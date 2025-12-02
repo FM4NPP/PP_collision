@@ -6,6 +6,8 @@ This repository contains the essential code for:
 1. **Pretraining**: State space models (Mamba, Mamba2) on particle physics data
 2. **Downstream Task**: Track reconstruction using pretrained representations
 
+**Paper**: [Foundation Models for Particle Physics](https://arxiv.org/abs/2508.14087)
+
 ## Repository Structure
 
 ```
@@ -132,26 +134,29 @@ data_root/
 
 ## Citation
 
-If you use this code, please cite:
+If you use this code, please cite our paper:
 
 ```bibtex
 @article{fm4npp2025,
-  title={Foundation Models for Particle Physics: Pretraining and Downstream Tasks},
-  author={[Authors]},
-  journal={[Journal]},
+  title={Foundation Models for Particle Physics},
+  author={Li, Shuhang and Ren, Yihui and Luo, Xihaier and Park, David and Yoo, Shinjae},
+  journal={arXiv preprint arXiv:2508.14087},
   year={2025}
 }
 ```
 
-## License
-
-[License Type]
+Paper: https://arxiv.org/abs/2508.14087
 
 ## Contact
 
-For questions or issues, please open a GitHub issue or contact [contact info].
+For questions or issues, please:
+- Open a GitHub issue
+- Contact: dpark1@bnl.gov
 
 ## Acknowledgments
 
-This work was supported by [funding sources, anonymized].
-Computing resources provided by [computing facility, anonymized].
+The authors would like to express their sincere gratitude to the sPHENIX Collaboration for sharing the simulation data and experimental knowledge, as well as Jubin Choi, Abhay Deshpande, Alexei Klimentov, Michael Begel, Torre Wenaus, Nicholas D'Imperio, James Dunlop, and John Hill from Brookhaven National Lab for their valuable support and feedback.
+
+This work was supported by the Laboratory Directed Research and Development (LDRD) Program at Brookhaven National Laboratory, LDRD 25-045, which is operated and managed for the U.S. Department of Energy (DOE) Office of Science by Brookhaven Science Associates under contract No. DE-SC0012704. Shuhang Li was partially supported by the DOE Office of Science through the Office of Nuclear Physics under Award No. DE-FG02-86ER40281. Yihui Ren, Xihaier Luo and Shinjae Yoo were partially supported by the DOE Office of Science through the Office of Advanced Scientific Computing Research and the Scientific Discovery through Advanced Computing (SciDAC) program.
+
+This research also utilized resources of the National Energy Research Scientific Computing Center (NERSC), a DOE Office of Science User Facility, under NERSC Award No. DDRERCAP-m4722. The authors are grateful to the NERSC staff for their support, particularly Shashank Subramanian and Wahid Bhimji.
