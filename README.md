@@ -186,7 +186,7 @@ See `demo.ipynb` in the dataset for data exploration and visualization examples.
 
 ## Citation
 
-If you use this code, please cite our paper:
+If you use this code or dataset, please cite both papers:
 
 ```bibtex
 @article{fm4npp2025,
@@ -195,15 +195,22 @@ If you use this code, please cite our paper:
   journal={arXiv preprint arXiv:2508.14087},
   year={2025}
 }
+
+@article{tpcpp10m2025,
+  title={TPCpp-10M: Simulated proton-proton collisions in a Time Projection Chamber for AI Foundation Models},
+  author={Li, Shuhang and Huang, Yi and Park, David and Luo, Xihaier and Yu, Haiwang and Go, Yeonju and Pinkenburg, Christopher and Lin, Yuewei and Yoo, Shinjae and Osborn, Joseph and Roland, Christof and Huang, Jin and Ren, Yihui},
+  journal={arXiv preprint arXiv:2509.05792},
+  year={2025}
+}
 ```
 
-Paper: https://arxiv.org/abs/2508.14087
+Papers:
+- Model: https://arxiv.org/abs/2508.14087
+- Dataset: https://arxiv.org/abs/2509.05792
 
 ## Contact
 
-For questions or issues, please:
-- Open a GitHub issue
-- Contact: dpark1@bnl.gov
+For questions or issues, please open a GitHub issue.
 
 ## Acknowledgments
 

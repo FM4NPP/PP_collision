@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
+message: "If you use this software or dataset, please cite both the model and dataset papers."
 type: software
 title: "FM4NPP: Foundation Models for Particle Physics"
 abstract: "Implementation of state space models (Mamba, Mamba2) for particle physics applications, including pretraining and track reconstruction."
@@ -16,7 +16,6 @@ authors:
   - family-names: "Park"
     given-names: "David"
     affiliation: "Brookhaven National Laboratory"
-    email: "dpark1@bnl.gov"
   - family-names: "Yoo"
     given-names: "Shinjae"
     affiliation: "Brookhaven National Laboratory"
@@ -52,3 +51,37 @@ preferred-citation:
   year: 2025
   arxiv: "2508.14087"
   url: "https://arxiv.org/abs/2508.14087"
+references:
+  - type: article
+    title: "TPCpp-10M: Simulated proton-proton collisions in a Time Projection Chamber for AI Foundation Models"
+    authors:
+      - family-names: "Li"
+        given-names: "Shuhang"
+      - family-names: "Huang"
+        given-names: "Yi"
+      - family-names: "Park"
+        given-names: "David"
+      - family-names: "Luo"
+        given-names: "Xihaier"
+      - family-names: "Yu"
+        given-names: "Haiwang"
+      - family-names: "Go"
+        given-names: "Yeonju"
+      - family-names: "Pinkenburg"
+        given-names: "Christopher"
+      - family-names: "Lin"
+        given-names: "Yuewei"
+      - family-names: "Yoo"
+        given-names: "Shinjae"
+      - family-names: "Osborn"
+        given-names: "Joseph"
+      - family-names: "Roland"
+        given-names: "Christof"
+      - family-names: "Huang"
+        given-names: "Jin"
+      - family-names: "Ren"
+        given-names: "Yihui"
+    journal: "arXiv preprint"
+    year: 2025
+    arxiv: "2509.05792"
+    url: "https://arxiv.org/abs/2509.05792"
