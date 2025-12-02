@@ -115,22 +115,74 @@ python train/downstream/track_finding_trainer.py \
 - `warmup_steps`: 1000
 - `total_steps`: 50000
 
-## Data Format
+## Dataset
 
-The code expects preprocessed data in memory-mapped format:
+### TPCpp-10M Dataset
 
+We provide the preprocessed dataset used in our paper on Zenodo:
+
+**Dataset**: [TPCpp-10M: Simulated proton-proton collisions in Time Projection Chamber for AI Foundation Models](https://doi.org/10.5281/zenodo.16970029)
+
+**Dataset Statistics**:
+- **Unlabeled data**: 10M events (100 files) for pretraining
+- **Labeled training**: 70k events for downstream tasks
+- **Labeled validation**: 13k events
+- **Labeled test**: 7k events
+- **Total size**: ~118.5 GB (compressed)
+
+**Data Format**: NumPy compressed format (.npz)
+
+### Download Dataset
+
+```bash
+# Download from Zenodo
+wget https://zenodo.org/records/16970029/files/TPCpp-10M.tar.gz
+
+# Extract
+tar -xzf TPCpp-10M.tar.gz
+
+# Dataset structure after extraction:
+TPCpp-10M/
+├── unlabeled/        # 10M events for pretraining (100 files)
+├── labeled_train/    # 70k labeled events (7 file sets)
+│   ├── spacepoints/
+│   ├── track_ids/
+│   ├── particle_ids/
+│   └── noise_tags/
+├── labeled_val/      # 13k validation events
+└── labeled_test/     # 7k test events
 ```
-data_root/
-├── features_train/    # Point cloud features (N_events × N_points × D_features)
-├── features_test/
-├── seg_target_train/  # Segmentation labels for track finding
-└── seg_target_test/
-```
+
+### Data Format Details
+
+Each spacepoint includes:
+- **Position**: (x, y, z) coordinates in TPC
+- **Energy**: Energy deposition at the point
+- **Labels** (for downstream tasks):
+  - Track IDs: Segmentation labels for track reconstruction
+  - Particle IDs: 5 classes (electron, photon, pion, kaon, proton)
+  - Noise tags: Binary labels (signal/noise)
 
 **Feature dimensions**: 30D per point
 - Position: (x, y, z)
 - Momentum: (px, py, pz)
 - Energy, time, detector metadata
+
+### Usage with Code
+
+After downloading, update config paths:
+
+```yaml
+# In scripts/configs/mamba_pretrain.yaml
+data_root: /path/to/TPCpp-10M/unlabeled
+stat_dir: /path/to/TPCpp-10M/statistics
+
+# In scripts/configs/mamba_tracking.yaml
+data_root: /path/to/TPCpp-10M/labeled_train
+data_root_test: /path/to/TPCpp-10M/labeled_test
+```
+
+See `demo.ipynb` in the dataset for data exploration and visualization examples.
 
 ## Citation
 
