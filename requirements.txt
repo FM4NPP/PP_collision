@@ -1,0 +1,24 @@
+# FM4NPP Requirements
+# Anonymized for publication
+
+# Core dependencies
+torch>=2.4.0
+numpy>=1.24.0
+scipy>=1.10.0
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# Mamba-specific dependencies
+mamba-ssm>=1.0.0
+causal-conv1d>=1.0.0
+triton>=2.2.0
+
+# Data handling
+mmap-ninja>=0.7.0
+
+# Distributed training
+torch-distributed>=2.0.0
+
+# Optional: for better performance
+# einops>=0.6.0
+# packaging>=23.0

@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "FM4NPP: Foundation Models for Particle Physics"
+abstract: "Implementation of state space models (Mamba, Mamba2) for particle physics applications, including pretraining and track reconstruction."
+authors:
+  - family-names: "[Author 1 Last Name]"
+    given-names: "[Author 1 First Name]"
+    affiliation: "[Institution]"
+  - family-names: "[Author 2 Last Name]"
+    given-names: "[Author 2 First Name]"
+    affiliation: "[Institution]"
+  # Add more authors as needed
+repository-code: "https://github.com/[organization]/FM4NPP_Public"
+url: "[Project website or paper URL]"
+keywords:
+  - machine learning
+  - particle physics
+  - state space models
+  - mamba
+  - track reconstruction
+  - deep learning
+license: MIT
+# version: 1.0.0  # Uncomment and update when releasing
+# date-released: 2025-01-01  # Uncomment and update when releasing
+preferred-citation:
+  type: article
+  title: "[Paper Title]"
+  authors:
+    - family-names: "[Author Last Name]"
+      given-names: "[Author First Name]"
+  journal: "[Journal Name]"
+  year: 2025
+  # volume: XX
+  # issue: X
+  # start: XX
+  # end: XX
+  # doi: 10.XXXX/XXXXX

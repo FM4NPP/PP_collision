@@ -1,0 +1,116 @@
+# Mamba Track Finding (Downstream) Configuration
+# Anonymized for publication
+
+# Default configuration
+default: &default
+  # === Data Paths (UPDATE THESE) ===
+  data_root: /path/to/preprocessed/data          # Same as pretraining data
+  data_root_train: /path/to/preprocessed/data
+  data_root_test: /path/to/preprocessed/data
+  stat_dir: /path/to/statistics
+  downstream_dir: /path/to/downstream/logs
+  checkpoint_dir: /path/to/downstream/logs
+
+  # === Data Configuration ===
+  data_version: dataset_name
+  batch_size: 4                          # Smaller batch for downstream
+  limit_data: true
+  limit_size: 100                        # Can use smaller subset for quick testing
+  log_to_screen: false
+  max_epochs: 200
+  n_data_idx: 1000000
+  n_eval_steps: 1000
+  num_data_workers: 4
+
+  # === Optimization ===
+  max_lr: 0.0001
+  min_lr: 0.00001
+  first_cycle_steps: 200
+  warmup_steps: 20
+
+  # === Model Configuration ===
+  base_dim: 256
+  embed_dim: 256
+  group_size: 8
+  init_std: 0.025
+  model_version: downstream_v1
+
+  # === Embedding Configuration ===
+  embed_method: additive
+  pe_method: nerf
+
+  # === Downstream Head Configuration ===
+  num_heads_backbone: 4
+  num_heads_decoder: 2
+  num_heads_encoder: 2
+  num_embedder_layers: 0
+  use_attention_head: true
+
+  # === Training Configuration ===
+  continue_from_best: true
+  valid_batch_size: 1
+
+  # === Loss Weights (tune based on data) ===
+  loss_matched_ce_weight: 0.5
+  loss_unmatched_ce_weight: 0.1
+  loss_dice_weight: 1
+  loss_focal_weight: 30
+
+  # === Data Processing ===
+  chunk_training: false
+  return_reg: false
+  return_dict: false
+  voxelize: true
+  space_filling_order: true
+  order: hilbert
+
+# ============================================================================
+# Mamba 5M Downstream Configuration
+# ============================================================================
+mamba_5m_downstream:
+  <<: *default
+  embed_dim: 256
+  num_layers_backbone: 12
+  d_state: 16
+  klen: 30
+  dropout: 0.1
+  max_lr: 0.0001
+  min_lr: 0.00001
+  mambaversion: mamba1
+
+  # === Pretrained Checkpoint (UPDATE THIS) ===
+  pretrained_ckpt: /path/to/pretrain/checkpoints/mamba_5m/run0/training_checkpoints/ckpt_best.tar
+
+# ============================================================================
+# Mamba2 5M Downstream Configuration
+# ============================================================================
+mamba2_5m_downstream:
+  <<: *default
+  embed_dim: 256
+  num_layers_backbone: 12
+  d_state: 128
+  headdim: 64
+  ngroups: 1
+  klen: 30
+  dropout: 0.1
+  max_lr: 0.0001
+  min_lr: 0.00001
+  mambaversion: mamba2
+
+  # === Pretrained Checkpoint (UPDATE THIS) ===
+  pretrained_ckpt: /path/to/pretrain/checkpoints/mamba2_5m/run0/training_checkpoints/ckpt_best.tar
+
+# ============================================================================
+# Training from Scratch (No Pretrain) - For Comparison
+# ============================================================================
+mamba_5m_scratch:
+  <<: *default
+  embed_dim: 256
+  num_layers_backbone: 12
+  d_state: 16
+  klen: 30
+  dropout: 0.1
+  max_lr: 0.0001
+  min_lr: 0.00001
+  mambaversion: mamba1
+  # No pretrained_ckpt - trains from random initialization
