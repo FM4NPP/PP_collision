@@ -1,4 +1,14 @@
-# Foundation Models for Particle Physics (FM4NPP)
+# Foundation Models for Nuclear and Particle Physics (FM4NPP)
+
+**Brookhaven National Laboratory**
+
+David Park\*, Shuhang Li\*, Yi Huang\*, Xihaier Luo, Haiwang Yu, Yeonju Go, Christopher Pinkenburg, Yuewei Lin, Shinjae Yoo, Joseph Osborn, Christof Roland, Jin Huang, Yihui Ren
+
+\* equal contribution
+
+[[`Paper`](https://arxiv.org/abs/2508.14087)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`BibTeX`](#citation)]
+
+--- 
 
 **Publication Repository**: Minimal implementation for reproducibility
 
@@ -189,9 +199,9 @@ See `demo.ipynb` in the dataset for data exploration and visualization examples.
 If you use this code or dataset, please cite both papers:
 
 ```bibtex
-@article{fm4npp2025,
-  title={Foundation Models for Particle Physics},
-  author={Li, Shuhang and Ren, Yihui and Luo, Xihaier and Park, David and Yoo, Shinjae},
+@article{park2025fm4npp,
+  title={FM4NPP: A Scaling Foundation Model for Nuclear and Particle Physics},
+  author={Park, David and Li, Shuhang and Huang, Yi and Luo, Xihaier and Yu, Haiwang and Go, Yeonju and Pinkenburg, Christopher and Lin, Yuewei and Yoo, Shinjae and Osborn, Joseph and others},
   journal={arXiv preprint arXiv:2508.14087},
   year={2025}
 }
