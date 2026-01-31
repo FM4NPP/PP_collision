@@ -1,7 +1,7 @@
 # Foundation Models for Nuclear and Particle Physics (FM4NPP)
 
 <p align="center">
-  <img src="fig/overview.png" width="80%" alt="FM4NPP overview">
+  <img src="fig/overview.png" width="70%" alt="FM4NPP overview">
 </p>
 
 **🎉 Accepted to ICLR 2026!**  
