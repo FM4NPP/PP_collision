@@ -13,7 +13,7 @@ David Keetae Park\*, Shuhang Li\*, Yi Huang\*, Xihaier Luo, Haiwang Yu, Yeonju G
 
 \* equal contribution; † corresponding author
 
-[[`OpenReview`](https://openreview.net/forum?id=qaI3cLFsiX)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`BibTeX`](#citation)]
+[[`OpenReview`](https://openreview.net/forum?id=qaI3cLFsiX)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`Dataset Paper`](https://www.sciencedirect.com/science/article/pii/S2352340925011060)] [[`BibTeX`](#citation)]
 
 --- 
 
@@ -139,6 +139,8 @@ python train/downstream/track_finding_trainer.py \
 We provide the preprocessed dataset used in our paper on Zenodo:
 
 **Dataset**: [TPCpp-10M: Simulated proton-proton collisions in Time Projection Chamber for AI Foundation Models](https://doi.org/10.5281/zenodo.16970029)
+
+**Dataset Paper (TPCpp-10M)**: https://www.sciencedirect.com/science/article/pii/S2352340925011060
 
 **Dataset Statistics**:
 - **Unlabeled data**: 10M events (100 files) for pretraining
