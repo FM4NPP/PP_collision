@@ -13,7 +13,7 @@ David Park\*, Shuhang Li\*, Yi Huang\*, Xihaier Luo, Haiwang Yu, Yeonju Go, Chri
 
 \* equal contribution
 
-[[`Paper`](https://arxiv.org/abs/2508.14087)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`BibTeX`](#citation)]
+[[`Paper`](https://openreview.net/forum?id=qaI3cLFsiX)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`BibTeX`](#citation)]
 
 --- 
 
@@ -23,7 +23,7 @@ This repository contains the essential code for:
 1. **Pretraining**: State space models (Mamba, Mamba2) on particle physics data
 2. **Downstream Task**: Track reconstruction using pretrained representations
 
-**Paper**: [Foundation Models for Particle Physics](https://arxiv.org/abs/2508.14087)
+**Paper**: [Foundation Models for Particle Physics](https://openreview.net/forum?id=qaI3cLFsiX)
 
 ## Repository Structure
 
@@ -221,9 +221,8 @@ If you use this code or dataset, please cite both papers:
 }
 ```
 
-Papers:
-- Model: https://arxiv.org/abs/2508.14087
-- Dataset: https://arxiv.org/abs/2509.05792
+OpenReview:
+- Model paper: https://openreview.net/forum?id=qaI3cLFsiX
 
 ## Contact
 
