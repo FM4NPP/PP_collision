@@ -9,11 +9,9 @@ See the paper on OpenReview: https://openreview.net/forum?id=qaI3cLFsiX
 
 **Brookhaven National Laboratory**
 
-David Park\*, Shuhang Li\*, Yi Huang\*, Xihaier Luo, Haiwang Yu, Yeonju Go, Christopher Pinkenburg, Yuewei Lin, Shinjae Yoo, Joseph Osborn, Christof Roland, Jin Huang, Yihui "Ray" Ren†
+David Keetae Park\*, Shuhang Li\*, Yi Huang\*, Xihaier Luo, Haiwang Yu, Yeonju Go, Christopher Pinkenburg, Yuewei Lin, Shinjae Yoo, Joseph D. Osborn, Jin Huang, Yihui "Ray" Ren†
 
-\* equal contribution
-
-† corresponding author
+\* equal contribution; † corresponding author
 
 [[`OpenReview`](https://openreview.net/forum?id=qaI3cLFsiX)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`BibTeX`](#citation)]
 
