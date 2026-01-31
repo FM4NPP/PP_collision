@@ -1,5 +1,12 @@
 # Foundation Models for Nuclear and Particle Physics (FM4NPP)
 
+<p align="center">
+  <img src="fig/overview.png" width="80%" alt="FM4NPP overview">
+</p>
+
+**🎉 Accepted to ICLR 2026!**  
+See the paper on OpenReview: https://openreview.net/forum?id=qaI3cLFsiX
+
 **Brookhaven National Laboratory**
 
 David Park\*, Shuhang Li\*, Yi Huang\*, Xihaier Luo, Haiwang Yu, Yeonju Go, Christopher Pinkenburg, Yuewei Lin, Shinjae Yoo, Joseph Osborn, Christof Roland, Jin Huang, Yihui Ren
