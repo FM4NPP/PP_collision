@@ -21,7 +21,7 @@ config="mamba_5m_downstream"  # Options: mamba_5m_downstream, mamba2_5m_downstre
 run_num="run0"                # Run identifier
 
 # === Python Environment (UPDATE THIS) ===
-PYTHON_BIN="/path/to/conda/envs/fm4npp/bin/python"
+PYTHON_BIN="/pscratch/sd/d/dpark1/.conda/pmambareal/bin/python"
 
 # Or activate conda environment:
 # source activate fm4npp
@@ -34,7 +34,7 @@ export MASTER_ADDR=$(hostname)
 cd train/downstream
 
 # Command to execute
-cmd="$PYTHON_BIN train_downstream.py \
+cmd="$PYTHON_BIN train_track_finding.py \
     --yaml_config=../../$config_file \
     --config=$config \
     --run_num=$run_num"
@@ -49,19 +49,19 @@ cmd="$PYTHON_BIN train_downstream.py \
 set -x  # Print commands for debugging
 
 # Using srun for distributed training
-srun -l \
-    bash -c "
-    # Export DDP environment variables
-    export LOCAL_RANK=\$SLURM_LOCALID
-    export RANK=\$SLURM_PROCID
-    export WORLD_SIZE=\$SLURM_NTASKS
-    export MASTER_PORT=29500
+# srun -l \
+#     bash -c "
+#     # Export DDP environment variables
+#     export LOCAL_RANK=\$SLURM_LOCALID
+#     export RANK=\$SLURM_PROCID
+#     export WORLD_SIZE=\$SLURM_NTASKS
+#     export MASTER_PORT=29500
 
-    # Run training
-    $cmd
-    "
+#     # Run training
+#     $cmd
+#     "
 
 # Alternative: Direct execution for single-node
-# $cmd
+$cmd
 
 echo "Downstream training job completed"

@@ -4,15 +4,34 @@
 # Default configuration (shared across all variants)
 default: &default
   # === Data Paths (UPDATE THESE) ===
-  data_root: /path/to/preprocessed/data  # Directory containing features_train, features_test
-  stat_dir: /path/to/statistics          # Directory with normalization statistics
-  checkpoint_dir: /path/to/checkpoints   # Where to save model checkpoints
+  data_root: /global/cfs/cdirs/m4722/NPFM/data/pp_12M_mmap  # Directory containing features_train, features_test
+  stat_dir:  /global/homes/d/dpark1/NPFN/PP_collision/fm4npp/datasets/stats         # Directory with normalization statistics
+  checkpoint_dir: /pscratch/sd/d/dpark1/NPFN/test   # Where to save model checkpoints
 
   # === Data Configuration ===
   data_version: dataset_name
   n_data_idx: 10000000                   # Number of training samples
   limit_data: true
   limit_size: 10000000
+
+  # === legacy (not used) ===
+  group_size: 8
+  nleave: 1e10
+  order: EPR
+  len_chunk: 512
+  portion: 0.2
+  chunk_training: false
+  return_reg_test: false
+  return_dict: false
+  max_gt_classes: 150
+  voxelize: true
+  space_filling_order: false
+  space_filling_curve: z # hilbert
+  grad_clip_value: 0.1
+  rep_aaai: false
+  loss_reweight: false
+  ablate_loss_scale: false
+  save_checkpoint: true
 
   # === Training Configuration ===
   batch_size: 256                        # Global batch size (distributed across GPUs)
@@ -21,9 +40,11 @@ default: &default
   local_valid_batch_size: 4
 
   # === Optimization ===
+  max_epochs: 10000
   max_lr: 0.0002
   min_lr: 0.00002
   warmup_steps: 1000
+  n_eval_steps: 1000
   total_steps: 50000
 
   # === Model Configuration ===
@@ -34,7 +55,7 @@ default: &default
   init_std: 0.025
 
   # === Embedding Configuration ===
-  embed_method: additive                 # or 'concat'
+  embed_method: add                 # or 'concat'
   pe_method: nerf                        # Positional encoding: 'nerf' or 'sinusoidal'
 
   # === Training Settings ===

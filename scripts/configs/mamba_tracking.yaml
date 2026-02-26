@@ -4,15 +4,15 @@
 # Default configuration
 default: &default
   # === Data Paths (UPDATE THESE) ===
-  data_root: /path/to/preprocessed/data          # Same as pretraining data
-  data_root_train: /path/to/preprocessed/data
-  data_root_test: /path/to/preprocessed/data
-  stat_dir: /path/to/statistics
-  downstream_dir: /path/to/downstream/logs
-  checkpoint_dir: /path/to/downstream/logs
+  data_root: /global/cfs/cdirs/m4722/NPFM/data/pp_12M_mmap
+  stat_dir: /global/cfs/cdirs/m4722/NPFM/data/stats
+  data_root_train: /mldata/sli/sphenix_fm/pp_100k_mmap-particle_ids/
+  data_root_test: /mldata/sli/sphenix_fm/pp_100k_mmap-particle_ids/ 
+  downstream_dir: /pscratch/sd/d/dpark1/NPFN/test
+  checkpoint_dir: /pscratch/sd/d/dpark1/NPFN/test
 
   # === Data Configuration ===
-  data_version: dataset_name
+  data_version: pp_12M
   batch_size: 4                          # Smaller batch for downstream
   limit_data: true
   limit_size: 100                        # Can use smaller subset for quick testing
@@ -21,6 +21,22 @@ default: &default
   n_data_idx: 1000000
   n_eval_steps: 1000
   num_data_workers: 4
+  
+  # === legacy (not used) ===
+  nleave: 1e10
+  order: EPR
+  len_chunk: 512
+  portion: 0.2
+  chunk_training: false
+  return_reg_test: false
+  max_gt_classes: 150
+  space_filling_order: false
+  space_filling_curve: z # hilbert
+  grad_clip_value: 0.1
+  rep_aaai: false
+  loss_reweight: false
+  ablate_loss_scale: false
+  save_checkpoint: true
 
   # === Optimization ===
   max_lr: 0.0001
@@ -36,7 +52,7 @@ default: &default
   model_version: downstream_v1
 
   # === Embedding Configuration ===
-  embed_method: additive
+  embed_method: add
   pe_method: nerf
 
   # === Downstream Head Configuration ===
@@ -57,12 +73,9 @@ default: &default
   loss_focal_weight: 30
 
   # === Data Processing ===
-  chunk_training: false
   return_reg: false
   return_dict: false
   voxelize: true
-  space_filling_order: true
-  order: hilbert
 
 # ============================================================================
 # Mamba 5M Downstream Configuration
@@ -79,7 +92,7 @@ mamba_5m_downstream:
   mambaversion: mamba1
 
   # === Pretrained Checkpoint (UPDATE THIS) ===
-  pretrained_ckpt: /path/to/pretrain/checkpoints/mamba_5m/run0/training_checkpoints/ckpt_best.tar
+  pretrained_ckpt: /global/cfs/cdirs/m4722/NPFM/pretrained_models/pp_m3_k5.ckpt
 
 # ============================================================================
 # Mamba2 5M Downstream Configuration
@@ -98,7 +111,7 @@ mamba2_5m_downstream:
   mambaversion: mamba2
 
   # === Pretrained Checkpoint (UPDATE THIS) ===
-  pretrained_ckpt: /path/to/pretrain/checkpoints/mamba2_5m/run0/training_checkpoints/ckpt_best.tar
+  pretrained_ckpt: /global/cfs/cdirs/m4722/NPFM/pretrained_models/pp_m3_k5.ckpt
 
 # ============================================================================
 # Training from Scratch (No Pretrain) - For Comparison

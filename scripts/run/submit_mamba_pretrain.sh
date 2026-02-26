@@ -21,7 +21,7 @@ config="mamba_5m"           # Options: mamba_5m, mamba2_5m, mamba_small
 run_num="run0"              # Run identifier
 
 # === Python Environment (UPDATE THIS) ===
-PYTHON_BIN="/path/to/conda/envs/fm4npp/bin/python"
+PYTHON_BIN="/pscratch/sd/d/dpark1/.conda/pmambareal/bin/python"
 
 # Or activate conda environment:
 # source activate fm4npp
@@ -46,19 +46,19 @@ cmd="$PYTHON_BIN -m train.pretrain.nppmamba.train_multi_gpu_mamba1 \
 set -x  # Print commands for debugging
 
 # Using srun for distributed training
-srun -l \
-    bash -c "
-    # Export DDP environment variables
-    export LOCAL_RANK=\$SLURM_LOCALID
-    export RANK=\$SLURM_PROCID
-    export WORLD_SIZE=\$SLURM_NTASKS
-    export MASTER_PORT=29500
+# srun -l \
+#     bash -c "
+#     # Export DDP environment variables
+#     export LOCAL_RANK=\$SLURM_LOCALID
+#     export RANK=\$SLURM_PROCID
+#     export WORLD_SIZE=\$SLURM_NTASKS
+#     export MASTER_PORT=29500
 
-    # Run training
-    $cmd
-    "
+#     # Run training
+#     $cmd
+#     "
 
 # Alternative: Direct execution for single-node
-# $cmd
+$cmd
 
 echo "Pretraining job completed"
