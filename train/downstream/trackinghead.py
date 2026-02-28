@@ -69,10 +69,10 @@ class FFNBlock(nn.Module):
 
 
 class RefinementLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, ffn_dim):
+    def __init__(self, embed_dim, num_heads, ffn_dim, dropout=0.0):
         super().__init__()
-        self.cross_attn = CrossAttentionBlock(embed_dim, num_heads)
-        self.self_attn = SelfAttentionBlock(embed_dim, num_heads)
+        self.cross_attn = CrossAttentionBlock(embed_dim, num_heads, dropout=dropout)
+        self.self_attn = SelfAttentionBlock(embed_dim, num_heads, dropout=dropout)
         self.ffn = FFNBlock(embed_dim, ffn_dim)
     
     def forward(self, refined_protos, context, pos_emb, padding_mask=None, attn_mask=None):
@@ -90,11 +90,13 @@ class RefinementLayer(nn.Module):
         # FFN processing
         return self.ffn(refined_protos)
 
+
+
 class MambaAttentionHead(nn.Module):
     def __init__(self, input_dim, embed_dim=256, num_layers=3, d_state=64, d_conv=4, expand=2, 
                  num_embedder_layers=1, d_state_embedder=64, d_conv_embedder=4, expand_embedder=2,
                  num_feature_layers=15, num_output_dim=256, num_prototypes=10, num_heads=4, ffn_dim=512,
-                 num_self_attn_layers=2, softmax_mask=False, do_masked_attn=True, return_embedding=False):
+                 num_self_attn_layers=2, softmax_mask=False, do_masked_attn=True, return_embedding=False, embed_method='add', pe_method = 'nerf', dropout=0.0):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
@@ -103,6 +105,10 @@ class MambaAttentionHead(nn.Module):
         self.do_masked_attn = do_masked_attn
         self.num_heads = num_heads
         self.return_embedding = return_embedding
+        if embed_method == 'concat':
+            Embedder = EmbedderConcat
+        else:
+            Embedder = EmbedderAdd
 
         # Input processing
         self.input_proj = nn.Sequential(
@@ -146,7 +152,7 @@ class MambaAttentionHead(nn.Module):
 
         # Prototype refinement
         self.refinement_layers = nn.ModuleList([
-            RefinementLayer(embed_dim, num_heads, ffn_dim)
+            RefinementLayer(embed_dim, num_heads, ffn_dim, dropout=dropout)
             for _ in range(num_self_attn_layers)
         ])
 
@@ -155,18 +161,18 @@ class MambaAttentionHead(nn.Module):
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Dropout(0.0),
+            nn.Dropout(dropout),
             nn.Linear(embed_dim, 2)
         )
         self.mask_mlp = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Dropout(0.0),
+            nn.Dropout(dropout),
             nn.Linear(embed_dim, num_output_dim)
         )
 
-        self.embedder = EmbedderAdd(pe_method='nerf', embed_dim=input_dim, learnable_projection=False)
+        self.embedder = Embedder(pe_method = 'nerf', embed_dim=input_dim)
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
 
     def make_predictions(self, refined_protos, point_features):
@@ -246,6 +252,8 @@ class MambaAttentionHead(nn.Module):
         if pretrain:
             x = feature.permute(1, 2, 0, 3)
             weights = torch.softmax(self.weighted_avg_weights, dim=0)
+            # Ensure dtype consistency for einsum operation
+            weights = weights.to(x.dtype)
             x = torch.einsum('bsnd,n->bsd', x, weights)
         else:
             x = self.embedder(x)

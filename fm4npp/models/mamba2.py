@@ -362,36 +362,67 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         d_mlp = (zxdtemp.shape[-1] - self.nheads) // 2
         z0, x0, dt_slice = torch.split(zxdtemp, [d_mlp, d_mlp, self.nheads], dim=-1)
 
-        # Select only the SSM portion from x0 for the conv/SSM path
-        x_ssm = x0[..., :self.d_ssm]  # (B, L, d_ssm)
+        A = -torch.exp(self.A_log.float())
+        dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
 
-        # Build input to depthwise conv: [x_ssm, B, C]
-        conv_in = torch.cat([x_ssm, B_slice, C_slice], dim=-1)  # (B, L, d_ssm + 2*g*d_state)
-        conv_in_chfirst = rearrange(conv_in, "b l c -> b c l")
-        conv_out = self.conv1d(conv_in_chfirst)                 # depthwise
-        conv_out = conv_out[..., :seqlen]                       # remove extra padding tail
-        conv_out = rearrange(conv_out, "b c l -> b l c")
+        if self.use_mem_eff_path and (inference_params is None):
+            # Fused Triton path: pack [z, x, B, C, dt] into one tensor and call the kernel.
+            zxbcdt_fused = torch.cat([z0, x0, B_slice, C_slice, dt_slice], dim=-1)
 
-        # Keep SSM channels after conv + activation
-        ssm_in = conv_out[..., :self.d_ssm]
-        ssm_in = self.act(ssm_in)
+            try:
+                from fm4npp.models.lora import LoRALinear
+                out_proj_has_lora = isinstance(self.out_proj, LoRALinear)
+            except ImportError:
+                out_proj_has_lora = False
 
-        # Optional RMSNorm on SSM channels
-        if self.rmsnorm_enabled and (self.norm is not None):
-            ssm_in = self.norm(ssm_in)
+            out = mamba_split_conv1d_scan_combined(
+                zxbcdt_fused,
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                self.conv1d.bias,
+                self.dt_bias,
+                A,
+                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+                chunk_size=self.chunk_size,
+                seq_idx=seq_idx,
+                return_final_states=False,
+                activation=self.activation,
+                rmsnorm_weight=self.norm.weight if self.rmsnorm_enabled else None,
+                rmsnorm_eps=self.norm.eps if self.rmsnorm_enabled else 1e-6,
+                outproj_weight=None if out_proj_has_lora else self.out_proj.weight,
+                outproj_bias=None if out_proj_has_lora else self.out_proj.bias,
+                headdim=None if self.D_has_hdim else self.headdim,
+                ngroups=self.ngroups,
+                norm_before_gate=self.norm_before_gate,
+                **dt_limit_kwargs
+            )
+            if out_proj_has_lora:
+                out = self.out_proj(out)
+            if is_packed:
+                out = rearrange(out, "b l d -> (b l) d")
+        else:
+            # Pure-PyTorch fallback: used when Triton is unavailable.
+            x_ssm = x0[..., :self.d_ssm]  # (B, L, d_ssm)
 
-        # Manual SSM (pure PyTorch EMA scan)
-        y_ssm = self._manual_ssm(ssm_in, dt_slice)  # (B, L, d_ssm)
+            # Depthwise conv over [x_ssm, B, C]
+            conv_in = torch.cat([x_ssm, B_slice, C_slice], dim=-1)
+            conv_in_chfirst = rearrange(conv_in, "b l c -> b c l")
+            conv_out = self.conv1d(conv_in_chfirst)
+            conv_out = conv_out[..., :seqlen]
+            conv_out = rearrange(conv_out, "b c l -> b l c")
 
-        # Gate with z0 (matches common Mamba gating pattern)
-        y = y_ssm * torch.sigmoid(z0)
+            ssm_in = conv_out[..., :self.d_ssm]
+            ssm_in = self.act(ssm_in)
 
-        # Final projection
-        if is_packed:
-            y = rearrange(y, "b l d -> (b l) d")
-        out = self.out_proj(y)
+            if self.rmsnorm_enabled and (self.norm is not None):
+                ssm_in = self.norm(ssm_in)
 
-        # If TP existed we'd reduce; in this environment it's no-op
+            y_ssm = self._manual_ssm(ssm_in, dt_slice)  # (B, L, d_ssm)
+            y = y_ssm * torch.sigmoid(z0)
+
+            if is_packed:
+                y = rearrange(y, "b l d -> (b l) d")
+            out = self.out_proj(y)
+
         out = _maybe_reduce(out, self.process_group, self.sequence_parallel)
         return out
 

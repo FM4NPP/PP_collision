@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 import gc, torch, torch.distributed as dist
+from torch.amp import autocast
+from contextlib import nullcontext
 
 from torch.utils.data import Dataset
 from torch.nn.parallel import DistributedDataParallel
@@ -24,11 +26,11 @@ sys.path.append('../..')
 from fm4npp.utils import *
 from fm4npp.datasets.dataset import *
 from fm4npp.models.mambagpt import MambaGPT, Mamba1GPT
-from fm4npp.models.longformer_gpt import LongformerGPT
-from fm4npp.models.linformer_gpt import LinformerGPT
 from fm4npp.models.embed import *
 from fm4npp.models.rmsnorm import RMSNorm
 from fm4npp.models.mamba2 import Mamba2
+from fm4npp.models.longformer_gpt import LongformerGPT
+from fm4npp.models.linformer_gpt import LinformerGPT
 
 
 from trackinghead import *
@@ -84,6 +86,8 @@ class DownstreamTrainer():
             self.device = torch.device('cpu')
         
         self.params = params
+        self.use_lora = False
+        self.use_amp = bool(getattr(self.params, 'use_amp', True))
         print("running on rank {} with world size {}".format(self.world_rank, self.world_size))
 
 
@@ -249,7 +253,7 @@ class DownstreamTrainer():
 
         def initialize_mamba2(model, d_state, embed_dim):
             """ Properly initializes Mamba v2 to ensure stable learning. """
-
+            
             with torch.no_grad():
                 for name, param in model.named_parameters():
 
@@ -266,12 +270,10 @@ class DownstreamTrainer():
                     elif "bias" in name:
                         init.zeros_(param)
 
-            if self.world_rank == 0:
-                print(f"✅ Mamba Model Initialized")
+                print(f"✅ Mamba v2 Model Initialized")
                 
-        # Set model dimension variables for optimizer (used by all models)
         Nu = self.params.embed_dim
-        Nx = getattr(self.params, 'd_state', 16)  # Default to 16 for non-Mamba models
+        Nx = getattr(self.params, 'd_state', 16)
 
         # Only initialize Mamba models with Mamba-specific initialization
         if self.params.mambaversion in ['mamba1', 'mamba2']:
@@ -316,9 +318,9 @@ class DownstreamTrainer():
             {"params": params_else,"lr": self.params.min_lr},
         ], weight_decay=0.1, betas=(0.9, 0.95))
 
-        self.scaler = torch.amp.GradScaler('cuda') 
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         self.scheduler = CosineAnnealingWarmupRestarts(self.optimizer,
-                                          first_cycle_steps=self.params.total_steps,
+                                          first_cycle_steps=getattr(self.params, 'total_steps', 200),
                                           max_lr=self.params.max_lr,
                                           min_lr=self.params.min_lr,
                                           warmup_steps=self.params.warmup_steps)
@@ -340,8 +342,23 @@ class DownstreamTrainer():
 
         ##### Pretraining checkpoint
         print("Loading checkpoint %s"%self.params.pretrained_ckpt)
-        self.restore_checkpoint(self.params.pretrained_ckpt, load_optimizer_state=False)
-        self.resumed = False  # Not resuming, starting fresh with pretrained weights
+        self.restore_checkpoint(self.params.pretrained_ckpt)
+        self.resumed = True
+
+        # LoRA: apply low-rank adapters to frozen backbone
+        if getattr(self.params, 'use_lora', False):
+            from fm4npp.models.lora import apply_lora_to_model, get_lora_params
+            target_modules = getattr(self.params, 'lora_target_modules', 'in_proj,out_proj,lin_B,lin_C').split(',')
+            lora_rank = getattr(self.params, 'lora_rank', 8)
+            lora_alpha = getattr(self.params, 'lora_alpha', 16)
+            n_lora = apply_lora_to_model(self.model, target_modules, lora_rank, lora_alpha)
+            self.use_lora = True
+            self.lora_optimizer = torch.optim.AdamW(
+                get_lora_params(self.model), lr=self.params.max_lr, weight_decay=0.01
+            )
+            total_backbone = sum(p.numel() for p in self.model.parameters())
+            trainable_backbone = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print(f"LoRA applied: {n_lora} adapter params ({trainable_backbone}/{total_backbone} trainable in backbone)")
 
         self.startEpoch = 0
         self.epoch = self.startEpoch
@@ -376,7 +393,7 @@ class DownstreamTrainer():
             dist.destroy_process_group()
         print("Cleanup complete. All resources released.")
 
-    def inference(self, checkpoint_path, pretrain=True, logfile=None):
+    def inference(self, checkpoint_path, pretrain=True, logfile=None, save_csv=False, csv_output_path=None):
         """Initialize model and load weights for inference"""
         # 1. Initialize model architecture
         #self.down_model = MambaAttentionHead(
@@ -391,7 +408,7 @@ class DownstreamTrainer():
 
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
                                   num_embedder_layers= self.params.num_embedder_layers, 
-                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes).to(self.device)
+                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes, dropout= self.params.downstream_dropout).to(self.device)
     
         total_params = sum(p.numel() for p in self.down_model.parameters())
         print(f"Total parameters in down_model: {total_params}")
@@ -440,6 +457,9 @@ class DownstreamTrainer():
         avg_loss = 0
         avg_ARI = 0
         
+        # Lists for CSV data collection
+        csv_data = []
+        
         with torch.no_grad():  # Disable gradient calculation
             for i, (grouped, label, knearest, reg) in enumerate(tqdm(self.val_data_loader)):
             #for i, (grouped, label, knearest) in enumerate(tqdm(self.train_data_loader)):
@@ -478,23 +498,22 @@ class DownstreamTrainer():
                         "labels": torch.ones(n_gt_classes, dtype=torch.long).to(self.device)  # (n_gt_classes,)
                     })
 
-                if pretrain:
-                    #print(grouped.size())
-                    with torch.no_grad():
-                        _, pre_embed, _ = self.model(grouped, return_z = True)
-                    #feature = torch.stack(pre_embed).mean(0)
-                    feature = torch.stack(pre_embed)
-                    pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask) 
-                    #pred_logit = self.down_model(grouped, feature, pretrain=pretrain) #B X N X C_classes
-                    
-                else:
-                    pred_dict = self.down_model(grouped, feature=None)
-                    #pred_logit = self.down_model(grouped, feature=None) #B X N X C_classes
-                #softmax it to the prob
-                #pred_probs = F.softmax(pred_logit, dim=-1) # B X N X C_classes
-                pred_probs = pred_dict['mask_probs'] # (B, N, N_pred)
-                class_probs = pred_dict['class_probs'] # (B, N_pred, 2)
-        
+                with autocast('cuda', dtype=torch.bfloat16) if amp_enabled else nullcontext():
+                    if pretrain:
+                        #print(grouped.size())
+                        _, pre_embed, _ = self.model(grouped, return_z=True)
+                        #feature = torch.stack(pre_embed).mean(0)
+                        feature = torch.stack(pre_embed)
+                        pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
+                        #pred_logit = self.down_model(grouped, feature, pretrain=pretrain) #B X N X C_classes
+                    else:
+                        pred_dict = self.down_model(grouped, feature=None)
+                        #pred_logit = self.down_model(grouped, feature=None) #B X N X C_classes
+                    #softmax it to the prob
+                    #pred_probs = F.softmax(pred_logit, dim=-1) # B X N X C_classes
+                    pred_probs = pred_dict['mask_probs'] # (B, N, N_pred)
+                    class_probs = pred_dict['class_probs'] # (B, N_pred, 2)
+
                 outputs = {
                     "pred_probs": class_probs,  
                     "pred_masks": pred_probs.permute(0, 2, 1) 
@@ -504,6 +523,62 @@ class DownstreamTrainer():
                 point_feature.append(grouped)
                 reg_target.append(reg)
                 seg_target.append(label)
+                
+                # Collect per-point data for CSV if requested
+                if save_csv:
+                    # Get predictions (assignments from inference result)
+                    pred_assignments = inference_result["assignments"]  # B X N
+                    
+                    # Get confidence scores (max probability from mask_probs)
+                    pred_probs = pred_probs  # (B, N, N_pred) - already computed above
+                    max_probs = torch.max(pred_probs, dim=-1)[0]  # B X N
+                    
+                    # Process each batch item
+                    for batch_idx in range(b):
+                        # Get valid points (non-padding)
+                        valid_mask = mask[batch_idx]  # N
+                        valid_indices = torch.where(valid_mask)[0]
+                        
+                        for point_idx in valid_indices:
+                            point_idx = point_idx.item()
+                            
+                            # Extract regression target components
+                            reg_point = reg[batch_idx, point_idx]  # 8 values
+                            px, py, pz = reg_point[0].item(), reg_point[1].item(), reg_point[2].item()
+                            vtx_x, vtx_y, vtx_z = reg_point[3].item(), reg_point[4].item(), reg_point[5].item()
+                            q, e = reg_point[6].item(), reg_point[7].item()
+                            
+                            # Get segmentation target (track ID)
+                            seg_target_point = label[batch_idx, point_idx].item()
+                            
+                            # Get prediction results
+                            pred_assignment = pred_assignments[batch_idx, point_idx].item()
+                            confidence = max_probs[batch_idx, point_idx].item()
+                            
+                            # Get point coordinates
+                            point_coords = grouped[batch_idx, point_idx]  # 4 values (E, x, y, z)
+                            E, x, y, z = point_coords[0].item(), point_coords[1].item(), point_coords[2].item(), point_coords[3].item()
+                            
+                            csv_data.append({
+                                'batch_idx': i,  # Global batch index from data loader
+                                'point_idx': point_idx,
+                                'E': E,
+                                'x': x, 
+                                'y': y,
+                                'z': z,
+                                'px': px,
+                                'py': py,
+                                'pz': pz,
+                                'vtx_x': vtx_x,
+                                'vtx_y': vtx_y,
+                                'vtx_z': vtx_z,
+                                'charge': q,
+                                'energy': e,
+                                'seg_target': seg_target_point,
+                                'pred_assignment': pred_assignment,
+                                'confidence': confidence
+                            })
+                
                 losses = compute_point_loss(
                     outputs=outputs,
                     targets=targets,
@@ -523,6 +598,45 @@ class DownstreamTrainer():
             with open(logfile, "w") as f:
                 f.write("Avg_Loss\tAvg_ARI\n")
                 f.write(f"{avg_loss/len(segmentation_result)}\t{avg_ARI/len(segmentation_result)}\n")
+        
+        # Save CSV data if requested
+        if save_csv and csv_data:
+            import pandas as pd
+            
+            # Create DataFrame from collected data
+            df = pd.DataFrame(csv_data)
+            
+            # Set default output path if not provided
+            if csv_output_path is None:
+                csv_output_path = logfile.replace('.log', '_per_point_data.csv') if logfile else 'track_finding_per_point_data.csv'
+            
+            # Save to CSV
+            df.to_csv(csv_output_path, index=False)
+            print(f"✅ Per-point data saved to: {csv_output_path}")
+            print(f"📊 Total points saved: {len(csv_data)}")
+            
+            # Print summary statistics
+            if self.log_to_screen:
+                print(f"\n📈 Track Finding Summary:")
+                print(f"   Average Loss: {avg_loss/len(segmentation_result):.4f}")
+                print(f"   Average ARI: {avg_ARI/len(segmentation_result):.4f}")
+                
+                # Track assignment distribution
+                if len(csv_data) > 0:
+                    seg_counts = df['seg_target'].value_counts().sort_index()
+                    pred_counts = df['pred_assignment'].value_counts().sort_index()
+                    print(f"\n📊 Track Assignment Distribution:")
+                    print(f"   True track assignments: {dict(seg_counts)}")
+                    print(f"   Predicted track assignments: {dict(pred_counts)}")
+                    
+                    # Confidence statistics
+                    conf_stats = df['confidence'].describe()
+                    print(f"\n📊 Confidence Statistics:")
+                    print(f"   Mean confidence: {conf_stats['mean']:.4f}")
+                    print(f"   Std confidence: {conf_stats['std']:.4f}")
+                    print(f"   Min confidence: {conf_stats['min']:.4f}")
+                    print(f"   Max confidence: {conf_stats['max']:.4f}")
+        
         return segmentation_result, seg_target, point_feature, reg_target
 
 
@@ -560,23 +674,18 @@ class DownstreamTrainer():
                 # Bias Terms
                 elif "bias" in name:
                     init.zeros_(param)
-
-            if self.world_rank == 0:
-                print(f"✅ Downstream Attention Head Initialized (Safe Scaling for {num_layers} Layers)")
+        
+            print(f"✅ Mamba v2 Model Initialized (Safe Scaling for {num_layers} Layers")
                 
     
-        if self.world_rank == 0:
-            print(f"Creating downstream head for {self.params.mambaversion} backbone...")
-
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
-                                  num_embedder_layers= self.params.num_embedder_layers,
+                                  num_embedder_layers= self.params.num_embedder_layers, 
                                   d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes).to(self.device)
-
+        
         initialize_mamba2(self.down_model, 3, num_residuals=1)
 
         total_params = sum(p.numel() for p in self.down_model.parameters())
-        if self.world_rank == 0:
-            print(f"Total parameters in downstream head: {total_params}")
+        print(f"Total parameters in down_model: {total_params}")
 
         self.down_optimizer = optim.AdamW(self.down_model.parameters(), 
                                          lr=self.params.max_lr, # Mamba: Linear-Time Sequence Modeling with Selective State Spaces
@@ -584,13 +693,11 @@ class DownstreamTrainer():
         
         torch.nn.utils.clip_grad_norm_(self.down_model.parameters(), max_norm=1.0)
 
-        # Ensure warmup_steps < first_cycle_steps for scheduler
-        effective_warmup = min(self.params.warmup_steps, self.params.max_epochs - 1)
         self.down_scheduler = CosineAnnealingWarmupRestarts(self.down_optimizer,
                                           first_cycle_steps=self.params.max_epochs,
                                           max_lr=self.params.max_lr,
                                           min_lr=self.params.min_lr,
-                                          warmup_steps=effective_warmup)
+                                          warmup_steps=self.params.warmup_steps)
         # Initialize matcher ------------------------------------------------------
         self.matcher = PointHungarianMatcher(
             cost_class=self.params.loss_matched_ce_weight,
@@ -620,20 +727,17 @@ class DownstreamTrainer():
             self.down_model.eval()
             print(f"✅ Model loaded from {checkpoint_path}")
 
-        # Create checkpoint directory if it doesn't exist
-        os.makedirs(self.params.checkpoint_dir, exist_ok=True)
-
         log_file_path = os.path.join(self.params.checkpoint_dir, self.params.log_file_name)
 
         checkpoint_file_name = self.params.log_file_name.split('.')[0] + '_checkpoint.pth'
-
+        
         if self.log_to_screen:
             print("Starting training loop...")
 
         # Always create log file and write header
         with open(log_file_path, "w") as f:
             f.write("Epoch\tTrain_Loss\tVal_Loss\tARI\tARI_2\tmatched_CE\tUnmatched_CE\tDice\tFocal\tTime\n")
-
+     
         self.best_loss = np.inf
         self.best_ARI = 0
         self.down_results = {'epoch': 0, 'train': [], 'val': [], 'ARI': [], 'ARI_2': [],  'loss_matched_ce': [], 'loss_unmatched_ce': [], 'loss_dice': [], 'loss_focal': []}
@@ -678,11 +782,9 @@ class DownstreamTrainer():
             avg_focal = np.mean(self.down_results['loss_focal'])
             avg_ari = np.mean(self.down_results['ARI'])
             avg_ari_2 = np.mean(self.down_results['ARI_2'])
-
             # Log to file
             with open(log_file_path, "a") as f:  # Append mode
                 f.write(f"{epoch}\t{train_epoch_loss:.8f}\t{val_epoch_loss:.8f}\t{avg_ari:.8f}\t{avg_ari_2:.8f}\t{avg_matched_ce:.8f}\t{avg_unmatched_ce:.8f}\t{avg_dice:.8f}\t{avg_focal:.8f}\t{epoch_time:.2f}\n")
-
             epoch_loss = val_epoch_loss
 
             # Print detailed metrics to screen
@@ -724,8 +826,12 @@ class DownstreamTrainer():
 
     def downstream_end_to_end_one_epoch(self, pretrain = False):
         tr_time = 0
-        self.model.eval()
+        if self.use_lora:
+            self.model.train()
+        else:
+            self.model.eval()
         self.down_model.train()
+        amp_enabled = torch.cuda.is_available() and self.use_amp
         # Buffers for logs
         tr_start = time.time()
         start_idx = 0
@@ -765,71 +871,84 @@ class DownstreamTrainer():
                 })
             
 
+            if self.use_lora:
+                self.lora_optimizer.zero_grad()
             self.down_optimizer.zero_grad()
-            if pretrain:
 
-                with torch.no_grad():
-                    _, pre_embed, _ = self.model(grouped, return_z = True)
-                #feature = torch.stack(pre_embed).mean(0)
-                feature = torch.stack(pre_embed)
-                #print('feature: ', feature.size())
-                pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
-                
-            else:
-                pred_dict = self.down_model(grouped, feature=None)
-                #pred_logit = self.down_model(grouped, feature=None) #B X N X C_classes
-            #softmax it to the prob
-            #pred_probs = F.softmax(pred_logit, dim=-1) # B X N X C_classes
-            pred_probs = pred_dict['mask_probs'] # (B, N, N_pred)
-            class_probs = pred_dict['class_probs'] # (B, N_pred, 2)
-     
-            #outputs["pred_masks"] = pred_probs.permute(0, 2, 1)
-            #outputs["pred_probs"] = class_probs
+            with autocast('cuda', dtype=torch.bfloat16) if amp_enabled else nullcontext():
+                if pretrain:
+                    if not self.use_lora:
+                        with torch.no_grad():
+                            _, pre_embed, _ = self.model(grouped, return_z=True)
+                    else:
+                        _, pre_embed, _ = self.model(grouped, return_z=True)
+                    #feature = torch.stack(pre_embed).mean(0)
+                    feature = torch.stack(pre_embed)
+                    #print('feature: ', feature.size())
+                    pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
 
-            outputs = {
-                "pred_probs": class_probs,  
-                "pred_masks": pred_probs.permute(0, 2, 1) 
-            }
-            #print('pred_probs: ', pred_probs.size(), 'class_probs: ', class_probs.size())
-            losses = compute_point_loss(
-                outputs=outputs,
-                targets=targets,
-                mask=mask,
-                matcher=self.matcher,
-                no_object_class=0
-            )
+                else:
+                    pred_dict = self.down_model(grouped, feature=None)
+                    #pred_logit = self.down_model(grouped, feature=None) #B X N X C_classes
+                #softmax it to the prob
+                #pred_probs = F.softmax(pred_logit, dim=-1) # B X N X C_classes
+                pred_probs = pred_dict['mask_probs'] # (B, N, N_pred)
+                class_probs = pred_dict['class_probs'] # (B, N_pred, 2)
 
-            
-            # Compute loss and get matching indices
-            #loss = sum(losses.values())
-
-            loss = losses["loss_matched_ce"] * self.loss_matched_ce_weight + losses["loss_unmatched_ce"] * self.loss_unmatched_ce_weight + losses["loss_dice"] * self.loss_dice_weight + losses["loss_focal"] * self.loss_focal_weight
-            
-            aux_list = pred_dict['aux_list']
-            for aux_dict in aux_list:
                 outputs = {
-                    "pred_probs": aux_dict['class_probs'],  
-                    "pred_masks": aux_dict['mask_probs'].permute(0, 2, 1) 
+                    "pred_probs": class_probs,
+                    "pred_masks": pred_probs.permute(0, 2, 1)
                 }
-                losses_aux = compute_point_loss(
+                #print('pred_probs: ', pred_probs.size(), 'class_probs: ', class_probs.size())
+                losses = compute_point_loss(
                     outputs=outputs,
                     targets=targets,
                     mask=mask,
                     matcher=self.matcher,
                     no_object_class=0
                 )
-                loss_aux = losses_aux["loss_matched_ce"] * self.loss_matched_ce_weight + losses_aux["loss_unmatched_ce"] * self.loss_unmatched_ce_weight + losses_aux["loss_dice"] * self.loss_dice_weight + losses_aux["loss_focal"] * self.loss_focal_weight
-                loss += loss_aux
 
-            loss.backward()
+                # Compute loss and get matching indices
+                #loss = sum(losses.values())
+                loss = losses["loss_matched_ce"] * self.loss_matched_ce_weight + losses["loss_unmatched_ce"] * self.loss_unmatched_ce_weight + losses["loss_dice"] * self.loss_dice_weight + losses["loss_focal"] * self.loss_focal_weight
+
+                aux_list = pred_dict['aux_list']
+                for aux_dict in aux_list:
+                    outputs = {
+                        "pred_probs": aux_dict['class_probs'],
+                        "pred_masks": aux_dict['mask_probs'].permute(0, 2, 1)
+                    }
+                    losses_aux = compute_point_loss(
+                        outputs=outputs,
+                        targets=targets,
+                        mask=mask,
+                        matcher=self.matcher,
+                        no_object_class=0
+                    )
+                    loss_aux = losses_aux["loss_matched_ce"] * self.loss_matched_ce_weight + losses_aux["loss_unmatched_ce"] * self.loss_unmatched_ce_weight + losses_aux["loss_dice"] * self.loss_dice_weight + losses_aux["loss_focal"] * self.loss_focal_weight
+                    loss += loss_aux
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.down_optimizer)
             torch.nn.utils.clip_grad_norm_(
                 self.down_model.parameters(),  # Or specific parameters
-                max_norm=1.0,  
-                norm_type=2.0   
+                max_norm=1.0,
+                norm_type=2.0
             )
-            
-            self.down_optimizer.step()
-                
+            if self.use_lora:
+                from fm4npp.models.lora import get_lora_params
+                self.scaler.unscale_(self.lora_optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    get_lora_params(self.model),
+                    max_norm=1.0,
+                    norm_type=2.0
+                )
+
+            self.scaler.step(self.down_optimizer)
+            if self.use_lora:
+                self.scaler.step(self.lora_optimizer)
+            self.scaler.update()
+
             self.down_results['train'].append(loss.item())
 
     def validate_end_to_end_one_epoch(self, pretrain=False):
@@ -837,6 +956,7 @@ class DownstreamTrainer():
         self.down_model.eval()  # Set downstream head to eval mode
         val_loss = 0.0
         total_samples = 0
+        amp_enabled = torch.cuda.is_available() and self.use_amp
 
         with torch.no_grad():  # Disable gradient calculation
             for i, (grouped, label, knearest) in enumerate(tqdm(self.val_data_loader)):
@@ -875,22 +995,21 @@ class DownstreamTrainer():
                         "labels": torch.ones(n_gt_classes, dtype=torch.long).to(self.device)  # (n_gt_classes,)
                     })
 
-                if pretrain:
-                    #print(grouped.size())
-                    with torch.no_grad():
-                        _, pre_embed, _ = self.model(grouped, return_z = True)
-                    #feature = torch.stack(pre_embed).mean(0)
-                    feature = torch.stack(pre_embed)
-                    pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)  
-                    #pred_logit = self.down_model(grouped, feature, pretrain=pretrain) #B X N X C_classes
-                    
-                else:
-                    pred_dict = self.down_model(grouped, feature=None)
-                    #pred_logit = self.down_model(grouped, feature=None) #B X N X C_classes
-                #softmax it to the prob
-                #pred_probs = F.softmax(pred_logit, dim=-1) # B X N X C_classes
-                pred_probs = pred_dict['mask_probs'] # (B, N, N_pred)
-                class_probs = pred_dict['class_probs'] # (B, N_pred, 2)
+                with autocast('cuda', dtype=torch.bfloat16) if amp_enabled else nullcontext():
+                    if pretrain:
+                        #print(grouped.size())
+                        _, pre_embed, _ = self.model(grouped, return_z=True)
+                        #feature = torch.stack(pre_embed).mean(0)
+                        feature = torch.stack(pre_embed)
+                        pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
+                        #pred_logit = self.down_model(grouped, feature, pretrain=pretrain) #B X N X C_classes
+                    else:
+                        pred_dict = self.down_model(grouped, feature=None)
+                        #pred_logit = self.down_model(grouped, feature=None) #B X N X C_classes
+                    #softmax it to the prob
+                    #pred_probs = F.softmax(pred_logit, dim=-1) # B X N X C_classes
+                    pred_probs = pred_dict['mask_probs'] # (B, N, N_pred)
+                    class_probs = pred_dict['class_probs'] # (B, N_pred, 2)
         
                 outputs = {
                     "pred_probs": class_probs,  
@@ -959,43 +1078,56 @@ class DownstreamTrainer():
         if isinstance(self.down_model, torch.nn.parallel.DistributedDataParallel):
             checkpoint['model_state_dict'] = self.down_model.module.state_dict()
 
+        if self.use_lora:
+            lora_state = {k: v for k, v in self.model.state_dict().items()
+                          if 'lora_A' in k or 'lora_B' in k}
+            checkpoint['lora_state_dict'] = lora_state
+            checkpoint['lora_optimizer_state_dict'] = self.lora_optimizer.state_dict()
+
         torch.save(checkpoint, os.path.join(self.params.checkpoint_dir, filename))
 
         msg = f"Saved {'best ' if is_best else ''}checkpoint at epoch {epoch} with loss {loss:.4f}"
         #print(msg) if self.log_to_screen else None
 
     def load_checkpoint(self, checkpoint_path, inference=False):
-        """Load checkpoint with proper device mapping and DDP handling. 
+        """Load checkpoint with proper device mapping and DDP handling.
            If inference=True, only loads the model weights."""
-        
+
         # 1. Get proper device string
         if isinstance(self.device, int):
             device_str = f'cuda:{self.device}' if torch.cuda.is_available() else 'cpu'
         else:
             device_str = str(self.device)
-    
+
         # 2. Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=device_str, weights_only=False)
-    
+
         # 3. Handle DDP keys
         state_dict = checkpoint['model_state_dict']
         new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    
+
         # 4. Load model weights
         if isinstance(self.down_model, torch.nn.parallel.DistributedDataParallel):
             self.down_model.module.load_state_dict(new_state_dict, strict=False)
         else:
             self.down_model.load_state_dict(new_state_dict, strict=False)
-    
+
+        # Load LoRA weights if present
+        if self.use_lora and 'lora_state_dict' in checkpoint:
+            self.model.load_state_dict(checkpoint['lora_state_dict'], strict=False)
+
         # 5. If not inference mode, load optimizer/scheduler states
         if not inference:
             self.down_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if self.down_scheduler is not None:
                 self.down_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
+
+            if self.use_lora and 'lora_optimizer_state_dict' in checkpoint:
+                self.lora_optimizer.load_state_dict(checkpoint['lora_optimizer_state_dict'])
+
             self.startEpoch = checkpoint.get('epoch', 0) + 1
             self.best_loss = checkpoint.get('best_loss', float('inf'))
-    
+
         # 6. Log info
         if self.log_to_screen:
             print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
@@ -1027,32 +1159,24 @@ class DownstreamTrainer():
 
     
             
-    def restore_checkpoint(self, checkpoint_path, load_optimizer_state=True):
-        """
-        Load checkpoint from file.
-
-        Args:
-            checkpoint_path: Path to checkpoint file
-            load_optimizer_state: If True, load optimizer/scheduler state (for resuming training).
-                                 If False, only load model weights (for pretrained initialization).
-        """
+    def restore_checkpoint(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cuda:{}'.format(self.device), weights_only=False)
         new_state_dict = {k.replace('module.', ''): v for k, v in checkpoint['model_state'].items()}
+        #try:
+            #self.model.load_state_dict(checkpoint['model_state'])
         self.model.load_state_dict(new_state_dict)
+        #except:
+        #    new_state_dict = OrderedDict()
+        #    for key, val in checkpoint['model_state'].items():
+        #        name = key[7:]
+        #        new_state_dict[name] = val 
+        #    self.model.load_state_dict(new_state_dict)
 
-        if load_optimizer_state:
-            # Load optimizer and scheduler state for resuming training
-            self.iters = checkpoint['iters']
-            self.startEpoch = checkpoint['epoch']+1 if self.iters % len(self.train_data_loader) == 0 else checkpoint['epoch']
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if self.scheduler is not None:
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        else:
-            # Only loaded model weights for pretrained initialization
-            self.iters = 0
-            self.startEpoch = 0
-            if self.world_rank == 0:
-                print(f"✅ Loaded pretrained weights only (optimizer state not loaded)")
+        self.iters = checkpoint['iters']
+        self.startEpoch = checkpoint['epoch']+1 if self.iters % len(self.train_data_loader) == 0 else checkpoint['epoch']
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
 
 

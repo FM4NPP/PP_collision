@@ -18,16 +18,23 @@ from torch.utils.data.distributed import DistributedSampler
 
 
 
-def knn_later_indices_batch(A, k):
+def knn_later_indices_batch(A, k, target=None, return_target=False, pad_value_target=0):
     """
     A: Tensor of shape (B, N, 3), where B = batch size, N = number of points per batch, D=3 coordinates.
        Assumed to be sorted by the last dimension if needed, but sorting is not mandatory for the logic here.
     k: Number of neighbors to find for each point, using only indices j > i.
+    target: Optional Tensor of shape (B, N) representing per-point targets.
+    return_target: If True and target is provided, also return knearest_target of shape (B, N, k)
+                   with padding value pad_value_target.
+    pad_value_target: Padding value used for invalid KNN slots in the returned target tensor (default 0).
     
     Returns:
-        Tensor of shape (B, N, 3*k):
-          - For each batch b, row i, we gather up to k neighbors from rows j>i.
-          - If fewer than k neighbors exist, the remainder is padded with -100.
+        - If return_target is False (default):
+            Tensor of shape (B, N, 3*k)
+        - If return_target is True and target is provided:
+            Tuple (neighbors, knearest_target)
+              neighbors: (B, N, 3*k)
+              knearest_target: (B, N, k)
     """
     B, N, D = A.shape
     assert D == 3, "A must have shape (B, N, 3)"
@@ -68,7 +75,6 @@ def knn_later_indices_batch(A, k):
         pad_size = k - k_limited
         inf_pad = torch.full((B, N, pad_size), float('inf'), device=A.device)
         minus1_pad = torch.full((B, N, pad_size), -1, device=A.device, dtype=torch.long)
-
         topk_vals = torch.cat([topk_vals, inf_pad], dim=2)    # (B, N, k)
         topk_idx  = torch.cat([topk_idx,  minus1_pad], dim=2) # (B, N, k)
 
@@ -76,30 +82,35 @@ def knn_later_indices_batch(A, k):
     inf_mask = torch.isinf(topk_vals)  # (B, N, k)
     topk_idx[inf_mask] = -1
 
-    # 6) We now gather the actual coordinates for these neighbor indices
-    #    - Create an output array full of -100 for padding
-    knn_neighbors = torch.full((B, N, k, D), -100, device=A.device, dtype=A.dtype)  # (B, N, k, 3)
-
-    # 6a) Build a "safe" version of the indices, replacing -1 with 0 to avoid index errors
+    # 6) Gather neighbor coordinates
+    knn_neighbors = torch.full((B, N, k, D), -100, device=A.device, dtype=A.dtype)
     safe_idx = topk_idx.clone()
     safe_idx[safe_idx < 0] = 0
+    valid_mask = (topk_idx >= 0)
+    b_idx = torch.arange(B, device=A.device).view(B, 1, 1).expand(B, N, k)
+    n_idx = torch.arange(N, device=A.device).view(1, N, 1).expand(B, N, k)
+    knn_neighbors[valid_mask] = A[b_idx[valid_mask], safe_idx[valid_mask], :]
+    knn_neighbors = knn_neighbors.view(B, N, 3*k)
 
-    # 6b) We'll do advanced indexing to fill valid neighbor slots
-    valid_mask = (topk_idx >= 0)  # (B, N, k) => True where neighbor is valid
+    if not return_target or target is None:
+        return knn_neighbors
 
-    # To do advanced indexing, we need the broadcasted batch/row/col indices:
-    b_idx = torch.arange(B, device=A.device).view(B, 1, 1).expand(B, N, k)    # (B, N, k)
-    n_idx = torch.arange(N, device=A.device).view(1, N, 1).expand(B, N, k)    # (B, N, k)
+    # Build knearest_target from indices
     # The "safe_idx" dimension is the neighbor index for each (b, n)
     # so we'll gather from dimension=1 in A => A[b, safe_idx, :]
     # We'll do advanced indexing on "neighbors[b, n, j, :]" = A[b, safe_idx[b, n, j], :]
+    B_t, N_t = target.shape
+    assert B_t == B and N_t == N, "target must have shape (B, N) to match A"
+    k_final = topk_idx.shape[-1]
+    safe_idx = topk_idx.clone()
+    safe_idx[safe_idx < 0] = 0
+    knearest_target = torch.full((B, N, k_final), pad_value_target, device=target.device, dtype=target.dtype)
+    valid_mask = topk_idx >= 0
+    b_idx = torch.arange(B, device=target.device).view(B, 1, 1).expand(B, N, k_final)
+    n_idx = torch.arange(N, device=target.device).view(1, N, 1).expand(B, N, k_final)
+    knearest_target[valid_mask] = target[b_idx[valid_mask], safe_idx[valid_mask]]
 
-    # Where valid, copy the data
-    knn_neighbors[valid_mask] = A[b_idx[valid_mask], safe_idx[valid_mask], :]
-
-    # 7) Finally, reshape to (B, N, 3*k)
-    knn_neighbors = knn_neighbors.view(B, N, 3*k)
-    return knn_neighbors
+    return knn_neighbors, knearest_target
 
 def swap_dim(arr, dims = [1,2]):
     c = arr.clone()
@@ -260,6 +271,34 @@ def set_simpler(inputs, target, nleave = 3, npoint_lower_thr = 5):
         return reduced_inputs, reduced_target
     
 class TPCBatchDataset(Dataset):
+    """TPC batch dataset for FM4NPP.
+
+    Loads ragged sequences from memmap files under a given `data_root`:
+      - features_<split>:  (N, 4) raw Cartesian features [E, x, y, z]
+      - seg_target_<split>:(N,)   integer class/track ids
+      - reg_target_<split>:(N, D) regression targets
+      - pid_target_<split>:(N,)   particle IDs
+
+    Pipeline (high level):
+      1) Read event arrays; optionally chunk in validation; convert to polar (η, φ, r)
+      2) Normalize features (z-normalize E, min-max for η/φ/r)
+      3) Sort by r (ascending) for a stable per-event ordering
+      4) Optionally compute K-nearest future neighbors per point (enforcing j > i)
+      5) Optionally reorder (space-filling or voxelize) once; apply the same sorter
+         to features, targets, and optionally knearest_* tensors
+      6) Optionally apply chunk-based slicing for training
+
+    Args:
+        data_root: Directory containing ragged memmaps
+        split: One of ['pretrain', 'test'] selecting which memmaps to open
+        group_size: Tokenizer grouping size (if voxelize=True)
+        order: Global coordinate order key (e.g., 'EPR') for voxelizer dimensions
+        num_pred_points: k for KNN (controls knearest_* widths)
+        return_dict: If True, returns a dict with named tensors; else returns tuples
+        return_knn_target: If True, includes knearest_target (N, k) with 0 padding
+        get_cart: If True, skip polar transform and keep original Cartesian coords
+        voxelize / space_filling_order: Mutually exclusive reordering strategies
+    """
     def __init__(self, 
                  data_root, 
                  version = 'pp_100k',
@@ -279,6 +318,7 @@ class TPCBatchDataset(Dataset):
                  limit_size = 8000,
                  return_reg = False,
                  return_dict = False,
+                 return_knn_target = False,
                  get_cart = False,
                  voxelize = True,
                  space_filling_order = None,
@@ -290,8 +330,14 @@ class TPCBatchDataset(Dataset):
         self.memmap_seg_target = RaggedMmap(os.path.join(data_root, 'seg_target_{}'.format(split)))
         self.memmap_reg_target = RaggedMmap(os.path.join(data_root, 'reg_target_{}'.format(split)))
         self.memmap_pid_target = RaggedMmap(os.path.join(data_root, 'pid_target_{}'.format(split)))
-        self.memmap_mid_target = RaggedMmap(os.path.join(data_root, 'pid_target_{}'.format(split)))
-        #self.memmap_mid_target = RaggedMmap(os.path.join(data_root, 'mid_target_{}'.format(split)))
+
+        # Try to load mid_target if available
+        try:
+            self.memmap_mid_target = RaggedMmap(os.path.join(data_root, 'mid_target_{}'.format(split)))
+            self.has_mid_target = True
+        except (FileNotFoundError, OSError):
+            self.memmap_mid_target = None
+            self.has_mid_target = False
 
         # voxelization ablation
         self.voxelize = voxelize
@@ -342,6 +388,7 @@ class TPCBatchDataset(Dataset):
         self.chunk_training = chunk_training
         self.return_reg = return_reg
         self.return_dict = return_dict
+        self.return_knn_target = return_knn_target
         self.get_cart = get_cart
         self.filter_data(high_thr = 3200)
         #self.filter_data(high_thr = 30000)
@@ -386,18 +433,16 @@ class TPCBatchDataset(Dataset):
         self.longest = 0
         self.shortest = 1e10
         self.toomanytracks = []
-        # print("[INFO] Filtering data by number of points. Low threshold: {}, High threshold: {}, Max tracks: {}".format(low_thr, high_thr, max_tracks))
-        print("[INFO] Filtering data by number of points. Low threshold: {}, High threshold: {}".format(low_thr, high_thr))
-        
+        print("[INFO] Filtering data by number of points. Low threshold: {}, High threshold: {}, Max tracks: {}".format(low_thr, high_thr, max_tracks))
         for i in range(len(self.memmap_feature)):
             len_ = self.memmap_feature[i].shape[0]
-            # ntracks = np.unique(self.memmap_seg_target[i])
+            ntracks = np.unique(self.memmap_seg_target[i])
             if len_ < low_thr:
                 self.tooshort.append(i)
             elif len_ > high_thr:
                 self.toolong.append(i)
-            # elif len(ntracks) > max_tracks:
-            #     self.toomanytracks.append(i)
+            elif len(ntracks) > max_tracks:
+                self.toomanytracks.append(i)
             else:
                 self.idxlist.append(i)
                 self.seqlens.append(len_)
@@ -412,8 +457,7 @@ class TPCBatchDataset(Dataset):
 
         # self.idxlist = create_sampled_lists_with_seq(self.idxlist, self.seqlens)
         
-        # print('[INFO] Filtering by N points. From {}, removed short {} long {}, too many tracks {}, remaining {}.'.format(len(self.memmap_feature), len(self.tooshort), len(self.toolong), len(self.toomanytracks), len(self.idxlist)))
-        print('[INFO] Filtering by N points. From {}, removed short {} long {}, remaining {}.'.format(len(self.memmap_feature), len(self.tooshort), len(self.toolong), len(self.idxlist)))
+        print('[INFO] Filtering by N points. From {}, removed short {} long {}, too many tracks {}, remaining {}.'.format(len(self.memmap_feature), len(self.tooshort), len(self.toolong), len(self.toomanytracks), len(self.idxlist)))
                                                                                                      
         print('[INFO] Shortest: {}, Longest: {}'.format(self.shortest, self.longest))
 
@@ -499,7 +543,16 @@ class TPCBatchDataset(Dataset):
         norm_features = norm_features[:, ind.squeeze()]      # reorder features by R
         norm_target   = target[:,           ind.squeeze()]   # reorder classification target by R
         norm_reg_target = reg_target[:,     ind.squeeze()]   # reorder regression target by R
-        knearest_points = knn_later_indices_batch(norm_features[..., 1:], k=self.num_pred_points)
+        if self.return_knn_target:
+            knearest_points, knearest_target = knn_later_indices_batch(
+                norm_features[..., 1:],
+                k=self.num_pred_points,
+                target=norm_target,
+                return_target=True,
+                pad_value_target=0,
+            )
+        else:
+            knearest_points = knn_later_indices_batch(norm_features[..., 1:], k=self.num_pred_points)
 
         # 2) Compute your “space‐filling” or voxel sort ONCE
 
@@ -522,20 +575,23 @@ class TPCBatchDataset(Dataset):
         serialized_target     = norm_target[:,    sorter].squeeze(0)
         serialized_reg_target = norm_reg_target[:,sorter].squeeze(0)
         knearest_points = knearest_points[:,sorter].squeeze(0)
+        if self.return_knn_target:
+            knearest_target = knearest_target[:, sorter].squeeze(0)
 
 
         # for return_dict branch, also do:
         if self.return_dict:
             pid_target = torch.from_numpy(np.copy(self.memmap_pid_target[real_idx])).unsqueeze(0)
-            #mid_target = torch.from_numpy(np.copy(self.memmap_mid_target[real_idx])).unsqueeze(0)
-
-            pid_target = pid_target[:,           ind.squeeze()]
-            #mid_target = mid_target[:,           ind.squeeze()]
-
+            pid_target = pid_target[:, ind.squeeze()]
             norm_pid_target = pid_target[:, sorter]
-            norm_mid_target = mid_target[:, sorter]
             serialized_pid_target = norm_pid_target.squeeze(0)
-            #serialized_mid_target = norm_mid_target.squeeze(0)
+
+            # Only load mid_target if available
+            if self.has_mid_target:
+                mid_target = torch.from_numpy(np.copy(self.memmap_mid_target[real_idx])).unsqueeze(0)
+                mid_target = mid_target[:, ind.squeeze()]
+                norm_mid_target = mid_target[:, sorter]
+                serialized_mid_target = norm_mid_target.squeeze(0)
 
         # 4) chunk‐train: apply the same slicing to every serialized_* tensor
         if self.chunk_training and self.train:
@@ -544,19 +600,28 @@ class TPCBatchDataset(Dataset):
             serialized_reg_target = serialized_reg_target[start_idx : start_idx+self.len_chunk]
             if self.return_dict:
                 serialized_pid_target = serialized_pid_target[start_idx : start_idx+self.len_chunk]
-                #serialized_mid_target = serialized_mid_target[start_idx : start_idx+self.len_chunk]
+                if self.has_mid_target:
+                    serialized_mid_target = serialized_mid_target[start_idx : start_idx+self.len_chunk]
+            if self.return_knn_target:
+                knearest_points = knearest_points[start_idx : start_idx+self.len_chunk]
+                knearest_target = knearest_target[start_idx : start_idx+self.len_chunk]
 
 
         # 5) Return everything
         if self.return_dict:
-            return {
+            out = {
                 'points':          serialized_points  * self.data_scaler,
                 'knearest_points': knearest_points   * self.data_scaler,
                 'target':          serialized_target,
                 'reg_target':      serialized_reg_target,
                 'pid_target':      serialized_pid_target,
-                #'mid_target':      serialized_mid_target,
             }
+            # Only include mid_target if it was loaded
+            if self.has_mid_target:
+                out['mid_target'] = serialized_mid_target
+            if self.return_knn_target:
+                out['knearest_target'] = knearest_target
+            return out
         elif self.return_reg:
             return (serialized_points * self.data_scaler,
                     serialized_target,
@@ -568,6 +633,16 @@ class TPCBatchDataset(Dataset):
                     knearest_points * self.data_scaler)
 
 class MyCollator:
+    """Batch collator that pads variable-length sequences.
+
+    Behavior:
+      - Dict samples: returns a dict of padded tensors with the same keys
+      - Tuple samples: returns a tuple (grouped, targets, knearest[, reg])
+
+    Padding:
+      - Pads to the longest N in the batch using pad_val (-100) for coordinates
+      - If `knearest_target` exists in the batch (dict mode), pads and returns it
+    """
     def __init__(self, pad_val=-100):
         self.pad_val = pad_val
 
@@ -589,16 +664,28 @@ class MyCollator:
         knearest = torch.stack([self.pad_tensor(d['knearest_points'], point_longest) for d in batch])
         reg = torch.stack([self.pad_tensor(d['reg_target'], point_longest) for d in batch])
         pid = torch.stack([self.pad_tensor(d['pid_target'].unsqueeze(-1), point_longest).squeeze(-1) for d in batch])
-        #mid = torch.stack([self.pad_tensor(d['mid_target'].unsqueeze(-1), point_longest).squeeze(-1) for d in batch])
+        has_mid_target = 'mid_target' in batch[0]
+        if has_mid_target:
+            mid = torch.stack([
+                self.pad_tensor(d['mid_target'].unsqueeze(-1), point_longest).squeeze(-1)
+                for d in batch
+            ])
+        has_knn_target = 'knearest_target' in batch[0]
+        if has_knn_target:
+            knn_t = torch.stack([self.pad_tensor(d['knearest_target'], point_longest) for d in batch])
 
-        return {
+        out = {
             'points': grouped,
             'target': targets,
             'knearest_points': knearest,
             'reg_target': reg,
             'pid_target': pid,
-            #'mid_target': mid
         }
+        if has_mid_target:
+            out['mid_target'] = mid
+        if has_knn_target:
+            out['knearest_target'] = knn_t
+        return out
 
     def collate_tuple(self, batch):
         point_longest = max(g.size(0) for g, _, _, *_ in batch)
@@ -622,6 +709,17 @@ class MyCollator:
 
 
 def get_data_loader(params, distributed):
+    """Construct train/test dataloaders from params.
+
+    Expects params to provide (at minimum):
+      - data_root, data_root_test, data_version, group_size, num_data_workers
+      - order, klen (used as num_pred_points), len_chunk, chunk_training
+      - stat_dir, voxelize, space_filling_order, space_filling_curve
+      - return_dict, return_reg_test, and optionally return_knn_target
+
+    Returns:
+      train_dataloader, train_sampler, test_dataloader, test_sampler
+    """
 
     train_dataset = TPCBatchDataset(data_root = params.data_root, 
                                     version = params.data_version, 
@@ -637,6 +735,7 @@ def get_data_loader(params, distributed):
                                     chunk_training = params.chunk_training,
                                     bin_dir = params.stat_dir,
                                     return_dict= params.return_dict,
+                                    return_knn_target = getattr(params, 'return_knn_target', False),
                                     voxelize = params.voxelize,
                                     space_filling_order = params.space_filling_order,
                                     space_filling_curve = params.space_filling_curve,
@@ -653,6 +752,7 @@ def get_data_loader(params, distributed):
                                    bin_dir = params.stat_dir,
                                    order = params.order,
                                    return_dict = params.return_dict,
+                                   return_knn_target = getattr(params, 'return_knn_target', False),
                                    return_reg=params.return_reg_test,
                                    voxelize = params.voxelize,
                                    space_filling_order = params.space_filling_order,

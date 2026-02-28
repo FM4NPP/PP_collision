@@ -49,11 +49,10 @@ class MambaGPT(nn.Module):
             feature.append(z)
             x = z + x           
             
-        x = self.norm(x)
-        
         if return_z:
-            return self.output_layer(x) * out_scale, feature, pos
+            return None, feature, pos
         else:
+            x = self.norm(x)
             return self.output_layer(x) * out_scale
 
 
@@ -90,9 +89,9 @@ class Mamba1GPT(nn.Module):
             z = layer(x)
             feature.append(z)
             x = z + x           
-        x = self.norm(x)
         #feature.append(x)
         if return_z:
-            return self.output_layer(x) * out_scale, feature, pos
+            return None, feature, pos
         else:
+            x = self.norm(x)
             return self.output_layer(x) * out_scale

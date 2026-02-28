@@ -67,7 +67,60 @@ class FFNBlock(nn.Module):
             return x + self.ffn(x_norm)
         else:
             return self.norm(x + self.ffn(x))
-        
+
+
+class SetTransformerPooling(nn.Module):
+    """
+    Lightweight Set Transformer block that applies a stack of
+    self-attention blocks followed by pooling via multihead attention
+    with learnable seed vectors (PMA).
+    """
+
+    def __init__(
+        self,
+        embed_dim,
+        num_heads=4,
+        num_sab_layers=1,
+        num_seeds=4,
+        ffn_dim=None,
+        dropout=0.1,
+    ):
+        super().__init__()
+        ffn_dim = ffn_dim or 2 * embed_dim
+        self.sab_layers = nn.ModuleList([
+            nn.ModuleList([
+                SelfAttentionBlock(embed_dim, num_heads, dropout=dropout, prenorm=True),
+                FFNBlock(embed_dim, ffn_dim, prenorm=True),
+            ])
+            for _ in range(num_sab_layers)
+        ])
+        self.num_seeds = num_seeds
+        self.seed_vectors = nn.Parameter(torch.randn(num_seeds, embed_dim))
+        self.pma_attn = CrossAttentionBlock(embed_dim, num_heads, dropout=dropout, prenorm=True)
+        self.pma_ffn = FFNBlock(embed_dim, ffn_dim, prenorm=True)
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x: (B, N, D)
+            mask: (B, N) boolean mask (True for valid entries)
+        Returns:
+            pooled: (B, D)
+        """
+        pad_mask = None
+        if mask is not None:
+            pad_mask = ~mask
+
+        seq = x.transpose(0, 1)  # (N, B, D)
+        for self_attn, ffn in self.sab_layers:
+            seq = self_attn(seq, key_padding_mask=pad_mask)
+            seq = ffn(seq)
+
+        seeds = self.seed_vectors.unsqueeze(1).expand(-1, x.size(0), -1)  # (K, B, D)
+        pooled_seq = self.pma_attn(seeds, seq, seq, key_padding_mask=pad_mask)
+        pooled_seq = self.pma_ffn(pooled_seq)  # (K, B, D)
+        pooled = pooled_seq.transpose(0, 1).mean(dim=1)  # (B, D)
+        return pooled
 
 class MLPHead(nn.Module):
     def __init__(self, embed_dim, output_dim, dropout=0.0):
@@ -162,7 +215,7 @@ class MambaAttentionHead(nn.Module):
         # Noise prediction head go from point embedding
         self.noise_mlp = MLPHead(embed_dim, 2)
 
-        self.embedder = EmbedderAdd(pe_method='nerf', embed_dim=input_dim, learnable_projection=False)
+        self.embedder = Embedder(embed_dim=input_dim)
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
 
     def make_predictions(self, refined_protos, point_features):
@@ -242,9 +295,13 @@ class MambaAttentionHead(nn.Module):
         if pretrain:
             x = feature.permute(1, 2, 0, 3)
             weights = torch.softmax(self.weighted_avg_weights, dim=0)
+            # Ensure dtype consistency for einsum operation
+            weights = weights.to(x.dtype)
             x = torch.einsum('bsnd,n->bsd', x, weights)
         else:
             x = self.embedder(x)
+            if isinstance(x, tuple):
+                x = x[0]
 
         embedding_pre_proj = None
         embedding_post_proj = None
@@ -326,7 +383,7 @@ class MambaAttentionHead(nn.Module):
 class MambaHead(nn.Module):
     def __init__(self, input_dim, embed_dim=256, num_layers=3, d_state=64, d_conv=4, expand=2, 
                  num_embedder_layers=1, d_state_embedder=64, d_conv_embedder=4, expand_embedder=2,
-                 num_feature_layers=15, num_output_dim=5, return_embedding=False):
+                 num_feature_layers=15, num_output_dim=5, return_embedding=False, dropout=0.0):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
@@ -367,9 +424,9 @@ class MambaHead(nn.Module):
         self.norm = RMSNorm(embed_dim)
 
         # Noise prediction head go from point embedding
-        self.out_mlp = MLPHead(embed_dim, num_output_dim)
+        self.out_mlp = MLPHead(embed_dim, num_output_dim, dropout=dropout)
 
-        self.embedder = EmbedderAdd(pe_method='nerf', embed_dim=input_dim, learnable_projection=False)
+        self.embedder = Embedder(embed_dim=input_dim)
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
 
 
@@ -378,9 +435,13 @@ class MambaHead(nn.Module):
         if pretrain:
             x = feature.permute(1, 2, 0, 3)
             weights = torch.softmax(self.weighted_avg_weights, dim=0)
+            # Ensure dtype consistency for einsum operation
+            weights = weights.to(x.dtype)
             x = torch.einsum('bsnd,n->bsd', x, weights)
         else:
             x = self.embedder(x)
+            if isinstance(x, tuple):
+                x = x[0]
             for layer in self.mamba_embedder_layers:
                 x = layer(x) + x
             x = self.embedder_norm(x)
@@ -413,11 +474,16 @@ class MambaHead(nn.Module):
 class AttentionHead(nn.Module):
     def __init__(self, input_dim, embed_dim=256, num_layers=3, num_heads = 4, 
                  num_embedder_layers=1, d_state_embedder=64, d_conv_embedder=4, expand_embedder=2,
-                 num_feature_layers=15, num_output_dim=5, return_embedding=False):
+                 num_feature_layers=15, num_output_dim=5, return_embedding=False, embed_method='add', pe_method = 'nerf', dropout=0.0, ffn_dim=512, adapter_FFN = True):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
         self.return_embedding = return_embedding
+        self.FFN = adapter_FFN
+        if embed_method == 'concat':
+            Embedder = EmbedderConcat
+        else:
+            Embedder = EmbedderAdd
 
         # Input processing
         self.input_proj = nn.Sequential(
@@ -434,6 +500,17 @@ class AttentionHead(nn.Module):
             )
             for _ in range(num_layers)
         ])
+        #ffn layers
+        if self.FFN:
+            self.ffn_layers = nn.ModuleList([
+                FFNBlock(
+                    embed_dim=embed_dim,
+                    ffn_dim=ffn_dim,
+                )
+                for _ in range(num_layers)
+            ])
+        else:
+            self.ffn_layers = []
         # if not using the pretrained mamba2, we can use the embedder layers
         self.mamba_embedder_layers = nn.ModuleList([
             nn.Sequential(
@@ -450,9 +527,9 @@ class AttentionHead(nn.Module):
         self.norm = RMSNorm(embed_dim)
 
         # Noise prediction head go from point embedding
-        self.out_mlp = MLPHead(embed_dim, num_output_dim)
+        self.out_mlp = MLPHead(embed_dim, num_output_dim, dropout=dropout)
 
-        self.embedder = EmbedderAdd(pe_method='nerf', embed_dim=input_dim, learnable_projection=False)
+        self.embedder = Embedder(pe_method = 'nerf', embed_dim=input_dim)
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
 
 
@@ -461,9 +538,13 @@ class AttentionHead(nn.Module):
         if pretrain:
             x = feature.permute(1, 2, 0, 3)
             weights = torch.softmax(self.weighted_avg_weights, dim=0)
+            # Ensure dtype consistency for einsum operation
+            weights = weights.to(x.dtype)
             x = torch.einsum('bsnd,n->bsd', x, weights)
         else:
             x = self.embedder(x)
+            if isinstance(x, tuple):
+                x = x[0]
             for layer in self.mamba_embedder_layers:
                 x = layer(x) + x
             x = self.embedder_norm(x)
@@ -481,16 +562,402 @@ class AttentionHead(nn.Module):
             embedding_post_projection = x
         
         x = x.transpose(0, 1) #(N,B,D)
-        # Process through SA layers
-        for layer in self.SA_layers:
-            x = layer(x, key_padding_mask=~padding_mask)
+        # Process through SA + FFN layers
+        if self.FFN:
+            for sa_layer, ffn_layer in zip(self.SA_layers, self.ffn_layers):
+                x = sa_layer(x, key_padding_mask=~padding_mask)
+                x = ffn_layer(x)
+        else:
+            for sa_layer in self.SA_layers:
+                x = sa_layer(x, key_padding_mask=~padding_mask)
+                x = x
         x = self.norm(x)
         x = x.transpose(0, 1) #(B,N,D)
         #noise prediction
         out_logits = self.out_mlp(x) # (B, N, num_output_dim)
-        
+
         return {
             'pred_logits': out_logits,  # (B, N, num_output_dim)
             'embedding_pre_projection': embedding_pre_projection,
             'embedding_post_projection': embedding_post_projection
         }
+
+
+class EventClassificationHead(nn.Module):
+    """
+    Event-level classification head for binary weak decay detection.
+    Uses transformer self-attention + FFN to aggregate point-level features
+    into a single event-level prediction.
+    """
+    def __init__(
+        self,
+        input_dim=256,
+        embed_dim=256,
+        num_layers=1,
+        num_heads=4,
+        ffn_dim=512,
+        num_feature_layers=12,
+        num_output_classes=2,
+        pooling='set_transformer',  # 'mean', 'max', 'both', 'learnable', 'set_transformer'
+        dropout=0.1,
+        return_embedding=False
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+        allowed_poolings = {'mean', 'max', 'both', 'learnable', 'set_transformer'}
+        if pooling not in allowed_poolings:
+            raise ValueError(f"Unsupported pooling '{pooling}'. Choose from {allowed_poolings}.")
+        self.pooling = pooling
+        self.return_embedding = return_embedding
+
+        # Weighted aggregation of pretrained backbone layers
+        self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
+
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, embed_dim)
+        )
+
+        # Transformer layers (self-attention + FFN)
+        self.transformer_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'self_attn': SelfAttentionBlock(embed_dim, num_heads, dropout=dropout, prenorm=True),
+                'ffn': FFNBlock(embed_dim, ffn_dim, prenorm=True)
+            })
+            for _ in range(num_layers)
+        ])
+
+        # Final normalization
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # Set Transformer pooling setup (keeps output dim = embed_dim)
+        if self.pooling == 'set_transformer':
+            self.set_pool = SetTransformerPooling(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_sab_layers=1,
+                num_seeds=4,
+                ffn_dim=ffn_dim,
+                dropout=dropout,
+            )
+
+        # Classification head
+        # If pooling='both', input is 2*embed_dim (mean + max concatenated)
+        pool_dim = 2 * embed_dim if pooling == 'both' else embed_dim
+        self.classifier = nn.Sequential(
+            nn.Linear(pool_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, num_output_classes)
+        )
+
+        if self.pooling == 'learnable':
+            hidden_dim = max(embed_dim // 2, 1)
+            self.pool_attn = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1)
+            )
+
+    def global_pool(self, x, mask):
+        """
+        Global pooling with padding mask handling.
+
+        Args:
+            x: (B, N, D) point features
+            mask: (B, N) boolean mask (True for valid, False for padded)
+
+        Returns:
+            pooled: (B, D) or (B, 2*D) depending on self.pooling
+        """
+        if self.pooling == 'set_transformer':
+            return self.set_pool(x, mask)
+        if self.pooling == 'learnable':
+            attn_logits = self.pool_attn(x).squeeze(-1)  # (B, N)
+            attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+            attn_weights = torch.softmax(attn_logits, dim=1)
+            attn_weights = attn_weights.masked_fill(~mask, 0.0)
+
+            no_valid = (~mask).all(dim=1)
+            if no_valid.any():
+                attn_weights = attn_weights.clone()
+                attn_weights[no_valid] = 1.0 / attn_weights.size(1)
+
+            pooled = (attn_weights.unsqueeze(-1) * x).sum(dim=1)
+            return pooled
+
+        # Expand mask for broadcasting
+        mask_expanded = mask.unsqueeze(-1).float()  # (B, N, 1)
+
+        pooled_features = []
+
+        if self.pooling in ['mean', 'both']:
+            # Mean pooling: masked sum / count
+            masked_sum = (x * mask_expanded).sum(dim=1)  # (B, D)
+            counts = mask_expanded.sum(dim=1).clamp(min=1)  # Avoid division by zero
+            mean_pool = masked_sum / counts
+            pooled_features.append(mean_pool)
+
+        if self.pooling in ['max', 'both']:
+            # Max pooling: set padded positions to -inf before max
+            x_masked = x.clone()
+            x_masked[~mask.unsqueeze(-1).expand_as(x)] = float('-inf')
+            max_pool = x_masked.max(dim=1)[0]  # (B, D)
+            # Handle edge case: all-padded (shouldn't happen, but be safe)
+            max_pool[max_pool == float('-inf')] = 0
+            pooled_features.append(max_pool)
+
+        # Concatenate mean and max if using both
+        return torch.cat(pooled_features, dim=-1)  # (B, D) or (B, 2*D)
+
+    def forward(self, points, feature=None, pretrain=True, padding_mask=None):
+        """
+        Forward pass for event classification.
+
+        Args:
+            points: (B, N, 4) raw point features (not used directly, for API consistency)
+            feature: (B, S, N, D) pretrained backbone features from multiple layers
+            pretrain: bool, whether using pretrained features
+            padding_mask: (B, N) boolean mask (True for valid, False for padded)
+
+        Returns:
+            dict with:
+                'event_logits': (B, num_output_classes)
+                'event_probs': (B, num_output_classes)
+                'pooled_features': (B, pool_dim)
+                'embedding_pre_projection': optional
+                'embedding_post_projection': optional
+        """
+        if padding_mask is None:
+            b, n = points.shape[:2]
+            padding_mask = torch.ones(b, n, dtype=torch.bool, device=points.device)
+
+        # Aggregate pretrained features using learnable weights
+        if pretrain and feature is not None:
+            # feature: (S,B, N, D) where S is num_feature_layers
+            x = feature.permute(1, 2, 0, 3) #(B, N, S, D)
+            weights = torch.softmax(self.weighted_avg_weights, dim=0)  # (S,)
+            x = torch.einsum('bnsd,s->bnd', x, weights)  # (B, N, D)
+        else:
+            # For non-pretrain mode (shouldn't be used for this model, but for safety)
+            x = points  # (B, N, D)
+
+        # Store embeddings if requested
+        embedding_pre_projection = x if self.return_embedding else None
+
+        # Input projection
+        x = self.input_proj(x)  # (B, N, embed_dim)
+
+        embedding_post_projection = x if self.return_embedding else None
+
+        # Transpose for PyTorch MultiheadAttention: (N, B, D)
+        x = x.transpose(0, 1)
+
+        # Process through transformer layers
+        for layer_dict in self.transformer_layers:
+            # Self-attention with padding mask
+            x = layer_dict['self_attn'](x, key_padding_mask=~padding_mask)
+            # FFN
+            x = layer_dict['ffn'](x)
+
+        # Final normalization
+        x = self.norm(x)
+
+        # Transpose back: (B, N, D)
+        x = x.transpose(0, 1)
+
+        # Global pooling to get event-level features
+        pooled = self.global_pool(x, padding_mask)  # (B, pool_dim)
+
+        # Classification
+        event_logits = self.classifier(pooled)  # (B, num_output_classes)
+        event_probs = torch.softmax(event_logits, dim=-1)
+
+        return {
+            'event_logits': event_logits,
+            'event_probs': event_probs,
+            'pooled_features': pooled,
+            'embedding_pre_projection': embedding_pre_projection,
+            'embedding_post_projection': embedding_post_projection
+        }
+
+
+class MultiTaskAttentionHead(nn.Module):
+    """
+    Multi-task attention head for joint PID + NID classification.
+
+    Architecture:
+    - Shared input projection (same for both tasks)
+    - Shared self-attention + FFN layers
+    - Separate task-specific output heads
+
+    This maximizes parameter sharing while maintaining task-specific
+    capacity only for final predictions.
+    """
+
+    def __init__(
+        self,
+        input_dim=256,
+        embed_dim=256,
+        num_shared_sa_layers=1,
+        num_heads=4,
+        ffn_dim=512,
+        num_feature_layers=12,
+        num_pid_classes=5,
+        num_nid_classes=2,
+        dropout=0.1,
+        adapter_FFN=True,
+        embed_method='add',
+        pe_method='nerf',
+        return_embedding=False
+    ):
+        """
+        Args:
+            input_dim: Dimension of backbone features
+            embed_dim: Embedding dimension for SA layers
+            num_shared_sa_layers: Number of shared SA+FFN blocks
+            num_heads: Number of attention heads
+            ffn_dim: Hidden dimension in FFN
+            num_feature_layers: Number of backbone layers to aggregate
+            num_pid_classes: Number of PID classes (5)
+            num_nid_classes: Number of NID classes (2)
+            dropout: Dropout probability
+            adapter_FFN: Whether to include FFN after SA
+            embed_method: Embedding method (for compatibility)
+            pe_method: Position encoding method (for compatibility)
+            return_embedding: Whether to return intermediate embeddings
+        """
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        self.num_shared_sa_layers = num_shared_sa_layers
+        self.return_embedding = return_embedding
+        self.adapter_FFN = adapter_FFN
+
+        # Weighted feature aggregation from backbone layers
+        self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
+
+        # Shared input projection (used by both tasks)
+        self.input_proj = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, embed_dim)
+        )
+
+        # Shared self-attention layers
+        self.shared_sa_layers = nn.ModuleList([
+            SelfAttentionBlock(embed_dim, num_heads, dropout=dropout, prenorm=True)
+            for _ in range(num_shared_sa_layers)
+        ])
+
+        # Shared FFN layers (if enabled)
+        if adapter_FFN:
+            self.shared_ffn_layers = nn.ModuleList([
+                FFNBlock(embed_dim, ffn_dim, prenorm=True)
+                for _ in range(num_shared_sa_layers)
+            ])
+
+        # Final normalization
+        self.shared_norm = RMSNorm(embed_dim)
+
+        # Task-specific classification heads
+        self.pid_head = MLPHead(embed_dim, num_pid_classes, dropout=dropout)
+        self.nid_head = MLPHead(embed_dim, num_nid_classes, dropout=dropout)
+
+        # Embedding layers (reuse upstream embedder implementations)
+        if embed_method == 'concat':
+            embedder_cls = EmbedderConcat
+        else:
+            embedder_cls = EmbedderAdd
+        self.embedder = embedder_cls(
+            pe_method=pe_method,
+            embed_dim=input_dim,
+            learnable_projection=False
+        )
+        self.embedder_norm = RMSNorm(input_dim)
+        # No additional Mamba embedder layers (num_embedder_layers=0)
+        self.mamba_embedder_layers = nn.ModuleList([])
+
+    def forward(self, x, feature=None, padding_mask=None, pretrain=True, task='both'):
+        """
+        Forward pass for multi-task learning.
+
+        Args:
+            x: Input features (B, N, 4) if not pretrain, not used if pretrain
+            feature: Backbone features (S, B, N, D) if pretrain
+            padding_mask: (B, N) boolean mask (True for valid, False for padded)
+            pretrain: Whether using pretrained backbone
+            task: 'pid', 'nid', or 'both' - which task(s) to compute
+
+        Returns:
+            dict with 'pid_logits' and/or 'nid_logits' depending on task
+        """
+        # Feature aggregation from backbone
+        if pretrain and feature is not None:
+            # feature: (S, B, N, D) where S = num_layers_backbone
+            x = feature.permute(1, 2, 0, 3)  # (B, N, S, D)
+
+            # Weighted average across backbone layers
+            weights = torch.softmax(self.weighted_avg_weights, dim=0)
+            weights = weights.to(x.dtype)
+            x = torch.einsum('bnsd,s->bnd', x, weights)  # (B, N, D)
+        else:
+            # Not using pretrained features - encode from raw input
+            x = self.embedder(x)  # (B, N, D)
+            if isinstance(x, tuple):
+                x = x[0]
+            for layer in self.mamba_embedder_layers:
+                x = layer(x) + x
+            x = self.embedder_norm(x)
+
+        # Shared input projection
+        x = self.input_proj(x)  # (B, N, embed_dim)
+
+        # Apply shared SA + FFN layers
+        x = self._apply_shared_layers(x, padding_mask)
+
+        # Task-specific heads
+        outputs = {}
+
+        if task in ['pid', 'both']:
+            outputs['pid_logits'] = self.pid_head(x)  # (B, N, num_pid_classes)
+
+        if task in ['nid', 'both']:
+            outputs['nid_logits'] = self.nid_head(x)  # (B, N, num_nid_classes)
+
+        return outputs
+
+    def _apply_shared_layers(self, x, padding_mask):
+        """
+        Apply shared SA + FFN layers.
+
+        Args:
+            x: Input features (B, N, embed_dim)
+            padding_mask: (B, N) boolean mask
+
+        Returns:
+            Processed features (B, N, embed_dim)
+        """
+        # Transpose for PyTorch MultiheadAttention (expects N, B, D)
+        x = x.transpose(0, 1)  # (N, B, D)
+
+        # Apply shared layers
+        for i, sa_layer in enumerate(self.shared_sa_layers):
+            # Self-attention with padding mask
+            x = sa_layer(x, key_padding_mask=~padding_mask)
+
+            # FFN (if enabled)
+            if self.adapter_FFN:
+                x = self.shared_ffn_layers[i](x)
+
+        # Final normalization
+        x = self.shared_norm(x)
+
+        # Transpose back to (B, N, D)
+        x = x.transpose(0, 1)
+
+        return x

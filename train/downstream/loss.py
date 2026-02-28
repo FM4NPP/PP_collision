@@ -81,6 +81,7 @@ def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor, mask: torch.Ten
         (B, N_pred, N_gt) - Dice loss matrix between all prediction-target pairs
     """
 
+    targets = targets.to(inputs.dtype)  # align dtypes: targets are float32, inputs may be bfloat16
     inputs = inputs * mask.unsqueeze(1)  # (B, N_pred, N_points)
     targets = targets * mask.unsqueeze(1)          # (B, N_gt, N_points)
 
@@ -119,6 +120,7 @@ def matched_dice_loss(
         Scalar DICE loss averaged over matches
     """
     # Apply valid mask to both predictions and targets
+    tgt_masks = tgt_masks.to(src_masks.dtype)  # align dtypes: tgt_masks are float32, src_masks may be bfloat16
     src_masks = src_masks * valid
     tgt_masks = tgt_masks * valid
 
@@ -146,16 +148,18 @@ def batch_focal_loss(inputs: torch.Tensor, targets: torch.Tensor, mask: torch.Te
     inputs = inputs * mask.unsqueeze(1)   # (B, N_pred, N_points)
     targets = targets * mask.unsqueeze(1) # (B, N_gt, N_points)
 
-    prob = inputs # (B, N_pred, N_points)
-    
-    # Focal loss components
-    focal_pos = ((1 - prob) ** gamma) * F.binary_cross_entropy(
-        inputs, torch.ones_like(inputs), reduction="none"
-    )  # (B, N_pred, N_points)
-    
-    focal_neg = (prob ** gamma) * F.binary_cross_entropy(
-        inputs, torch.zeros_like(inputs), reduction="none"
-    )  # (B, N_pred, N_points)
+    prob = inputs.float() # (B, N_pred, N_points)
+
+    # Focal loss components — disable autocast: F.binary_cross_entropy is
+    # unconditionally unsafe inside any autocast context regardless of dtype.
+    with torch.autocast('cuda', enabled=False):
+        focal_pos = ((1 - prob) ** gamma) * F.binary_cross_entropy(
+            prob, torch.ones_like(prob), reduction="none"
+        )  # (B, N_pred, N_points)
+
+        focal_neg = (prob ** gamma) * F.binary_cross_entropy(
+            prob, torch.zeros_like(prob), reduction="none"
+        )  # (B, N_pred, N_points)
 
     # Apply alpha weighting
     if alpha >= 0:
@@ -198,16 +202,17 @@ def matched_focal_loss(
     src_masks = src_masks.flatten(1)
     tgt_masks = tgt_masks.flatten(1)
 
-    # Compute probabilities
-    prob = src_masks
+    prob = src_masks.float()
 
-    # Focal loss components
-    focal_pos = ((1 - prob) ** gamma) * F.binary_cross_entropy(
-        prob, torch.ones_like(prob), reduction="none"
-    )
-    focal_neg = (prob ** gamma) * F.binary_cross_entropy(
-        prob, torch.zeros_like(prob), reduction="none"
-    )
+    # Focal loss components — disable autocast: F.binary_cross_entropy is
+    # unconditionally unsafe inside any autocast context regardless of dtype.
+    with torch.autocast('cuda', enabled=False):
+        focal_pos = ((1 - prob) ** gamma) * F.binary_cross_entropy(
+            prob, torch.ones_like(prob), reduction="none"
+        )
+        focal_neg = (prob ** gamma) * F.binary_cross_entropy(
+            prob, torch.zeros_like(prob), reduction="none"
+        )
 
     # Apply alpha weighting
     if alpha >= 0:
