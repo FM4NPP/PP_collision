@@ -13,7 +13,7 @@ David Keetae Park\*, Shuhang Li\*, Yi Huang\*, Xihaier Luo, Haiwang Yu, Yeonju G
 
 \* equal contribution; † corresponding author
 
-[[`OpenReview`](https://openreview.net/forum?id=qaI3cLFsiX)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`Dataset Paper`](https://www.sciencedirect.com/science/article/pii/S2352340925011060)] [[`BibTeX`](#citation)]
+[[`OpenReview`](https://openreview.net/forum?id=qaI3cLFsiX)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`Dataset Paper`](https://www.sciencedirect.com/science/article/pii/S2352340925011060)] [[`BibTeX`](#citation)]  [[`Model Checkpoints`](https://drive.google.com/drive/folders/1iNHtLD80ucCNwYQQmLHCnsUD1rI7NgXY?usp=sharing)]
 
 --- 
 
