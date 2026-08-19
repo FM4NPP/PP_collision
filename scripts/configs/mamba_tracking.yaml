@@ -56,6 +56,9 @@ default: &default
   pe_method: nerf
 
   # === Downstream Head Configuration ===
+  # [FIX B1] track_finding_trainer.py reads params.downstream_dropout, which was defined
+  # nowhere in this file -> AttributeError on every downstream run.
+  downstream_dropout: 0.1
   num_heads_backbone: 4
   num_heads_decoder: 2
   num_heads_encoder: 2
@@ -74,6 +77,9 @@ default: &default
 
   # === Data Processing ===
   return_reg: false
+  # [B19] track_finding_trainer.py unpacks TUPLES from the dataloader (lines ~435/799/923),
+  # so tracking requires return_dict: false. point_classification_trainer.py consumes
+  # DICTS and needs return_dict: true. Do not share one value across both tasks.
   return_dict: false
   voxelize: true
 
@@ -86,13 +92,21 @@ mamba_5m_downstream:
   num_layers_backbone: 12
   d_state: 16
   klen: 30
-  dropout: 0.1
+  # [FIX] `dropout` is the FROZEN BACKBONE's dropout and must stay 0.0 for the released
+  # checkpoints; the trainable head's rate is `downstream_dropout` (see &default).
+  dropout: 0.0
   max_lr: 0.0001
   min_lr: 0.00001
-  mambaversion: mamba1
+  # [FIX B10] the released checkpoints are Mamba2. Note that both entrypoints end with
+  # `params.mambaversion = args.mambaversion` and --mambaversion defaults to "mamba2",
+  # so this key was silently overridden anyway -- the advertised mamba1 never ran.
+  mambaversion: mamba2
 
-  # === Pretrained Checkpoint (UPDATE THIS) ===
-  pretrained_ckpt: /global/cfs/cdirs/m4722/NPFM/pretrained_models/pp_m3_k5.ckpt
+  # === Pretrained Checkpoint ===
+  # [FIX B11] HF: https://huggingface.co/FM4NPP/PP_collision
+  # NOTE the naming trap: pp_nerf_m1_k30.ckpt is width 256 / 5.3M params, which the
+  # PAPER calls m3. Repo "m1" != paper "m1".
+  pretrained_ckpt: ./checkpoints/pp_nerf_m1_k30.ckpt
 
 # ============================================================================
 # Mamba2 5M Downstream Configuration

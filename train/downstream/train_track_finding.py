@@ -6,6 +6,8 @@ import os
 import sys
 import argparse
 import gc
+import random
+import numpy as np
 
 import torch
 
@@ -15,6 +17,22 @@ sys.path.append('../..')
 
 from fm4npp.utils import YParams
 from track_finding_trainer import DownstreamTrainer
+
+
+def set_seed(seed):
+    """[FIX B8] Set all random seeds for reproducibility.
+
+    Without this the downstream run is non-deterministic and the paper's
+    multi-seed studies cannot be reproduced.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU setups
+    np.random.seed(seed)
+    random.seed(seed)
+
+    print(f"Random seed set to: {seed}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Downstream tracking training script")
@@ -40,7 +58,11 @@ def main():
     parser.set_defaults(usepretrain=True)
     parser.add_argument("--train_batch_size", default=32, type=int, help="train batch size")
     parser.add_argument("--mambaversion", default="mamba2", type=str, help="mambd2/mamba1 for the pretrain model")
+    parser.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility")
     args = parser.parse_args()
+
+    # [FIX B8] seed before anything touches an RNG
+    set_seed(args.seed)
 
     # Mapping from model name to log file and checkpoint paths
     model2log = {
@@ -104,7 +126,9 @@ def main():
     params.limit_size = int(args.eventnumber)
     params.valid_batch_size = 1
     params.pretrained_ckpt = model2ckpt[args.config]
-    base_name = f"{args.config}_nerf_tracking_head_d{params.limit_size}_{args.run_num}"
+    # [FIX B8] the seed must appear in artifact names, otherwise runs at different seeds
+    # overwrite each other and eval cannot find the checkpoint it is asked for.
+    base_name = f"{args.config}_nerf_tracking_head_d{params.limit_size}_{args.run_num}_seed{args.seed}"
     if args.usepretrain:
         params.log_file_name = base_name + ".log"
     else:

@@ -406,9 +406,13 @@ class DownstreamTrainer():
         #    num_prototypes=self.params.max_gt_classes
         #).to(self.device)
 
+        # [FIX B3] embed_method='concat' is what the published downstream head uses;
+        # dropping it silently builds EmbedderAdd instead of EmbedderConcat, which is a
+        # different architecture with a different parameter count.
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
-                                  num_embedder_layers= self.params.num_embedder_layers, 
-                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes, dropout= self.params.downstream_dropout).to(self.device)
+                                  num_embedder_layers= self.params.num_embedder_layers,
+                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes, dropout= self.params.downstream_dropout,
+                                  embed_method='concat').to(self.device)
     
         total_params = sum(p.numel() for p in self.down_model.parameters())
         print(f"Total parameters in down_model: {total_params}")
@@ -449,6 +453,11 @@ class DownstreamTrainer():
         self.down_model.eval()
         self.model.eval()
         print(f"✅ Model loaded from {checkpoint_path}")
+        # [FIX B20] this assignment was deleted from inference() but the variable is still
+        # used at the autocast() call below -> NameError on every evaluation run.
+        # (downstream_end_to_end_one_epoch and validate_end_to_end_one_epoch both keep
+        # their own copy, which is why only eval was broken.)
+        amp_enabled = torch.cuda.is_available() and self.use_amp
 
         seg_target = []
         segmentation_result = []
@@ -678,9 +687,11 @@ class DownstreamTrainer():
             print(f"✅ Mamba v2 Model Initialized (Safe Scaling for {num_layers} Layers")
                 
     
+        # [FIX B3] see above.
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
-                                  num_embedder_layers= self.params.num_embedder_layers, 
-                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes).to(self.device)
+                                  num_embedder_layers= self.params.num_embedder_layers,
+                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes,
+                                  embed_method='concat').to(self.device)
         
         initialize_mamba2(self.down_model, 3, num_residuals=1)
 

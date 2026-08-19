@@ -2,206 +2,125 @@
 """
 Example Usage of FM4NPP Models
 
-This script demonstrates how to:
-1. Load pretrained Mamba models
-2. Create downstream models
-3. Run inference on particle data
+Rewritten against the API the code actually exposes. The previous version could not
+run at all: it imported a class named Mamba2GPT (the class is MambaGPT), passed
+embed_method='additive' (the assert allows only 'concat' or 'add'), passed
+num_layers_decoder/num_layers_encoder to MambaAttentionHead (which accepts neither),
+fed tensors shaped (B, 30, N) to an embedder that wants (B, N, 4), and called
+backbone(x) when downstream features come from backbone(x, return_z=True). Every
+failure was swallowed by a blanket try/except that printed a generic error, which
+made broken code look like a path-configuration problem.
+
+Run:
+    pip install -r requirements.txt
+    python example_usage.py --checkpoint /path/to/pp_nerf_m1_k30.ckpt
 """
+import argparse
+import os
+import sys
 
 import torch
-import numpy as np
-from fm4npp.models.mambagpt import Mamba1GPT, Mamba2GPT
-from train.downstream.model import MambaAttentionHead
 
-def example_pretrain_inference():
-    """Example: Load pretrained model and run inference."""
-    print("="*80)
-    print("Example 1: Pretrained Model Inference")
-    print("="*80)
+from fm4npp.models.mambagpt import MambaGPT, Mamba1GPT
+# NOTE: the track-finding trainer imports its head from trackinghead.py, NOT model.py.
+# train/downstream/model.py holds a same-named class used by the multitask/joint heads.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'train', 'downstream'))
+from trackinghead import MambaAttentionHead
 
-    # Model configuration
-    embed_dim = 256
-    num_layers = 12
-    d_state = 16
-    klen = 30
+# The released checkpoints. NOTE the naming trap: this repo's "m1" is the PAPER's "m3".
+#   repo m1 = width  256 =  5.3M params = paper m3   (pp_nerf_m1_k30.ckpt)
+#   repo m3 = width  512 =   21M params = paper m4   (pp_nerf_m3_k30.ckpt)
+#   repo m4 = width 1024 =   84M params = paper m5   (pp_nerf_m4_k30.ckpt)
+#   repo m5 = width 1536 =  188M params = paper m6   (pp_nerf_m5_k30.ckpt)
+CONFIGS = {
+    'm1': dict(embed_dim=256,  d_state=16),
+    'm3': dict(embed_dim=512,  d_state=32),
+    'm4': dict(embed_dim=1024, d_state=64),
+    'm5': dict(embed_dim=1536, d_state=96),
+}
 
-    # Create Mamba model
-    model = Mamba1GPT(
-        embed_dim=embed_dim,
-        num_layers=num_layers,
-        d_state=d_state,
-        d_conv=4,
-        expand=2,
-        klen=klen,
-        dropout=0.1,
-        embed_method='additive',
-        pe_method='nerf'
+
+def build_backbone(embed_dim, d_state, num_layers=12, klen=30, mambaversion='mamba2'):
+    """The released checkpoints are Mamba2 (MambaGPT), not Mamba1.
+
+    You can verify this from the checkpoint itself: Mamba2 blocks carry lin_B/lin_C
+    and a per-head A_log, which mamba_ssm's Mamba1 block does not have.
+    """
+    cls = MambaGPT if mambaversion == 'mamba2' else Mamba1GPT
+    return cls(
+        embed_dim=embed_dim, num_layers=num_layers,
+        d_state=d_state, d_conv=4, expand=2, klen=klen,
+        dropout=0.0,               # backbone dropout stays 0 for the released weights
+        embed_method='add',        # 'add' or 'concat' -- the backbone was trained with 'add'
+        pe_method='nerf',
     )
 
-    # Load pretrained checkpoint (update path)
-    checkpoint_path = '/path/to/pretrain/checkpoint.tar'
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state'])
-        print(f"✓ Loaded checkpoint from {checkpoint_path}")
-    except:
-        print(f"⚠ Checkpoint not found, using randomly initialized model")
 
-    # Move to GPU if available
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = model.to(device)
-    model.eval()
+def load_checkpoint(model, path):
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    state = ckpt['model_state']
+    # checkpoints were saved from a DistributedDataParallel wrapper
+    state = {k.replace('module.', ''): v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=True), None
+    return ckpt.get('iters'), ckpt.get('epoch')
 
-    print(f"✓ Model on device: {device}")
-    print(f"✓ Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-
-    # Create dummy input data
-    batch_size = 2
-    num_points = 100
-    input_dim = 30  # 30D features per point
-
-    # Random point cloud data
-    x = torch.randn(batch_size, input_dim, num_points).to(device)
-
-    # Run inference
-    with torch.no_grad():
-        output = model(x)
-
-    print(f"✓ Input shape: {x.shape}")
-    print(f"✓ Output shape: {output.shape}")
-    print()
-
-def example_downstream_inference():
-    """Example: Load downstream model and run track finding."""
-    print("="*80)
-    print("Example 2: Downstream Track Finding")
-    print("="*80)
-
-    # Backbone configuration
-    embed_dim = 256
-    num_layers = 12
-    d_state = 16
-    klen = 30
-
-    # Create backbone
-    backbone = Mamba1GPT(
-        embed_dim=embed_dim,
-        num_layers=num_layers,
-        d_state=d_state,
-        d_conv=4,
-        expand=2,
-        klen=klen,
-        dropout=0.1,
-        embed_method='additive',
-        pe_method='nerf'
-    )
-
-    # Load pretrained weights
-    checkpoint_path = '/path/to/pretrain/checkpoint.tar'
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        backbone.load_state_dict(checkpoint['model_state'])
-        print(f"✓ Loaded pretrained backbone")
-    except:
-        print(f"⚠ Using randomly initialized backbone")
-
-    # Create downstream head
-    input_dim = 30
-    downstream_head = MambaAttentionHead(
-        embed_dim=embed_dim,
-        input_dim=input_dim,
-        num_heads=4,
-        num_layers_decoder=2,
-        num_layers_encoder=2,
-        dropout=0.1
-    )
-
-    # Move to GPU
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    backbone = backbone.to(device)
-    downstream_head = downstream_head.to(device)
-
-    backbone.eval()
-    downstream_head.eval()
-
-    print(f"✓ Backbone parameters: {sum(p.numel() for p in backbone.parameters()) / 1e6:.2f}M")
-    print(f"✓ Head parameters: {sum(p.numel() for p in downstream_head.parameters()) / 1e6:.2f}M")
-
-    # Create dummy input
-    batch_size = 2
-    num_points = 100
-    x = torch.randn(batch_size, input_dim, num_points).to(device)
-
-    # Run inference
-    with torch.no_grad():
-        # Extract features from backbone
-        features = backbone(x)
-
-        # Run downstream head
-        track_predictions = downstream_head(features)
-
-    print(f"✓ Input shape: {x.shape}")
-    print(f"✓ Features shape: {features.shape}")
-    print(f"✓ Predictions shape: {track_predictions.shape}")
-    print()
-
-def example_mamba2():
-    """Example: Using Mamba2 model."""
-    print("="*80)
-    print("Example 3: Mamba2 Model")
-    print("="*80)
-
-    # Create Mamba2 model
-    model = Mamba2GPT(
-        embed_dim=256,
-        num_layers=12,
-        d_state=128,
-        headdim=64,
-        ngroups=1,
-        klen=30,
-        dropout=0.1,
-        embed_method='additive',
-        pe_method='nerf'
-    )
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = model.to(device)
-    model.eval()
-
-    print(f"✓ Mamba2 model created")
-    print(f"✓ Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-
-    # Run inference
-    batch_size = 2
-    num_points = 100
-    x = torch.randn(batch_size, 30, num_points).to(device)
-
-    with torch.no_grad():
-        output = model(x)
-
-    print(f"✓ Output shape: {output.shape}")
-    print()
 
 def main():
-    """Run all examples."""
-    print("\n" + "="*80)
-    print("FM4NPP Example Usage")
-    print("="*80 + "\n")
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--checkpoint', default=None, help='e.g. pp_nerf_m1_k30.ckpt')
+    ap.add_argument('--size', default='m1', choices=sorted(CONFIGS))
+    args = ap.parse_args()
 
-    try:
-        example_pretrain_inference()
-        example_downstream_inference()
-        example_mamba2()
+    cfg = CONFIGS[args.size]
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f'device: {device}   backbone: {args.size} (width {cfg["embed_dim"]})')
 
-        print("="*80)
-        print("✅ All examples completed successfully!")
-        print("="*80)
+    backbone = build_backbone(**cfg)
+    if args.checkpoint:
+        iters, epoch = load_checkpoint(backbone, args.checkpoint)
+        print(f'loaded {args.checkpoint} (iters={iters}, epoch={epoch})')
+    else:
+        print('no --checkpoint given: using randomly initialised weights')
+    backbone = backbone.to(device).eval()
+    print(f'backbone params: {sum(p.numel() for p in backbone.parameters())/1e6:.2f}M')
 
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        print("\nNote: Update checkpoint paths in this script before running.")
-        import traceback
-        traceback.print_exc()
+    # The downstream head consumes the backbone's PER-LAYER hidden states, so it needs
+    # num_feature_layers == the backbone's layer count.
+    head = MambaAttentionHead(
+        input_dim=cfg['embed_dim'],
+        num_layers=0,
+        num_embedder_layers=0,
+        d_state=64, d_conv=4, expand=2,
+        num_feature_layers=12,
+        num_prototypes=150,
+        dropout=0.1,
+        embed_method='concat',     # the downstream head uses 'concat' (see the trainer)
+    ).to(device).eval()
+    print(f'head params:     {sum(p.numel() for p in head.parameters())/1e6:.2f}M')
+
+    # Input is (B, N, 4) = (E, x, y, z) per spacepoint, already normalised by the dataset.
+    # Not 30 features -- README/SETUP.md were wrong about that; the published data is 4D.
+    B, N = 2, 512
+    x = torch.randn(B, N, 4, device=device)
+    padding_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        # return_z=True yields the per-layer features the head expects
+        _, per_layer, _ = backbone(x, return_z=True)
+        feature = torch.stack(per_layer)                 # (L, B, N, D)
+        out = head(x, feature, pretrain=True, padding_mask=padding_mask)
+
+    print(f'input:        {tuple(x.shape)}')
+    print(f'per-layer:    {tuple(feature.shape)}')
+    for k, v in out.items():
+        if torch.is_tensor(v):
+            print(f'  {k:20s} {tuple(v.shape)}')
+        elif isinstance(v, list):
+            print(f'  {k:20s} list of {len(v)}')
+    print('\nclass_probs is (B, n_prototypes, 2) = track vs no-object;')
+    print('mask_probs  is (B, N, n_prototypes)  = per-point assignment to each track query.')
+    print('\nOK')
+
 
 if __name__ == '__main__':
     main()

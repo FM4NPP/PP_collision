@@ -52,79 +52,90 @@ python -c "from mamba_ssm import Mamba; print('Mamba installed successfully')"
 
 ### Data Format
 
-The code expects preprocessed data in memory-mapped format:
+The code reads memory-mapped `RaggedMmap` directories. Note the split names: the
+TRAINING loader is hardcoded to `split='pretrain'` and the eval loader to
+`split='test'` (see `get_data_loader` in `fm4npp/datasets/dataset.py`). So your
+labeled *training* data must be written with the `pretrain` suffix. The name is
+historical -- it is not the unlabeled pretraining corpus.
 
 ```
-data_root/
-├── features_train/     # RaggedMmap of point features [N_events, N_points, 30]
-├── features_test/
-├── seg_target_train/   # RaggedMmap of segmentation labels [N_events, N_points]
-└── seg_target_test/
+data_root/                       # training data (params.data_root)
+├── features_pretrain/           # (n_i, 4) float32
+├── seg_target_pretrain/         # (n_i,)   int64  track ids
+├── pid_target_pretrain/         # (n_i,)   int64  raw PDG codes
+└── reg_target_pretrain/         # (n_i, 8) float32
+data_root_test/                  # eval data (params.data_root_test)
+├── features_test/  seg_target_test/  pid_target_test/  reg_target_test/
 ```
 
-### Feature Format (30D per point)
+### Feature Format (4D per point)
 
-Each point has 30 features:
-1. Position (3D): x, y, z
-2. Momentum (3D): px, py, pz
-3. Energy (1D): E
-4. Time (1D): t
-5. Detector metadata (22D): layer, module, sensor, cell, etc.
+Each spacepoint has **4** features, not 30:
+
+| index | meaning |
+|---|---|
+| 0 | `E`  energy deposition |
+| 1 | `x` |
+| 2 | `y` |
+| 3 | `z` |
+
+The dataset converts (x, y, z) to polar (eta, phi, r) internally and normalizes with
+constants hardcoded in `TPCBatchDataset.__init__`: `E` is z-normalized with
+mean 253.0982 / std 268.7093, `eta` min-maxed over [-2, 2], `phi` over [-pi, pi],
+and `r` over [31.372, 75.385].
+
+### Target Formats
+
+- `seg_target` -- integer track id per point. Track finding clusters points by these.
+- `pid_target` -- **raw PDG codes**, not class indices.
+  `downstream_util.get_pidlabel()` maps them itself
+  (211 -> 1 pion, 321 -> 2 kaon, 2212 -> 3 proton, 11 -> 4 electron, else 0).
+- `reg_target` -- `(n, 8)` = `px, py, pz, vtx_x, vtx_y, vtx_z, q, e`.
+  `downstream_util.get_trackinfo_noiselabel()` derives `noise_labels`
+  (pt < 0.06), `valid_tracks` (vertex within 1 cm) and `track_info` from it.
 
 ### Statistics Files
 
-Normalization statistics should be in `stat_dir`:
-- `bin_edges_v3_nbins_8_8_6.pkl`: Binning for features
-- `loss_bin_pp.pkl`: Loss binning for track finding
-- `loss_weight_pp.pkl`: Loss weights
+`stat_dir` must contain:
+- `bin_edges_v3_nbins_8_8_6.pkl` -- voxelizer bin edges (`fm4npp/datasets/voxelizer.py`)
+- `loss_bin_pp.pkl`, `loss_weight_pp.pkl` -- loaded unconditionally by the trainers
 
-### Data Preprocessing Script (Example)
+These are **not** in this repository and are **not** part of the Zenodo release;
+obtain them from the FM4NPP maintainers. Without them the voxelizer will attempt to
+recompute bin edges from your dataset (which will not match the released
+checkpoints' pretraining) and the trainers will fail outright on the two loss pickles.
 
-```python
-import numpy as np
-from mmap_ninja import RaggedMmap
+### Preparing the Public Dataset
 
-def preprocess_data(raw_data_dir, output_dir):
-    """
-    Convert raw particle data to memory-mapped format.
+The Zenodo release ships flat `.npz` files, not `RaggedMmap` directories. Use the
+converter in this repo:
 
-    Args:
-        raw_data_dir: Directory with raw event files
-        output_dir: Directory to save preprocessed data
-    """
-    # Load raw events
-    events = load_raw_events(raw_data_dir)  # Your function
+```bash
+# Zenodo: https://doi.org/10.5281/zenodo.16970029
+# labeled/<split>/{spacepoints,track_ids,pid_labels,noise_tags}.npz
 
-    # Extract features (30D per point)
-    features = []
-    targets = []
+python scripts/prepare_data.py \
+    --in_dir /path/to/TPCpp-10M/labeled/train \
+    --out    /path/to/mmap_train \
+    --split  pretrain          # 'pretrain' == the TRAINING loader, see above
 
-    for event in events:
-        # Extract point features
-        event_features = extract_features(event)  # [N_points, 30]
-        event_targets = extract_targets(event)    # [N_points]
-
-        features.append(event_features)
-        targets.append(event_targets)
-
-    # Save as RaggedMmap
-    RaggedMmap.from_generator(
-        out_dir=f"{output_dir}/features_train",
-        sample_generator=iter(features),
-        batch_size=1000
-    )
-
-    RaggedMmap.from_generator(
-        out_dir=f"{output_dir}/seg_target_train",
-        sample_generator=iter(targets),
-        batch_size=1000
-    )
-
-    print(f"Preprocessed {len(events)} events to {output_dir}")
-
-# Usage
-preprocess_data('/path/to/raw/data', '/path/to/preprocessed/data')
+python scripts/prepare_data.py \
+    --in_dir /path/to/TPCpp-10M/labeled/test \
+    --out    /path/to/mmap_test \
+    --split  test
 ```
+
+Two caveats, both documented in `scripts/prepare_data.py`:
+
+1. Zenodo's `pid_labels` are already *class indices* (0-4), whereas the code expects
+   raw PDG codes and maps them itself. The converter inverts the mapping so the
+   round-trip is exact. Passing the Zenodo labels through unchanged collapses every
+   point to class 0.
+2. Zenodo publishes no `reg_target` -- only a boolean `noise_tag`. The converter
+   synthesizes an 8-column `reg_target` that reproduces `noise_labels` faithfully and
+   sets `valid_tracks = 1`; `track_info` is a **placeholder**. Track finding and noise
+   tagging do not read `track_info`, but any task regressing track kinematics needs
+   the real regression targets from the collaboration.
 
 ## Configuration
 

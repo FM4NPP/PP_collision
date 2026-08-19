@@ -44,6 +44,18 @@ def main():
         help="Run number / seed identifier",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="[FIX B8] Random seed used during training (selects the checkpoint)",
+    )
+    parser.add_argument(
+        "--no_seed_in_ckpt",
+        action="store_true",
+        default=False,
+        help="Use a checkpoint name without the _seed<N> suffix (pre-B8 checkpoints)",
+    )
+    parser.add_argument(
         "--root_dir",
         type=str,
         default="/home/shuhang/FM4NPP/downstream_eval/",
@@ -121,8 +133,10 @@ def main():
     params.batch_size = args.eval_batch_size
     params.valid_batch_size = args.eval_batch_size
     params.pretrained_ckpt = model2ckpt[args.config]
-    checkpoint_base_name = f"{args.config}_nerf_tracking_head_d{params.limit_size}_{args.run_num}"
-    log_base_name = f"{args.config}_eval_tracking_head_d{params.limit_size}_{args.run_num}"
+    # [FIX B8] mirror the seed suffix used by train_track_finding.py
+    seed_suffix = "" if args.no_seed_in_ckpt else f"_seed{args.seed}"
+    checkpoint_base_name = f"{args.config}_nerf_tracking_head_d{params.limit_size}_{args.run_num}{seed_suffix}"
+    log_base_name = f"{args.config}_eval_tracking_head_d{params.limit_size}_{args.run_num}{seed_suffix}"
     if args.usepretrain:
         params.log_file_name = log_base_name + ".log"
         checkpoint_name = checkpoint_base_name + "_checkpoint.pth"

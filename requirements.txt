@@ -1,24 +1,32 @@
 # FM4NPP Requirements
-# Anonymized for publication
 
-# Core dependencies
+# Core
 torch>=2.4.0
 numpy>=1.24.0
 scipy>=1.10.0
 pyyaml>=6.0
 tqdm>=4.65.0
 
-# Mamba-specific dependencies
-mamba-ssm>=1.0.0
-causal-conv1d>=1.0.0
-triton>=2.2.0
+# [FIX B15] These are imported at module load and were all missing:
+einops>=0.6.0                # fm4npp/models/mamba2.py
+ruamel.yaml>=0.17            # fm4npp/utils.py, the trainers
+scikit-learn>=1.2            # adjusted_rand_score in the trainers
+huggingface_hub>=0.20        # PyTorchModelHubMixin in fm4npp/models/mamba2.py
+plotly>=5.0                  # fm4npp/datasets/voxelizer.py (hard import in the data path)
+pandas>=2.0                  # per-point CSV export in the eval scripts
+matplotlib>=3.7
+# installed from git; there is no PyPI package under this name
+cosine_annealing_warmup @ git+https://github.com/katsura-jp/pytorch-cosine-annealing-with-warmup
 
 # Data handling
 mmap-ninja>=0.7.0
 
-# Distributed training
-torch-distributed>=2.0.0
+# [FIX B15] `torch-distributed` was listed here but is not a real package;
+# torch.distributed ships with torch.
 
-# Optional: for better performance
-# einops>=0.6.0
-# packaging>=23.0
+# Optional: only needed for the Mamba1 (mambaversion=mamba1) backbone. The released
+# checkpoints are Mamba2 and run on the pure-PyTorch fm4npp/models/mamba2.py, so you
+# do NOT need to compile these to reproduce the paper.
+# mamba-ssm>=1.0.0
+# causal-conv1d>=1.0.0
+# triton>=2.2.0

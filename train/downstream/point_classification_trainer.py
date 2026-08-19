@@ -385,7 +385,7 @@ class DownstreamTrainer():
 
 
         if self.params.use_attention_head:
-            self.down_model = AttentionHead(input_dim=self.params.embed_dim, num_layers=1, num_output_dim = self.params.num_output_classes,
+            self.down_model = AttentionHead(input_dim=self.params.embed_dim, num_layers=self.params.num_layers, num_output_dim = self.params.num_output_classes,
                           num_heads = 4, num_feature_layers=self.params.num_layers_backbone,
                           num_embedder_layers= self.params.num_embedder_layers, 
                           ).to(self.device)
@@ -571,7 +571,7 @@ class DownstreamTrainer():
         #                          ).to(self.device)
 
         if self.params.use_attention_head:
-            self.down_model = AttentionHead(input_dim=self.params.embed_dim, num_layers=1, num_output_dim = self.params.num_output_classes,
+            self.down_model = AttentionHead(input_dim=self.params.embed_dim, num_layers=self.params.num_layers, num_output_dim = self.params.num_output_classes,
                           num_heads = 4, num_feature_layers=self.params.num_layers_backbone,
                           num_embedder_layers= self.params.num_embedder_layers, 
                           ).to(self.device)
