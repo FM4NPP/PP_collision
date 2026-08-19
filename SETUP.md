@@ -100,10 +100,12 @@ and `r` over [31.372, 75.385].
 - `bin_edges_v3_nbins_8_8_6.pkl` -- voxelizer bin edges (`fm4npp/datasets/voxelizer.py`)
 - `loss_bin_pp.pkl`, `loss_weight_pp.pkl` -- loaded unconditionally by the trainers
 
-These are **not** in this repository and are **not** part of the Zenodo release;
-obtain them from the FM4NPP maintainers. Without them the voxelizer will attempt to
-recompute bin edges from your dataset (which will not match the released
-checkpoints' pretraining) and the trainers will fail outright on the two loss pickles.
+These now ship in [`stats/`](stats/) — set `stat_dir` to that directory. They were
+previously absent because the blanket `*.pkl` rule in `.gitignore` excluded them, which
+is worth knowing about: if the bin-edges file is missing the voxelizer silently
+*recomputes* bins from your dataset, producing a different tokenization from the one the
+released checkpoints were pretrained with, with no error raised. The two loss pickles
+have no fallback and raise `FileNotFoundError`.
 
 ### Getting the Data Without a 118 GB Download
 
