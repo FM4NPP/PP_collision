@@ -43,6 +43,7 @@ reg_target IS SYNTHESIZED -- READ THIS BEFORE USING IT FOR PHYSICS.
    kinematics needs the real reg_target from the collaboration.
 """
 import argparse
+import glob
 import os
 import numpy as np
 from mmap_ninja import RaggedMmap
@@ -54,15 +55,39 @@ NOISE_PT_THRESHOLD = 0.06   # must match get_trackinfo_noiselabel's default
 PT_SIGNAL, PT_NOISE = 1.0, 1e-3
 
 
+def _shards(in_dir, stem):
+    """Zenodo shards labeled/train as <stem>_000.npz ... and ships labeled/test and
+    labeled/validation as a single <stem>.npz. Handle both."""
+    single = os.path.join(in_dir, f'{stem}.npz')
+    if os.path.exists(single):
+        return [single]
+    found = sorted(glob.glob(os.path.join(in_dir, f'{stem}_[0-9]*.npz')))
+    if not found:
+        raise FileNotFoundError(f'no {stem}.npz or {stem}_NNN.npz in {in_dir}')
+    return found
+
+
+def _concat(in_dir, stem, key='data'):
+    parts = []
+    for f in _shards(in_dir, stem):
+        with np.load(f) as h:
+            parts.append(h[key])
+    return np.concatenate(parts) if len(parts) > 1 else parts[0]
+
+
 def load_split(in_dir):
-    with np.load(os.path.join(in_dir, 'spacepoints.npz')) as h:
-        spacepoints, sizes = h['data'], h['size']
-    with np.load(os.path.join(in_dir, 'track_ids.npz')) as h:
-        track_ids = h['data']
-    with np.load(os.path.join(in_dir, 'pid_labels.npz')) as h:
-        pid_labels = h['data']
-    with np.load(os.path.join(in_dir, 'noise_tags.npz')) as h:
-        noise_tags = h['data']
+    # sizes must be concatenated in the SAME shard order as the point arrays, or every
+    # event boundary after the first shard is wrong.
+    sp_parts, size_parts = [], []
+    for f in _shards(in_dir, 'spacepoints'):
+        with np.load(f) as h:
+            sp_parts.append(h['data'])
+            size_parts.append(h['size'])
+    spacepoints = np.concatenate(sp_parts) if len(sp_parts) > 1 else sp_parts[0]
+    sizes = np.concatenate(size_parts) if len(size_parts) > 1 else size_parts[0]
+    track_ids = _concat(in_dir, 'track_ids')
+    pid_labels = _concat(in_dir, 'pid_labels')
+    noise_tags = _concat(in_dir, 'noise_tags')
     n = int(sizes.sum())
     for name, arr in [('track_ids', track_ids), ('pid_labels', pid_labels),
                       ('noise_tags', noise_tags)]:
