@@ -56,6 +56,18 @@ def main():
         help="Use a checkpoint name without the _seed<N> suffix (pre-B8 checkpoints)",
     )
     parser.add_argument(
+        "--data_root_test",
+        type=str,
+        default=None,
+        help="[FIX B21] Evaluation data root (default: data_root_test from the config)",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="[FIX B21] Where downstream checkpoints live (default: --root_dir)",
+    )
+    parser.add_argument(
         "--root_dir",
         type=str,
         default="/home/shuhang/FM4NPP/downstream_eval/",
@@ -144,9 +156,14 @@ def main():
         params.log_file_name = log_base_name + "_nopretrain.log"
         checkpoint_name = checkpoint_base_name + "_nopretrain_checkpoint.pth"
     params.num_embedder_layers = 0
-    params.data_root_test = "/mldata/sli/sphenix_fm/pp_test_9k/"
-    checkpoint_base_dir = "/home/shuhang/FM4NPP/downstream_log/"
-    checkpoint_path = checkpoint_base_dir + checkpoint_name
+    # [FIX B21] both of these were hardcoded to a personal cluster path, so --root_dir
+    # was ignored and no external user could point eval at their own data/checkpoints.
+    # data_root_test now comes from the config; the checkpoint dir defaults to --root_dir
+    # (which is where train_track_finding.py writes) and is overridable with --checkpoint_dir.
+    if args.data_root_test:
+        params.data_root_test = args.data_root_test
+    checkpoint_base_dir = args.checkpoint_dir or args.root_dir
+    checkpoint_path = os.path.join(checkpoint_base_dir, checkpoint_name)
 
     params.loss_matched_ce_weight = 0.5
     params.loss_unmatched_ce_weight = 0.1
