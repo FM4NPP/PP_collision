@@ -138,6 +138,17 @@ missing = [m for m in ['einops', 'ruamel', 'scikit-learn', 'plotly', 'cosine_ann
 check('B15', 'requirements.txt lists all hard imports', not missing,
       f'missing: {missing}' if missing else '')
 
+# --- B2: the heads in model.py must be constructable at all ---
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        import model as _m
+        _m.MambaAttentionHead(input_dim=256)
+        _m.MambaHead(input_dim=256)
+    check('B2', 'model.py heads construct (no undefined Embedder)', True)
+except Exception as e:  # noqa: BLE001
+    check('B2', 'model.py heads construct (no undefined Embedder)', False,
+          f'{type(e).__name__}: {e}')
+
 # --- Architectural: the LIVE track-finding head must build EmbedderConcat ---
 try:
     import torch  # noqa: F401
