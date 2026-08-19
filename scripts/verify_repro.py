@@ -96,6 +96,11 @@ check('B20', 'inference() defines amp_enabled before use',
       'used but never assigned -> NameError on every eval run'
       if uses_amp and not assigns_amp else '')
 
+# --- B22: checkpoint-loading failures must not be swallowed into exit 0 ---
+_inf_src = ast.get_source_segment(tr, inf) or ''
+check('B22', 'eval raises on checkpoint-loading failure instead of returning exit 0',
+      'Checkpoint loading failed' not in _inf_src or 'raise' in _inf_src)
+
 # --- B8: seeding present and encoded in artifact names ---
 tt = src('train/downstream/train_track_finding.py')
 check('B8', 'training seeds RNGs and puts the seed in artifact names',

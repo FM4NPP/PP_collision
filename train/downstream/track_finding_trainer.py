@@ -447,7 +447,13 @@ class DownstreamTrainer():
         try:
             self.load_checkpoint(checkpoint_path, inference=True)
         except Exception as e:
-            print(f"❌ Checkpoint loading failed: {str(e)}")
+            # [FIX B22] this used to print and fall through, so evaluation returned exit 0
+            # having scored nothing. A missing checkpoint, or a state-dict shape mismatch
+            # (the classic symptom of a head built with the wrong embed_method), read as
+            # success to any batch harness. Fail loudly instead.
+            raise RuntimeError(
+                f"Checkpoint loading failed for {checkpoint_path}: {e}"
+            ) from e
             return None
         
         self.down_model.eval()
