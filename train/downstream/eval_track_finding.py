@@ -56,6 +56,26 @@ def main():
         help="Use a checkpoint name without the _seed<N> suffix (pre-B8 checkpoints)",
     )
     parser.add_argument(
+        "--save_csv",
+        dest="save_csv",
+        action="store_true",
+        default=True,
+        help="[FIX B23] Save per-point track assignments to CSV (default: enabled). "
+             "This is the input to calculate_tracking_eff_purity.py.",
+    )
+    parser.add_argument(
+        "--no-csv",
+        dest="save_csv",
+        action="store_false",
+        help="Disable per-point CSV output",
+    )
+    parser.add_argument(
+        "--csv_output_path",
+        type=str,
+        default=None,
+        help="Path for the per-point CSV (default: derived from the log file name)",
+    )
+    parser.add_argument(
         "--data_root_test",
         type=str,
         default=None,
@@ -183,7 +203,12 @@ def main():
     trainer.inference(
         checkpoint_path=checkpoint_path,
         pretrain=args.usepretrain,                # evaluation uses downstream checkpoint
-        logfile=logfile
+        logfile=logfile,
+        # [FIX B23] inference() has always accepted these, but the CLI never set them, so
+        # the per-point export was unreachable dead code and the efficiency/purity
+        # analysis had no input.
+        save_csv=args.save_csv,
+        csv_output_path=args.csv_output_path,
     )
     trainer.cleanup()
 

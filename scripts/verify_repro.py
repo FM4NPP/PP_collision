@@ -138,6 +138,16 @@ missing = [m for m in ['einops', 'ruamel', 'scikit-learn', 'plotly', 'cosine_ann
 check('B15', 'requirements.txt lists all hard imports', not missing,
       f'missing: {missing}' if missing else '')
 
+# --- B23: the per-point CSV export must be reachable, and its analysis shipped ---
+ev = src('train/downstream/eval_track_finding.py')
+has_flag = 'save_csv' in ev
+wired = 'save_csv=args.save_csv' in ev
+has_script = os.path.exists(os.path.join(REPO, 'train', 'downstream',
+                                         'calculate_tracking_eff_purity.py'))
+check('B23', 'per-point CSV export reachable from the CLI, eff/purity analysis present',
+      has_flag and wired and has_script,
+      f'cli_flag={has_flag} wired={wired} eff_purity_script={has_script}')
+
 # --- B2: the heads in model.py must be constructable at all ---
 try:
     with contextlib.redirect_stdout(io.StringIO()):
