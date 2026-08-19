@@ -105,6 +105,24 @@ obtain them from the FM4NPP maintainers. Without them the voxelizer will attempt
 recompute bin edges from your dataset (which will not match the released
 checkpoints' pretraining) and the trainers will fail outright on the two loss pickles.
 
+### Getting the Data Without a 118 GB Download
+
+The Zenodo release is one 118.5 GB zip, but the downstream tasks only need the labeled
+splits, which come to **under 1 GB**. Zenodo serves HTTP range requests, so you can pull
+just those members:
+
+```bash
+pip install remotezip
+python scripts/fetch_labeled_data.py --out ./TPCpp-10M
+# fetching 32 members, 0.97 GB (the full archive is 118.53 GB)
+```
+
+Download the whole archive only if you intend to pretrain from scratch -- the other
+117 GB is the unlabeled pretraining corpus.
+
+Note that `labeled/train` is **sharded** (`spacepoints_000.npz` ... `_006.npz`) while
+`labeled/test` and `labeled/validation` are single files. `prepare_data.py` handles both.
+
 ### Preparing the Public Dataset
 
 The Zenodo release ships flat `.npz` files, not `RaggedMmap` directories. Use the
