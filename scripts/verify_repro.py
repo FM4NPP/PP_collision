@@ -148,6 +148,29 @@ check('B23', 'per-point CSV export reachable from the CLI, eff/purity analysis p
       has_flag and wired and has_script,
       f'cli_flag={has_flag} wired={wired} eff_purity_script={has_script}')
 
+# --- B24: per-batch ARI must accumulate, not overwrite ---
+check('B24', 'validate loop accumulates ARI over the batch (+=, not =)',
+      'adjusted_rand_index += adjusted_rand_score' in tr,
+      'with "=" it reports ARI(last event)/batch_size')
+
+# --- B25: the released checkpoints must all have a config to run them ---
+cfg_txt = src('scripts/configs/mamba_tracking.yaml')
+sizes = [c for c in ('d9_m1_k30_p20', 'd9_m3_k30_p20', 'd9_m4_k30_p20', 'd9_m5_k30_p20')
+         if c in cfg_txt]
+check('B25', 'every published checkpoint has a matching config', len(sizes) == 4,
+      f'{len(sizes)}/4 present: {sizes}')
+
+# --- B26: LR cycle length decoupled from max_epochs ---
+check('B26', 'LR cycle length is its own key, not hardwired to max_epochs',
+      'first_cycle_steps=first_cycle' in tr,
+      'shortening max_epochs silently rewrites the LR schedule')
+
+# --- B27: feature-cache path present (makes the large models tractable) ---
+check('B27', 'frozen-backbone feature cache available',
+      os.path.exists(os.path.join(REPO, 'scripts', 'cache_features.py'))
+      and os.path.exists(os.path.join(REPO, 'train', 'downstream', 'cached_dataset.py'))
+      and 'feature_cache' in tr)
+
 # --- B2: the heads in model.py must be constructable at all ---
 try:
     with contextlib.redirect_stdout(io.StringIO()):

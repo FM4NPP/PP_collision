@@ -373,3 +373,60 @@ For questions or issues:
 1. Check this guide and README.md
 2. Open a GitHub issue
 3. Contact: [contact email]
+
+## Running the larger models (m3 / m4 / m6)
+
+The four published checkpoints now each have a config. Note the naming: these are the
+repository's internal names and they do **not** match the paper's — see README.md.
+
+| config | width | params | checkpoint | paper calls it |
+|---|---|---|---|---|
+| `d9_m1_k30_p20` | 256 | 5.3M | `pp_nerf_m1_k30.ckpt` | m3 |
+| `d9_m3_k30_p20` | 512 | 21M | `pp_nerf_m3_k30.ckpt` | m4 |
+| `d9_m4_k30_p20` | 1024 | 84M | `pp_nerf_m4_k30.ckpt` | m5 |
+| `d9_m5_k30_p20` | 1536 | 175M | `pp_nerf_m5_k30.ckpt` | m6 |
+
+### Precompute the frozen-backbone features first
+
+The foundation model is frozen for every downstream task, so it recomputes identical
+features on every epoch. Measured on one GB10 at batch 32, sequence length ~2000:
+
+| stage | ms/batch | share of step |
+|---|---|---|
+| frozen backbone forward | 786 | ~45% |
+| dataloading (`num_data_workers: 0`) | 379 | ~22% |
+| matcher + loss (x3) | 261 | ~15% |
+| adapter fwd/bwd — the only part that trains | 140 | ~8% |
+
+Caching removes the first two. For the 175M model that is roughly **48 min/epoch → 8 min/epoch**.
+
+```bash
+python scripts/cache_features.py \
+    --yaml_config scripts/configs/mamba_tracking.yaml \
+    --config d9_m5_k30_p20 \
+    --checkpoint ./checkpoints/pp_nerf_m5_k30.ckpt \
+    --out ./cache/m6_10k --eventnumber 10000
+
+python train/downstream/train_track_finding.py \
+    --yaml_config scripts/configs/mamba_tracking.yaml \
+    --config d9_m5_k30_p20 --eventnumber 10000 --seed 42 \
+    --train_batch_size 8 \
+    --feature_cache ./cache/m6_10k
+```
+
+Cache size is `12 * width * 2` bytes per spacepoint: ~310 GB per 10k events at width 1536,
+~53 GB at width 256. The cache is exact — features match a fresh forward to ~3e-08 — but it
+is only valid while the backbone is frozen, and it is invalidated by a different checkpoint
+or different preprocessing. It cannot be used with LoRA or backbone fine-tuning.
+
+### Two things that will cost you a run if you don't know them
+
+**Batch size.** `--train_batch_size 16` exhausts memory at width 1536 on a 128 GB
+unified-memory part. Use 8, or accumulate gradients.
+
+**Do not shorten `max_epochs` for a quick test.** Until recently the cosine cycle length was
+hardwired to `max_epochs` and the scheduler steps once per epoch, so lowering it compressed
+the entire LR schedule while `warmup_steps` stayed fixed — a 40-epoch run spent 50% of itself
+in warmup and then annealed to `min_lr` while the training loss was still falling. Set
+`first_cycle_steps` explicitly instead; it is now honoured as its own key. For reference,
+tracking runs in the original work reached their best validation loss around **epoch 118-126**.

@@ -35,6 +35,7 @@ from fm4npp.models.linformer_gpt import LinformerGPT
 
 from trackinghead import *
 from loss import *
+from cached_dataset import get_cached_data_loader
 
 
 class DownstreamTrainer():
@@ -327,8 +328,30 @@ class DownstreamTrainer():
 
         
         # get the dataloaders
-        self.train_data_loader, self.train_sampler, self.val_data_loader, _ = get_data_loader(self.params, 
-                                                                                              dist.is_initialized())
+        # [B27] With a feature cache the frozen backbone forward and the CPU preprocessing
+        # are both skipped. Measured on one GB10 at batch 32: backbone 786 ms/batch (~45% of
+        # step time) and dataloading 379 ms (~22%). For the 175M model this is the difference
+        # between ~48 min/epoch and ~8 min/epoch.
+        self.feature_cache = getattr(self.params, 'feature_cache', None)
+        self.feature_cache_val = getattr(self.params, 'feature_cache_val', None)
+        if self.feature_cache:
+            self.train_data_loader, ds_tr = get_cached_data_loader(
+                self.feature_cache, batch_size=self.params.local_batch_size, shuffle=True,
+                num_workers=self.params.num_data_workers, limit_size=self.params.limit_size)
+            self.train_sampler = None
+            if ds_tr.embed_dim != self.params.embed_dim:
+                raise ValueError(
+                    f'feature cache width {ds_tr.embed_dim} != config embed_dim '
+                    f'{self.params.embed_dim} -- wrong cache for this config')
+            if self.feature_cache_val:
+                self.val_data_loader, _ = get_cached_data_loader(
+                    self.feature_cache_val, batch_size=self.params.local_valid_batch_size,
+                    shuffle=False, num_workers=self.params.num_data_workers)
+            else:
+                _, _, self.val_data_loader, _ = get_data_loader(self.params, dist.is_initialized())
+        else:
+            self.train_data_loader, self.train_sampler, self.val_data_loader, _ = get_data_loader(self.params,
+                                                                                                  dist.is_initialized())
 
         # set loss functions
         self.loss_func = nn.MSELoss(reduction='none')
@@ -710,8 +733,18 @@ class DownstreamTrainer():
         
         torch.nn.utils.clip_grad_norm_(self.down_model.parameters(), max_norm=1.0)
 
+        # [FIX B26] The cosine cycle length used to be hardwired to max_epochs, and this
+        # scheduler is stepped once per epoch. That silently coupled "how long do I train"
+        # to "what learning-rate schedule do I use": lowering max_epochs for a quick test
+        # compressed the whole cycle while warmup_steps stayed fixed, so a 40-epoch run
+        # spent 50% of itself in warmup and then annealed to min_lr, versus 10% warmup at
+        # the intended 200. Training loss was still falling when the LR hit its floor.
+        # first_cycle_steps is now its own config key (it already existed in the yaml and
+        # was being ignored here); max_epochs remains the fallback for old configs.
+        first_cycle = int(getattr(self.params, 'first_cycle_steps', self.params.max_epochs)
+                          or self.params.max_epochs)
         self.down_scheduler = CosineAnnealingWarmupRestarts(self.down_optimizer,
-                                          first_cycle_steps=self.params.max_epochs,
+                                          first_cycle_steps=first_cycle,
                                           max_lr=self.params.max_lr,
                                           min_lr=self.params.min_lr,
                                           warmup_steps=self.params.warmup_steps)
@@ -894,13 +927,18 @@ class DownstreamTrainer():
 
             with autocast('cuda', dtype=torch.bfloat16) if amp_enabled else nullcontext():
                 if pretrain:
-                    if not self.use_lora:
+                    if getattr(self, 'feature_cache', None):
+                        # [B27] Third slot carries precomputed per-layer features
+                        # (L, B, N, D). The backbone is frozen, so these are the tensors it
+                        # would recompute every epoch. See scripts/cache_features.py.
+                        feature = knearest.to(self.device, dtype=torch.bfloat16)
+                    elif not self.use_lora:
                         with torch.no_grad():
                             _, pre_embed, _ = self.model(grouped, return_z=True)
+                        feature = torch.stack(pre_embed)
                     else:
                         _, pre_embed, _ = self.model(grouped, return_z=True)
-                    #feature = torch.stack(pre_embed).mean(0)
-                    feature = torch.stack(pre_embed)
+                        feature = torch.stack(pre_embed)
                     #print('feature: ', feature.size())
                     pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
 
@@ -1015,9 +1053,11 @@ class DownstreamTrainer():
                 with autocast('cuda', dtype=torch.bfloat16) if amp_enabled else nullcontext():
                     if pretrain:
                         #print(grouped.size())
-                        _, pre_embed, _ = self.model(grouped, return_z=True)
-                        #feature = torch.stack(pre_embed).mean(0)
-                        feature = torch.stack(pre_embed)
+                        if getattr(self, 'feature_cache_val', None):
+                            feature = knearest.to(self.device, dtype=torch.bfloat16)
+                        else:
+                            _, pre_embed, _ = self.model(grouped, return_z=True)
+                            feature = torch.stack(pre_embed)
                         pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
                         #pred_logit = self.down_model(grouped, feature, pretrain=pretrain) #B X N X C_classes
                     else:
@@ -1047,10 +1087,17 @@ class DownstreamTrainer():
                 segmentation_result_opt2 = infrence_result_opt2["assignments"]
                 #calculate adjust rand score between segmentation result and label
                 
+                # [FIX B24] these accumulated with '=' instead of '+=', so the loop kept
+                # only the LAST event's score and then divided it by the batch size. The
+                # reported ARI was ARI(last event)/b -- correct only at batch size 1, which
+                # is what train_track_finding.py happens to set. The shared &default in the
+                # config declares valid_batch_size: 128, so anyone using that path, or
+                # passing --eval_batch_size > 1, silently got a near-zero ARI.
+                adjusted_rand_index = 0.0
+                adjusted_rand_index_opt2 = 0.0
                 for j in range(b):
-                    adjusted_rand_index = adjusted_rand_score(inverse_indices_list[j].cpu().numpy(), segmentation_result[j].cpu().numpy())
-                    adjusted_rand_index_opt2 = adjusted_rand_score(inverse_indices_list[j].cpu().numpy(), segmentation_result_opt2[j].cpu().numpy())
-                    
+                    adjusted_rand_index += adjusted_rand_score(inverse_indices_list[j].cpu().numpy(), segmentation_result[j].cpu().numpy())
+                    adjusted_rand_index_opt2 += adjusted_rand_score(inverse_indices_list[j].cpu().numpy(), segmentation_result_opt2[j].cpu().numpy())
 
                 adjusted_rand_index /= b
                 adjusted_rand_index_opt2 /= b

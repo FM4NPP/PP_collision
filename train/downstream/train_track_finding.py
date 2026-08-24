@@ -59,6 +59,11 @@ def main():
     parser.add_argument("--train_batch_size", default=32, type=int, help="train batch size")
     parser.add_argument("--mambaversion", default="mamba2", type=str, help="mambd2/mamba1 for the pretrain model")
     parser.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility")
+    parser.add_argument("--feature_cache", default=None, type=str,
+                        help="[B27] Directory of precomputed frozen-backbone features "
+                             "(scripts/cache_features.py). Skips the backbone forward.")
+    parser.add_argument("--feature_cache_val", default=None, type=str,
+                        help="Feature cache for the validation split")
     args = parser.parse_args()
 
     # [FIX B8] seed before anything touches an RNG
@@ -139,6 +144,8 @@ def main():
     params.loss_focal_weight = 30
     params.num_embedder_layers = 0
     params.mambaversion = args.mambaversion
+    params.feature_cache = args.feature_cache
+    params.feature_cache_val = args.feature_cache_val
 
 
     # Launch and train

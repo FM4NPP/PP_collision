@@ -141,3 +141,59 @@ mamba_5m_scratch:
   min_lr: 0.00001
   mambaversion: mamba1
   # No pretrained_ckpt - trains from random initialization
+
+# ============================================================================
+# Model-size configurations for the released checkpoints
+# ============================================================================
+# [FIX B25] train_track_finding.py's model2ckpt maps d9_m1/m3/m4/m5_k30_p20 to the four
+# published checkpoints, but this file defined none of them -- the checkpoint map pointed
+# at configs that did not exist, so only the width-256 model could actually be run.
+#
+# NOTE THE NAMING: these are this repository's internal names. They do NOT match the
+# paper's model names. See the table in README.md.
+#
+#   config            width  d_state  params  checkpoint              paper calls it
+#   d9_m1_k30_p20      256      16     5.3M   pp_nerf_m1_k30.ckpt          m3
+#   d9_m3_k30_p20      512      32      21M   pp_nerf_m3_k30.ckpt          m4
+#   d9_m4_k30_p20     1024      64      84M   pp_nerf_m4_k30.ckpt          m5
+#   d9_m5_k30_p20     1536      96     175M   pp_nerf_m5_k30.ckpt          m6
+#
+# All four are Mamba2 backbones. Verified by loading each checkpoint with strict=True.
+
+d9_m1_k30_p20:
+  <<: *default
+  embed_dim: 256
+  d_state: 16
+  num_layers_backbone: 12
+  klen: 30
+  dropout: 0.0          # frozen backbone: keep at 0 for the released weights
+  mambaversion: mamba2
+
+d9_m3_k30_p20:
+  <<: *default
+  embed_dim: 512
+  d_state: 32
+  num_layers_backbone: 12
+  klen: 30
+  dropout: 0.0
+  mambaversion: mamba2
+
+d9_m4_k30_p20:
+  <<: *default
+  embed_dim: 1024
+  d_state: 64
+  num_layers_backbone: 12
+  klen: 30
+  dropout: 0.0
+  mambaversion: mamba2
+
+d9_m5_k30_p20:
+  <<: *default
+  embed_dim: 1536
+  d_state: 96
+  num_layers_backbone: 12
+  klen: 30
+  dropout: 0.0
+  mambaversion: mamba2
+  # At width 1536 a train_batch_size of 16 exhausts memory on a 128 GB unified-memory
+  # part. Use 8, or accumulate. See SETUP.md for the full recipe.
