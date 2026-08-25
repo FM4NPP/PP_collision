@@ -62,6 +62,16 @@ class CachedFeatureDataset(Dataset):
     def num_layers(self):
         return int(self.meta['num_layers'])
 
+    @property
+    def combine_layers(self):
+        """True if the cache stores the layer-combined tensor rather than the stack."""
+        return bool(self.meta.get('combine_layers', False))
+
+    @property
+    def layer_weights(self):
+        """Softmax weights baked into a combined cache, or None."""
+        return self.meta.get('layer_weights')
+
     def __len__(self):
         return self.n
 

@@ -343,6 +343,15 @@ class DownstreamTrainer():
                 raise ValueError(
                     f'feature cache width {ds_tr.embed_dim} != config embed_dim '
                     f'{self.params.embed_dim} -- wrong cache for this config')
+            # [B28] A combined cache stores the softmax-weighted sum over layers rather than
+            # the stack, which is 12x smaller (3,072 vs 36,864 bytes/point at width 1536 --
+            # the difference between 185 GB and 2.17 TB for the 70k split). The head must be
+            # told, so it builds with num_feature_layers=1 instead of 12.
+            self.cache_combined = ds_tr.combine_layers
+            if self.cache_combined:
+                self.cache_layer_weights = ds_tr.layer_weights
+                print(f'[cache] layer-combined cache: head layer mixing frozen to '
+                      f'{[round(w, 4) for w in (self.cache_layer_weights or [])]}')
             if self.feature_cache_val:
                 self.val_data_loader, _ = get_cached_data_loader(
                     self.feature_cache_val, batch_size=self.params.local_valid_batch_size,
@@ -716,10 +725,15 @@ class DownstreamTrainer():
             print(f"✅ Mamba v2 Model Initialized (Safe Scaling for {num_layers} Layers")
                 
     
+        # [B28] With a layer-combined cache the softmax over layers was already applied at
+        # cache time, so the head sees L=1. softmax over a single element is identically 1.0,
+        # so the head's own mixing becomes an exact pass-through -- verified at max
+        # difference 0.000e+00 against the full-stack path. Costs 11 of 5,565,326 parameters.
+        n_feat_layers = 1 if getattr(self, 'cache_combined', False) else self.params.num_layers_backbone
         # [FIX B3] see above.
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
                                   num_embedder_layers= self.params.num_embedder_layers,
-                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes,
+                                  d_state=64, d_conv=4, expand=2, num_feature_layers=n_feat_layers, num_prototypes = self.params.max_gt_classes,
                                   embed_method='concat').to(self.device)
         
         initialize_mamba2(self.down_model, 3, num_residuals=1)

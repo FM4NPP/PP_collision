@@ -111,6 +111,14 @@ def main():
     ap.add_argument('--batch_size', type=int, default=1,
                     help='events per backbone forward; 1 keeps the cache padding-free')
     ap.add_argument('--write_every', type=int, default=500)
+    ap.add_argument('--combine_layers', action='store_true',
+                    help='Store the softmax-weighted sum over layers instead of the full '
+                         'stack. 12x smaller (3,072 vs 36,864 bytes/point at width 1536). '
+                         'Requires the head to freeze weighted_avg_weights to match.')
+    ap.add_argument('--layer_weights', type=str, default=None,
+                    help='Comma-separated RAW (pre-softmax) layer weights for '
+                         '--combine_layers. Default: uniform. Pass the vector a converged '
+                         'run learned to minimise the approximation.')
     args = ap.parse_args()
 
     params = YParams(args.yaml_config, args.config)
@@ -120,6 +128,20 @@ def main():
                               else params.data_root_test)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    n_layers = int(params.num_layers_backbone)
+    combine_w = None
+    if args.combine_layers:
+        if args.layer_weights:
+            raw = [float(x) for x in args.layer_weights.split(',')]
+            if len(raw) != n_layers:
+                raise ValueError(f'--layer_weights has {len(raw)} entries, '
+                                 f'model has {n_layers} layers')
+        else:
+            raw = [1.0] * n_layers
+        combine_w = torch.softmax(torch.tensor(raw, dtype=torch.float32), dim=0).to(device)
+        print(f'[cache] combining {n_layers} layers -> 1 '
+              f'({n_layers}x smaller); softmax weights: '
+              + ' '.join(f'{v:.4f}' for v in combine_w.tolist()))
     print(f'[cache] config={args.config} split={args.split} events={args.eventnumber}')
     model = build_backbone(params, args.checkpoint, device)
 
@@ -150,8 +172,11 @@ def main():
             else:
                 with autocast('cuda', dtype=torch.bfloat16), torch.no_grad():
                     _, per_layer, _ = model(pts.unsqueeze(0).to(device), return_z=True)
-                # (L, 1, N, D) -> (L, N, D)
-                yield torch.stack(per_layer)[:, 0].float().cpu().numpy().astype(np.float16)
+                f = torch.stack(per_layer)[:, 0].float()          # (L, N, D)
+                if combine_w is not None:
+                    # exactly what the head does: einsum('bsnd,n->bsd', x, softmax(w))
+                    f = torch.einsum('lnd,l->nd', f, combine_w).unsqueeze(0)   # (1, N, D)
+                yield f.cpu().numpy().astype(np.float16)
 
     t0 = time.time()
     for kind in ('points', 'seg_target', 'features'):
@@ -161,7 +186,9 @@ def main():
                                   batch_size=args.write_every, verbose=False)
         print(f'  wrote {kind:11s} in {time.time()-t1:6.0f}s', flush=True)
 
-    meta = dict(config=args.config, split=args.split, n_events=n_events,
+    meta = dict(combine_layers=bool(args.combine_layers),
+                layer_weights=(combine_w.cpu().tolist() if combine_w is not None else None),
+                config=args.config, split=args.split, n_events=n_events,
                 embed_dim=int(params.embed_dim), num_layers=int(params.num_layers_backbone),
                 d_state=int(params.d_state), klen=int(params.klen),
                 checkpoint=os.path.basename(args.checkpoint),
