@@ -119,6 +119,15 @@ def main():
     )
     parser.set_defaults(usepretrain=True)
     parser.add_argument("--global_log_dir", default='globallogs', type=str, help="Global dir to store logging only")
+    parser.add_argument(
+        "--combine_weights",
+        type=str,
+        default=None,
+        help="Comma-separated POST-softmax layer weights. Required to evaluate a head that "
+             "was trained against a --combine_layers cache: such a head was built with "
+             "num_feature_layers=1 and cannot consume the live backbone's full stack. Read "
+             "the vector from the cache's cache_meta.json.",
+    )
     args = parser.parse_args()
 
     # Default mapping from config to checkpoint if not provided via --checkpoint
@@ -199,6 +208,17 @@ def main():
 
     # Launch and run inference
     trainer = DownstreamTrainer(params, args)
+    if args.combine_weights:
+        w = [float(x) for x in args.combine_weights.split(',')]
+        if len(w) != int(params.num_layers_backbone):
+            raise ValueError(f'--combine_weights has {len(w)} entries, model has '
+                             f'{params.num_layers_backbone} layers')
+        if abs(sum(w) - 1.0) > 1e-3:
+            raise ValueError(f'--combine_weights sums to {sum(w):.6f}, expected 1.0 -- '
+                             'pass the POST-softmax vector from cache_meta.json')
+        trainer.cache_combined = True          # so the head is built with L=1
+        trainer.eval_combine_weights = w       # so inference() collapses the stack the same way
+        print(f'[eval] layer-combined head: {[round(x,4) for x in w]}')
     trainer.launch()
     trainer.inference(
         checkpoint_path=checkpoint_path,

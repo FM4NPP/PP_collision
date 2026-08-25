@@ -441,9 +441,15 @@ class DownstreamTrainer():
         # [FIX B3] embed_method='concat' is what the published downstream head uses;
         # dropping it silently builds EmbedderAdd instead of EmbedderConcat, which is a
         # different architecture with a different parameter count.
+        # [B28] Same layer-combination rule as the other construction site below: a head
+        # trained against a --combine_layers cache was built with num_feature_layers=1, and
+        # must be rebuilt that way to load its checkpoint at all. Missing this made such a
+        # head trainable but not evaluable -- state_dict load failed on weighted_avg_weights
+        # with shape [1] vs [12].
+        n_feat_layers = 1 if getattr(self, 'cache_combined', False) else self.params.num_layers_backbone
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
                                   num_embedder_layers= self.params.num_embedder_layers,
-                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes, dropout= self.params.downstream_dropout,
+                                  d_state=64, d_conv=4, expand=2, num_feature_layers=n_feat_layers, num_prototypes = self.params.max_gt_classes, dropout= self.params.downstream_dropout,
                                   embed_method='concat').to(self.device)
     
         total_params = sum(p.numel() for p in self.down_model.parameters())
