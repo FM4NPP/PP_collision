@@ -120,6 +120,14 @@ def main():
     parser.set_defaults(usepretrain=True)
     parser.add_argument("--global_log_dir", default='globallogs', type=str, help="Global dir to store logging only")
     parser.add_argument(
+        "--max_eval_events",
+        type=int,
+        default=20000,
+        help="Evaluate at most this many events. Useful for a fast environment "
+             "check: a correct stack and a broken one differ by ~0.9 ARI, which "
+             "is visible in a few hundred events.",
+    )
+    parser.add_argument(
         "--combine_weights",
         type=str,
         default=None,
@@ -192,7 +200,12 @@ def main():
     if args.data_root_test:
         params.data_root_test = args.data_root_test
     checkpoint_base_dir = args.checkpoint_dir or args.root_dir
-    checkpoint_path = os.path.join(checkpoint_base_dir, checkpoint_name)
+    # [B34] --checkpoint was documented as "overrides default" but was parsed and never
+    # read, so an explicit path silently fell back to the derived name. That made it
+    # impossible to score a checkpoint someone else trained -- which is exactly the test
+    # that eventually found [B29].
+    checkpoint_path = (args.checkpoint if args.checkpoint
+                       else os.path.join(checkpoint_base_dir, checkpoint_name))
 
     params.loss_matched_ce_weight = 0.5
     params.loss_unmatched_ce_weight = 0.1
@@ -208,6 +221,7 @@ def main():
 
     # Launch and run inference
     trainer = DownstreamTrainer(params, args)
+    trainer.max_eval_events = args.max_eval_events
     if args.combine_weights:
         w = [float(x) for x in args.combine_weights.split(',')]
         if len(w) != int(params.num_layers_backbone):

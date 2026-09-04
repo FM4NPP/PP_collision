@@ -517,8 +517,11 @@ class DownstreamTrainer():
             for i, (grouped, label, knearest, reg) in enumerate(tqdm(self.val_data_loader)):
             #for i, (grouped, label, knearest) in enumerate(tqdm(self.train_data_loader)):
                 #reg = 0
-                #validate for 500 samples
-                if i > 20000:
+                # [B34] The hardcoded 20000 never fired on a 6,943-event test set, so
+                # there was no way to score a subset without editing code -- which makes
+                # a quick setup check ("does this environment give 0.95 or 0.05?") cost a
+                # full pass over the test data.
+                if i >= getattr(self, 'max_eval_events', 20000):
                     break
                 b, c = grouped.size(0), grouped.size(-1)
                 labels = label.to(self.device)
