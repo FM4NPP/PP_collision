@@ -95,9 +95,11 @@ conda activate fm4npp
 # Install PyTorch
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# Install Mamba dependencies
-pip install mamba-ssm causal-conv1d
+# Install Mamba dependencies.
+# NOT `pip install mamba-ssm causal-conv1d`: PyPI ships source only for both, so that
+# compiles for 20-60 minutes and fails without --no-build-isolation.
 pip install triton
+bash tutorials/01_environment/install_kernels.sh
 
 # Install other requirements
 pip install pyyaml numpy scipy tqdm mmap-ninja

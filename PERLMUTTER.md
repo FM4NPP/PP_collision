@@ -21,9 +21,15 @@ Two facts to carry through the whole tutorial, because both cost people days:
   run unless you set `FM4NPP_ALLOW_FALLBACK=1`. Install the kernels:
 
   ```bash
-  pip install mamba-ssm causal-conv1d       # on a login node; they compile
+  bash tutorials/01_environment/install_kernels.sh   # fetches prebuilt wheels
   python scripts/check_kernel_equivalence.py
   ```
+
+  Do not run `pip install mamba-ssm causal-conv1d` directly. PyPI ships source only, so
+  that compiles for 20-60 minutes, fails without `--no-build-isolation` because setup.py
+  imports torch, and on the current release drags in `tilelang` and `quack-kernels`. The
+  script above reads your torch/CUDA/Python/ABI and fetches the matching prebuilt wheel
+  from the upstream GitHub releases instead.
 
 ---
 

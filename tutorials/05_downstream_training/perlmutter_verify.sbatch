@@ -20,7 +20,10 @@
 # PREREQUISITE -- run once on a LOGIN node, not here. These compile:
 #
 #     source common/paths.sh && source $FM4NPP_WORK/.venv/bin/activate
-#     pip install mamba-ssm causal-conv1d
+#     bash tutorials/01_environment/install_kernels.sh
+#
+# Not `pip install mamba-ssm causal-conv1d` -- PyPI has no wheels for either, so that
+# compiles for the better part of an hour and fails without --no-build-isolation.
 #
 # Submit:  sbatch tutorials/05_downstream_training/perlmutter_verify.sbatch
 #
@@ -46,7 +49,7 @@ try:
 except Exception as e:
     print(f"  mamba-ssm NOT importable ({type(e).__name__})")
     print("  This job cannot do what it exists to do. Install on a login node:")
-    print("      pip install mamba-ssm causal-conv1d")
+    print("      bash tutorials/01_environment/install_kernels.sh")
     sys.exit(1)
 PY
 [ $? -ne 0 ] && { echo "STOP: install the kernels first."; exit 1; }

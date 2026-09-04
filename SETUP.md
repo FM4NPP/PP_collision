@@ -33,8 +33,12 @@ conda activate fm4npp
 # Install PyTorch with CUDA
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# Install Mamba dependencies
-pip install mamba-ssm causal-conv1d triton
+# Install Mamba dependencies.
+# NOT `pip install mamba-ssm causal-conv1d`: PyPI has no wheels for either package, so
+# that compiles CUDA extensions for 20-60 minutes and fails without --no-build-isolation
+# (setup.py imports torch). This script fetches the matching prebuilt wheel instead.
+pip install triton
+bash tutorials/01_environment/install_kernels.sh
 
 # Install other requirements
 pip install -r requirements.txt

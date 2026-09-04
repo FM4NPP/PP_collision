@@ -66,9 +66,19 @@ Both errors are fixed and the fallback now tracks the kernels. It is still far s
 still unvalidated on any given machine, so it refuses to run unless you ask:
 
 ```bash
-pip install mamba-ssm causal-conv1d          # login node; these compile
-python scripts/check_kernel_equivalence.py   # PASS, or SKIP if the kernels are absent
+bash install_kernels.sh                      # prebuilt wheels, no compile
+python ../../scripts/check_kernel_equivalence.py   # PASS, or SKIP if kernels absent
 ```
+
+`install_kernels.sh` exists because `pip install mamba-ssm causal-conv1d` does not work
+the way you would expect: PyPI has **no wheels for either package**, only source, so pip
+compiles CUDA extensions every time -- 20-60 minutes, and it fails outright without
+`--no-build-isolation` because `setup.py` imports torch before torch is available. Both
+projects publish prebuilt wheels on their GitHub releases keyed by CUDA major, torch
+minor, C++11 ABI and Python version; the script reads those four values off your torch
+and fetches the match. It pins mamba-ssm to 2.2.4, which declares no dependencies at all
+-- the current 2.3.2 requires `tilelang`, `quack-kernels` and `triton>=3.5`, which will
+argue with whatever torch you already have.
 
 If they cannot be built on your machine, `export FM4NPP_ALLOW_FALLBACK=1` and read the
 warning it prints. The lesson generalises past this repo: a numerical fallback that cannot
