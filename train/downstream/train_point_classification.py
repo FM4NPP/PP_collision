@@ -49,6 +49,13 @@ def main():
                         help="Random seed. Recorded in the checkpoint name so eval can find it. "
                              "run_pid.sh and run_nid.sh have always passed this flag; until now "
                              "it did not exist and they failed with unrecognized arguments.")
+    parser.add_argument(
+        "--pretrained_ckpt",
+        type=str,
+        default=None,
+        help="Path to the pretrained backbone. Overrides the built-in model2ckpt table, "
+             "which points at paths that exist only on the original author's cluster.",
+    )
     args = parser.parse_args()
     if args.seed is not None:
         set_seed(args.seed)
@@ -110,7 +117,15 @@ def main():
     params.limit_data = True
     params.limit_size = int(args.eventnumber)
     params.valid_batch_size = 1
-    params.pretrained_ckpt = model2ckpt[args.config]
+    # [B35] The model2ckpt dict above hardcodes the original author's cluster paths and is
+    # assigned AFTER YParams, so it silently overrides whatever pretrained_ckpt the config
+    # says -- and repoint_config.py only rewrites YAML, so this is the one path surface
+    # repointing cannot reach. Anyone running outside that filesystem had no way to point at
+    # their own backbone.
+    if getattr(args, 'pretrained_ckpt', None):
+        params.pretrained_ckpt = args.pretrained_ckpt
+    else:
+        params.pretrained_ckpt = model2ckpt[args.config]
     seed_suffix = "" if args.seed is None else f"_seed{args.seed}"
     params.log_file_name = (f"{args.config}_nerf_{params.task}_d{params.limit_size}"
                             f"_{args.run_num}{seed_suffix}.log")

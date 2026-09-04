@@ -1,0 +1,100 @@
+{
+  "source": "/home/aid1/fm4npp_repro/data/mmap70/val100",
+  "arrays": {
+    "features_pretrain": {
+      "events": 20,
+      "data_sha256": "b7e8efc8cd893c0a6d5368f0cc36f5d2533d3863d4145b8b9fd9733897caf691"
+    },
+    "seg_target_pretrain": {
+      "events": 20,
+      "data_sha256": "8bfb996f77e58df42691b75b72cee8e196631a3cb17ccd3f94c52f5bb176bf5f"
+    },
+    "pid_target_pretrain": {
+      "events": 20,
+      "data_sha256": "955899dbe24c7c9bfe933abdc40d633bcc5fde16e9b5861c331d426b2a9fca67"
+    },
+    "reg_target_pretrain": {
+      "events": 20,
+      "data_sha256": "6312dd841e4b9df8e1e1963a0f4bd9471f6db2e3810b0cd27f7c30aa6a242e57"
+    },
+    "features_test": {
+      "events": 20,
+      "data_sha256": "38fa477418bf957c34b1d2f807e937c0ce8e16a0605edcf949c5a067bc75366b"
+    },
+    "seg_target_test": {
+      "events": 20,
+      "data_sha256": "79c875c5fd7e2544f871f5a1d6e82fe9428bc836f352b3bd80675cba82dd58f2"
+    },
+    "pid_target_test": {
+      "events": 20,
+      "data_sha256": "72543011fb1cfc6fc65c89643dcbabfe5c0fd2a2edc4a80aa88c481460179d13"
+    },
+    "reg_target_test": {
+      "events": 20,
+      "data_sha256": "2113fe314d04d29af69906fd8e83a1f7418987377c41cdf5df7cbad6790771cf"
+    }
+  },
+  "splits": {
+    "pretrain": {
+      "events": 20,
+      "source_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "points": 12520,
+      "max_points": 1892,
+      "max_tracks": 23
+    },
+    "test": {
+      "events": 20,
+      "source_indices": [
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "points": 10097,
+      "max_points": 1927,
+      "max_tracks": 48
+    }
+  },
+  "stats": {
+    "bin_edges_v3_nbins_8_8_6.pkl": "4e603255647c012d76feb1109d397c8b755e3ccb6cb384f4f0e7c561df0c6bf0",
+    "loss_bin_pp.pkl": "2c915499b5b6ba8eb6599a756bd42be13321f95bf8fe927c3e375f8527628cb7",
+    "loss_weight_pp.pkl": "040cb86c88f2591e21b8cb3a3dee977c2c80de07b8c1723b76abf6b0e761e497"
+  }
+}

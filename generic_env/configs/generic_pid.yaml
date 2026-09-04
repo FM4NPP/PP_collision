@@ -1,0 +1,74 @@
+# Particle identification on the committed fixture
+#
+# Self-contained: every path below is RELATIVE to generic_env/, so nothing needs repointing.
+# That is deliberate. scripts/repoint_config.py rewrites four absolute literals, but it does
+# not rewrite `stat_dir` in the point-classification configs, and its leftover-detector greps
+# only for /global/cfs|/mldata|/pscratch -- so a leftover /home/shuhang path is never
+# reported and the script prints "written" as if it had succeeded.
+#
+# Sized for the 20-event fixture:
+#   batch_size 4   -- the train loader uses drop_last=True, so a batch above 20 yields nothing
+#   max_epochs 4  -- enough to watch the loss move; not a measurement
+#
+# A number from this config demonstrates that the pipeline runs. It is not a result.
+d9_m1_k30_p20:
+  embed_dim: 256
+  d_state: 16
+  num_layers_backbone: 12
+  dropout: 0.0
+  klen: 30
+  base_dim: 256
+  batch_size: 4
+  data_root: fixture
+  data_root_train: fixture
+  data_root_test: fixture
+  stat_dir: fixture
+  downstream_dir: runs
+  checkpoint_dir: runs
+  data_version: pp_100k
+  group_size: 8
+  init_std: 0.025
+  limit_data: true
+  limit_size: 20
+  log_to_screen: true
+  max_epochs: 4
+  max_lr: 0.001
+  min_lr: 0.0001
+  model_version: mtest1
+  n_data_idx: 1000000
+  n_eval_steps: 1000
+  num_data_workers: 0
+  num_heads_backbone: 4
+  num_heads_decoder: 2
+  num_heads_encoder: 2
+  num_layers_decoder: 3
+  num_layers_encoder: 3
+  order: EPR
+  out_scale: 0.01
+  save_checkpoint: true
+  save_version: mamba2
+  total_steps: 200
+  valid_batch_size: 1
+  warmup_steps: 1
+  weight_decay: 0.01
+  continue_from_best: false
+  nleave: 1e6
+  len_chunk: 512
+  portion: 0.2
+  chunk_training: false
+  return_reg_test: false
+  return_dict: true
+  use_attention_head: true
+  num_layers: 1
+  downstream_dropout: 0.1
+  first_cycle_steps: 4
+  head_embed_method: legacy
+  adapter_FFN: false
+  num_output_classes: 5
+  task: pid
+  embed_method: add
+  pe_method: nerf
+  mambaversion: mamba2
+  voxelize: true
+  space_filling_order: false
+  space_filling_curve: z

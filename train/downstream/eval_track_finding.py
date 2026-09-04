@@ -136,6 +136,13 @@ def main():
              "num_feature_layers=1 and cannot consume the live backbone's full stack. Read "
              "the vector from the cache's cache_meta.json.",
     )
+    parser.add_argument(
+        "--pretrained_ckpt",
+        type=str,
+        default=None,
+        help="Path to the pretrained backbone. Overrides the built-in model2ckpt table, "
+             "which points at paths that exist only on the original author's cluster.",
+    )
     args = parser.parse_args()
 
     # Default mapping from config to checkpoint if not provided via --checkpoint
@@ -181,7 +188,15 @@ def main():
     params.limit_size = args.eventnumber
     params.batch_size = args.eval_batch_size
     params.valid_batch_size = args.eval_batch_size
-    params.pretrained_ckpt = model2ckpt[args.config]
+    # [B35] The model2ckpt dict above hardcodes the original author's cluster paths and is
+    # assigned AFTER YParams, so it silently overrides whatever pretrained_ckpt the config
+    # says -- and repoint_config.py only rewrites YAML, so this is the one path surface
+    # repointing cannot reach. Anyone running outside that filesystem had no way to point at
+    # their own backbone.
+    if getattr(args, 'pretrained_ckpt', None):
+        params.pretrained_ckpt = args.pretrained_ckpt
+    else:
+        params.pretrained_ckpt = model2ckpt[args.config]
     # [FIX B8] mirror the seed suffix used by train_track_finding.py
     seed_suffix = "" if args.no_seed_in_ckpt else f"_seed{args.seed}"
     checkpoint_base_name = f"{args.config}_nerf_tracking_head_d{params.limit_size}_{args.run_num}{seed_suffix}"

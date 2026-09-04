@@ -1,0 +1,74 @@
+# Track finding on the committed fixture
+#
+# Self-contained: every path below is RELATIVE to generic_env/, so nothing needs repointing.
+# That is deliberate. scripts/repoint_config.py rewrites four absolute literals, but it does
+# not rewrite `stat_dir` in the point-classification configs, and its leftover-detector greps
+# only for /global/cfs|/mldata|/pscratch -- so a leftover /home/shuhang path is never
+# reported and the script prints "written" as if it had succeeded.
+#
+# Sized for the 20-event fixture:
+#   batch_size 4   -- the train loader uses drop_last=True, so a batch above 20 yields nothing
+#   max_epochs 4  -- enough to watch the loss move; not a measurement
+#
+# A number from this config demonstrates that the pipeline runs. It is not a result.
+d9_m1_k30_p20:
+  embed_dim: 256
+  d_state: 16
+  num_layers_backbone: 12
+  klen: 30
+  dropout: 0.0
+  mambaversion: mamba2
+  data_root: fixture
+  stat_dir: fixture
+  data_root_train: fixture
+  data_root_test: fixture
+  downstream_dir: runs
+  checkpoint_dir: runs
+  data_version: pp_12M
+  batch_size: 4
+  limit_data: true
+  limit_size: 20
+  log_to_screen: true
+  max_epochs: 4
+  n_data_idx: 1000000
+  n_eval_steps: 1000
+  num_data_workers: 0
+  nleave: 1e10
+  order: EPR
+  len_chunk: 512
+  portion: 0.2
+  chunk_training: false
+  return_reg_test: false
+  max_gt_classes: 150
+  space_filling_order: false
+  space_filling_curve: z
+  grad_clip_value: 0.1
+  rep_aaai: false
+  loss_reweight: false
+  ablate_loss_scale: false
+  save_checkpoint: true
+  max_lr: 0.0001
+  min_lr: 0.00001
+  first_cycle_steps: 4
+  warmup_steps: 1
+  base_dim: 256
+  group_size: 8
+  init_std: 0.025
+  model_version: downstream_v1
+  embed_method: add
+  pe_method: nerf
+  downstream_dropout: 0.1
+  num_heads_backbone: 4
+  num_heads_decoder: 2
+  num_heads_encoder: 2
+  num_embedder_layers: 0
+  use_attention_head: true
+  continue_from_best: true
+  valid_batch_size: 1
+  loss_matched_ce_weight: 0.5
+  loss_unmatched_ce_weight: 0.1
+  loss_dice_weight: 1
+  loss_focal_weight: 30
+  return_reg: false
+  return_dict: false
+  voxelize: true

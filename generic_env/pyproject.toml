@@ -1,0 +1,53 @@
+[project]
+name = "fm4npp-generic-env"
+version = "0.1.0"
+description = "Downstream-only environment for FM4NPP: released checkpoint in, trained head and a score out."
+requires-python = ">=3.10"
+
+# This list is the transitive closure of what the downstream entry points actually import,
+# traced from train/eval_{track_finding,point_classification}.py and scripts/cache_features.py.
+# It is deliberately shorter than the repository's requirements.txt, which carries packages
+# this path never reaches.
+dependencies = [
+    # --- the actual compute path ---
+    "torch>=2.4.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",              # loss.py: linear_sum_assignment, the Hungarian matcher
+    "scikit-learn>=1.2",          # adjusted_rand_score -- the headline tracking metric
+    "einops>=0.6.0",              # models/mamba2.py, models/rmsnorm.py
+    "tqdm>=4.65.0",
+
+    # --- config and data ---
+    "ruamel.yaml>=0.17",          # YParams. NOTE: not pyyaml -- see below
+    "mmap-ninja>=0.7.0",          # the RaggedMmap on-disk format
+    "pandas>=2.0",                # inference() CSV export; --save_csv defaults on
+
+    # --- imported at module load, never used on the compute path ---
+    # voxelizer.py imports both unconditionally, and dataset.py does `from .voxelizer import *`,
+    # so constructing any dataset pulls them in. They cannot be dropped without editing source.
+    "plotly>=5.0",
+    "matplotlib>=3.7",
+
+    # --- git-only, and imported by the trainer module itself, so even eval needs it ---
+    "cosine_annealing_warmup @ git+https://github.com/katsura-jp/pytorch-cosine-annealing-with-warmup",
+
+    # --- fetching the released backbone ---
+    "huggingface-hub>=0.20",
+]
+
+# Deliberately ABSENT, having been traced and found unreachable on this path:
+#
+#   pyyaml       requirements.txt lists it, but YParams uses ruamel.yaml. Nothing on the
+#                downstream path does `import yaml`.
+#   remotezip    only scripts/fetch_labeled_data.py, which this env does not use.
+#   transformers not imported anywhere in the repository.
+#   triton       never imported by fm4npp; a transitive dependency of mamba-ssm only.
+#   tilelang     not imported; it is a dependency of mamba-ssm 2.3.2 and nothing else.
+#
+# mamba-ssm and causal-conv1d are NOT here on purpose. They have no PyPI wheels, so listing
+# them would make `uv sync` compile CUDA extensions for the better part of an hour. This env
+# runs the corrected pure-PyTorch fallback instead; see README.md and env.sh. To upgrade:
+#     bash ../tutorials/01_environment/install_kernels.sh
+
+[tool.uv]
+package = false
