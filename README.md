@@ -46,6 +46,12 @@ All released checkpoints are **Mamba2** backbones (`mambaversion: mamba2`), buil
 the pure-PyTorch `fm4npp/models/mamba2.py`. You do **not** need to compile `mamba-ssm`
 to reproduce the paper -- that dependency is only used by the `mamba1` backbone.
 
+## Running on Perlmutter
+
+A step-by-step walkthrough for NERSC Perlmutter -- environment, data, SLURM scripts, the
+checks to run at each stage, and the numbers to expect -- is in
+**[PERLMUTTER.md](PERLMUTTER.md)**.
+
 ## Repository Structure
 
 ```
