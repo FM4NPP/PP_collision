@@ -11,9 +11,19 @@ Two facts to carry through the whole tutorial, because both cost people days:
 - **The checkpoint names do not match the paper.** `pp_nerf_m1_k30.ckpt` is the paper's
   **m3**; `pp_nerf_m5_k30.ckpt` is the paper's **m6**. Download "m1" expecting the paper's
   m1 and you get a model 16x larger.
-- **You do not need `mamba-ssm`.** Every released checkpoint is a Mamba2 backbone running
-  on pure PyTorch. Compiling `mamba-ssm` on Perlmutter is the single most common way to
-  lose an afternoon here, and it buys nothing.
+- **You DO need `mamba-ssm`.** An earlier version of this document said the opposite. It
+  was wrong, and it cost roughly 0.09 ARI. Without the compiled kernels
+  `fm4npp/models/mamba2.py` falls back to a pure-PyTorch path that used to compute a
+  *different function* -- an ungated norm on the wrong tensor, and an EMA in place of the
+  SSD scan that threw away `B` and `C` entirely. Released checkpoints loaded into it
+  cleanly and scored about 0.86 where the paper reports 0.9448. Both errors are fixed and
+  the fallback now tracks the kernels, but it is orders of magnitude slower and refuses to
+  run unless you set `FM4NPP_ALLOW_FALLBACK=1`. Install the kernels:
+
+  ```bash
+  pip install mamba-ssm causal-conv1d       # on a login node; they compile
+  python scripts/check_kernel_equivalence.py
+  ```
 
 ---
 
@@ -63,7 +73,8 @@ source $WORK/venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` has `mamba-ssm`, `causal-conv1d` and `triton` commented out on purpose.
+`requirements.txt` lists `mamba-ssm`, `causal-conv1d` and `triton` as required. They
+compile, so install them on a login node, not in a batch job.
 Leave them that way.
 
 ## 3. Verify before spending an allocation

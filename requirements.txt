@@ -24,9 +24,10 @@ mmap-ninja>=0.7.0
 # [FIX B15] `torch-distributed` was listed here but is not a real package;
 # torch.distributed ships with torch.
 
-# Optional: only needed for the Mamba1 (mambaversion=mamba1) backbone. The released
-# checkpoints are Mamba2 and run on the pure-PyTorch fm4npp/models/mamba2.py, so you
-# do NOT need to compile these to reproduce the paper.
-# mamba-ssm>=1.0.0
-# causal-conv1d>=1.0.0
-# triton>=2.2.0
+# REQUIRED. These were commented out with a note saying the released Mamba2 checkpoints
+# did not need them. That was wrong: without these, fm4npp/models/mamba2.py falls back to
+# a pure-PyTorch path that computed a different function (see [B29]) and silently cost
+# ~0.09 ARI. They compile -- install on a login node, not in a batch job.
+mamba-ssm>=1.0.0
+causal-conv1d>=1.0.0
+triton>=2.2.0

@@ -42,9 +42,15 @@ you intended.
 The paper's `m1` (width 64, 0.34M) and `m2` (width 128, 1.3M) are configs
 `d9_m64_k30_p20` and `d9_m128_k30_p20`; their checkpoints are not published.
 
-All released checkpoints are **Mamba2** backbones (`mambaversion: mamba2`), built from
-the pure-PyTorch `fm4npp/models/mamba2.py`. You do **not** need to compile `mamba-ssm`
-to reproduce the paper -- that dependency is only used by the `mamba1` backbone.
+All released checkpoints are **Mamba2** backbones (`mambaversion: mamba2`), and they
+require `mamba-ssm`. Earlier text here said the opposite. Without the compiled kernels
+`fm4npp/models/mamba2.py` takes a pure-PyTorch fallback which, until [B29], was not the
+same model: it applied an ungated RMSNorm to the SSM input and replaced the SSD scan with
+an EMA that discarded `B` and `C`. Checkpoints loaded into it with `strict=True` and then
+scored about 0.09 ARI below the paper, with nothing to indicate why. The fallback is
+corrected and still available for machines that cannot build the kernels, but it must be
+requested with `FM4NPP_ALLOW_FALLBACK=1` and validated with
+`scripts/check_kernel_equivalence.py`.
 
 ## Running on Perlmutter
 

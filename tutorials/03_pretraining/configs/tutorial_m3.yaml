@@ -1,0 +1,69 @@
+# FM4NPP tutorial -- pretraining config for the paper's m3 (width 256, 5.3M params).
+#
+# Architecturally identical to the downstream config `d9_m1_k30_p20`, which is what
+# `pp_nerf_m1_k30.ckpt` was trained as:
+#     embed_dim 256 | d_state 16 | num_layers_backbone 12 | klen 30
+#
+# Paths come from environment variables set by common/paths.sh, expanded by
+# configs/render_config.py before the run. See README.md.
+
+tutorial_m3:
+  # === paths (rendered from common/paths.sh) ===
+  data_root:  __FM4NPP_PRETRAIN_ROOT__   # must hold BOTH features_pretrain/ and features_test/
+  stat_dir:   __FM4NPP_STATS__           # the repo's stats/ -- see fm4npp_naming.md section 5
+
+  # === model: the paper's m3 ===
+  embed_dim: 256
+  d_state: 16
+  num_layers_backbone: 12
+  klen: 30
+  dropout: 0.1
+  embed_method: add
+  pe_method: nerf
+
+  # === data ===
+  # 2,000 events keeps the pre-training dataset scan under a minute. The dataset's
+  # __init__ loops over every event to read its length before step 0, and the k-NN
+  # target builds an (N,N) distance matrix per event on the fly -- both are why this
+  # number is small for a debug-queue run.
+  limit_data: true
+  limit_size: 2000
+  data_version: pp_100k          # dead key, kept for shape compatibility
+  group_size: 8
+  order: EPR
+  nleave: 1e10
+  len_chunk: 512
+  chunk_training: false
+  voxelize: true
+  space_filling_order: false
+  space_filling_curve: z
+  return_dict: false
+  return_reg_test: false
+  max_gt_classes: 150
+
+  # === batching ===
+  # local_* are the ones actually used; batch_size / valid_batch_size are decorative.
+  batch_size: 32
+  local_batch_size: 8
+  valid_batch_size: 16
+  local_valid_batch_size: 4
+  num_data_workers: 4
+
+  # === optimization ===
+  max_epochs: 10000        # an upper bound; the run stops on total_steps / --max_steps
+  total_steps: 50000       # overridden by --max_steps for the debug job
+  warmup_steps: 1000       # auto-clamped to total_steps//5 by pretrain_m3.py
+  n_eval_steps: 100        # validate every 100 steps so a 200-step job validates twice
+  max_lr: 0.0002
+  min_lr: 0.00002
+  grad_clip_value: 0.1
+
+  # === loss ===
+  loss_reweight: false
+  ablate_loss_scale: false
+  rep_aaai: false
+
+  # === output ===
+  save_checkpoint: true
+  log_to_screen: true
+  save_version: tutorial_m3
