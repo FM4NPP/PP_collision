@@ -8,6 +8,11 @@ import ast
 import contextlib
 import io
 import os
+
+# The runtime checks below construct models. They verify structure, not numbers,
+# so the pure-PyTorch fallback is acceptable here even though it must never be
+# used silently for results -- see fm4npp/models/mamba2.py.
+os.environ.setdefault('FM4NPP_ALLOW_FALLBACK', '1')
 import sys
 
 REPO = sys.argv[1] if len(sys.argv) > 1 else '.'
@@ -51,9 +56,15 @@ def head_callsites(source):
 
 
 sites = head_callsites(tr)
-check('B3', "every MambaAttentionHead call site passes embed_method='concat'",
-      len(sites) > 0 and all(s == 'concat' for s in sites),
-      f'{sites}')
+# B3 originally asserted every call site hardcodes embed_method='concat'. That was wrong.
+# Shuhang's own downstream checkpoints settle it: of 148 tracking heads in his run tree,
+# 148 use 'add' and 0 use 'concat'. His paper-m6 head is 2,617,358 parameters; 'concat'
+# builds 5,565,326 with an extra embedder.proj2 of 1920x1536. The head must take
+# embed_method from the config (whose default block says `embed_method: add`), not from a
+# literal in the trainer.
+check('B3', 'MambaAttentionHead call sites take embed_method from config, not a hardcoded literal',
+      len(sites) > 0 and all(s is None for s in sites),
+      f'{sites} (None = read from params)')
 
 # --- B4: the noise-loss guard must key on something the heads actually emit ---
 loss = src('train/downstream/loss.py')
@@ -76,10 +87,28 @@ pre_src = '\n'.join(ast.dump(s) for s in pre)
 check('B6', 'loss_track_reg/loss_pid_ce initialised before the num_matched branch',
       'loss_track_reg' in pre_src and 'loss_pid_ce' in pre_src)
 
-# --- B16: mamba_ssm import must be optional ---
+# --- B16: mamba_ssm import must be optional for Mamba1GPT's sake ---
 mg = src('fm4npp/models/mambagpt.py')
-check('B16', 'mamba_ssm import is guarded (the mamba2 path needs no compiled kernels)',
+check('B16', 'mamba_ssm import is guarded (only Mamba1GPT needs the compiled Mamba1 op)',
       'try:' in mg.split('from mamba_ssm import Mamba')[0][-40:])
+
+# --- B29: the pure-PyTorch fallback must be correct, and must not engage silently ---
+# The previous B16 wording said the mamba2 path "needs no compiled kernels". That was
+# wrong and expensive: the fallback replaced the gated RMSNorm with an ungated one on the
+# wrong tensor, and the SSD scan with an EMA that discarded B and C. Released checkpoints
+# loaded into it cleanly (strict=True passes -- no shape changes) and scored ~0.09 ARI
+# below the paper. A head trained against the real kernels scored 0.054 against 0.948 in
+# its own log. Structural checks cannot see this, so check for the fix and the guard.
+m2 = src('fm4npp/models/mamba2.py')
+check('B29a', 'SSD scan uses B and C (not the EMA stand-in that discarded them)',
+      '_manual_ssm(self, x_ssm, dt_slice, B_ssm, C_ssm)' in m2
+      and "einsum('bhpn,bhn->bhp'" in m2)
+check('B29b', 'the block norm is gated (rmsnorm(y * silu(z)), not a plain norm on the input)',
+      'F.silu(z)' in m2 and 'norm_before_gate' in m2)
+check('B29c', 'falling back without mamba-ssm raises unless FM4NPP_ALLOW_FALLBACK is set',
+      '_require_kernels_or_optin' in m2 and 'FM4NPP_ALLOW_FALLBACK' in m2)
+check('B29d', 'scripts/check_kernel_equivalence.py exists to validate the fallback',
+      os.path.isfile(os.path.join(REPO, 'scripts', 'check_kernel_equivalence.py')))
 
 # --- B18: mid_target detection must not trust RaggedMmap to raise ---
 check('B18', 'mid_target presence checked via isdir/len, not a bare try/except',
@@ -196,9 +225,14 @@ try:
     with contextlib.redirect_stdout(io.StringIO()):
         h = MambaAttentionHead(**kwargs)
     total = sum(p.numel() for p in h.parameters())
-    check('ARCH', "head built as this repo's trainer builds it has the published param count",
-          total == 2285646,
-          f'{total} via embed_method={em!r} (published 2285646 needs concat; add yields 2203918)')
+    # Ground truth is shuhang's own released heads, not a guess: his 256-wide tracking
+    # head is 2,203,918 parameters and his 1536-wide (paper m6) is 2,617,358, both built
+    # with embed_method='add'. Verified by exact tensor-for-tensor equality against
+    # d9_m5_k30_p20_nerf_tracking_head_d70000_1_seed8_checkpoint.pth.
+    check('ARCH', "head built as this repo's trainer builds it matches shuhang's released head",
+          total == 2203918,
+          f'{total} via embed_method={em!r} '
+          f"(his 256-wide head is 2203918 with 'add'; 'concat' yields 2285646)")
 except Exception as e:  # noqa: BLE001
     check('ARCH', 'track-finding head parameter count', False, f'{type(e).__name__}: {e}')
 

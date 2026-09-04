@@ -63,9 +63,21 @@ class CachedFeatureDataset(Dataset):
         return int(self.meta['num_layers'])
 
     @property
+    def stored_layers(self):
+        """Layers actually present in the cache, read from the data rather than metadata.
+
+        The head must be sized to what the cache holds. Deriving that from a flag is
+        fragile: --combine_layers is only one of the ways a cache ends up with a single
+        layer -- --feature_source final stores x_0 + sum_j z_j, which is also L=1 but
+        sets no combine flag. Asking the array is correct for every such case, present
+        and future.
+        """
+        return int(self.features[0].shape[0])
+
+    @property
     def combine_layers(self):
-        """True if the cache stores the layer-combined tensor rather than the stack."""
-        return bool(self.meta.get('combine_layers', False))
+        """True if the cache stores one layer rather than the per-layer stack."""
+        return self.stored_layers == 1
 
     @property
     def layer_weights(self):

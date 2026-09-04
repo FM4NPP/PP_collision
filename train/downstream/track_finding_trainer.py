@@ -450,7 +450,7 @@ class DownstreamTrainer():
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
                                   num_embedder_layers= self.params.num_embedder_layers,
                                   d_state=64, d_conv=4, expand=2, num_feature_layers=n_feat_layers, num_prototypes = self.params.max_gt_classes, dropout= self.params.downstream_dropout,
-                                  embed_method='concat').to(self.device)
+                                  embed_method=getattr(self.params, 'embed_method', 'add')).to(self.device)
     
         total_params = sum(p.numel() for p in self.down_model.parameters())
         print(f"Total parameters in down_model: {total_params}")
@@ -740,7 +740,7 @@ class DownstreamTrainer():
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
                                   num_embedder_layers= self.params.num_embedder_layers,
                                   d_state=64, d_conv=4, expand=2, num_feature_layers=n_feat_layers, num_prototypes = self.params.max_gt_classes,
-                                  embed_method='concat').to(self.device)
+                                  embed_method=getattr(self.params, 'embed_method', 'add')).to(self.device)
         
         initialize_mamba2(self.down_model, 3, num_residuals=1)
 
