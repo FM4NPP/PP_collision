@@ -69,3 +69,8 @@ temp/
 
 # SLURM
 slurm-*.out
+
+# [FIX B17] The blanket *.pkl rule above silently excluded the normalization and loss
+# statistics that every downstream run loads unconditionally, which is why they were
+# never published. They are a few KB each and belong in the repository.
+!stats/*.pkl

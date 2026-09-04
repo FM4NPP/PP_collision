@@ -1,0 +1,41 @@
+# FM4NPP tutorials -- dependencies
+#
+# Mirrors PP_collision/requirements.txt and adds what the notebooks need.
+# Nothing here compiles: every package is a prebuilt wheel.
+
+# --- core ---
+torch>=2.4.0
+numpy>=1.24.0
+scipy>=1.10.0
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# --- imported at module load by fm4npp, and easy to miss ---
+einops>=0.6.0                 # fm4npp/models/mamba2.py
+ruamel.yaml>=0.17             # fm4npp/utils.py YParams
+scikit-learn>=1.2             # adjusted_rand_score; also TSNE for module 04
+huggingface_hub>=0.20         # PyTorchModelHubMixin, and checkpoint download
+plotly>=5.0                   # HARD import in fm4npp/datasets/voxelizer.py --
+                              # importing TPCBatchDataset at all pulls this in
+pandas>=2.0
+matplotlib>=3.7
+
+# --- git-only: no PyPI package under this name ---
+# Needs network at install time. Install on a login node, not a compute node.
+cosine_annealing_warmup @ git+https://github.com/katsura-jp/pytorch-cosine-annealing-with-warmup
+
+# --- data ---
+mmap-ninja>=0.7.0
+remotezip>=0.12               # range-request fetch of the 118.5 GB Zenodo archive
+
+# --- notebooks ---
+jupyter>=1.0
+ipykernel>=6.0
+
+# --- REQUIRED, and these compile (install on a login node) ---
+#   This block used to say these were deliberately omitted. That was wrong: without
+#   them fm4npp/models/mamba2.py falls back to a pure-PyTorch path that computed a
+#   different model and cost ~0.09 ARI with no visible symptom. See [B29].
+mamba-ssm>=1.0.0
+causal-conv1d>=1.0.0
+triton>=2.2.0

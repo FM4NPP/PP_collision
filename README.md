@@ -13,7 +13,7 @@ David Keetae Park\*, Shuhang Li\*, Yi Huang\*, Xihaier Luo, Haiwang Yu, Yeonju G
 
 \* equal contribution; † corresponding author
 
-[[`OpenReview`](https://openreview.net/forum?id=qaI3cLFsiX)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`Dataset Paper`](https://www.sciencedirect.com/science/article/pii/S2352340925011060)] [[`BibTeX`](#citation)]  [[`Model Checkpoints`](https://drive.google.com/drive/folders/1iNHtLD80ucCNwYQQmLHCnsUD1rI7NgXY?usp=sharing)]
+[[`OpenReview`](https://openreview.net/forum?id=qaI3cLFsiX)] [[`Dataset`](https://doi.org/10.5281/zenodo.16970029)] [[`Dataset Paper`](https://www.sciencedirect.com/science/article/pii/S2352340925011060)] [[`BibTeX`](#citation)]  [[`Model Checkpoints`](https://huggingface.co/FM4NPP/PP_collision)]
 
 --- 
 
@@ -24,6 +24,39 @@ This repository contains the essential code for:
 2. **Downstream Task**: Track reconstruction using pretrained representations
 
 **Paper (OpenReview)**: [Foundation Models for Particle Physics](https://openreview.net/forum?id=qaI3cLFsiX)
+
+## ⚠️ Checkpoint naming: repo `m1` is NOT the paper's `m1`
+
+The released checkpoint filenames follow this repository's internal config names,
+which do **not** match the model names used in the paper. Check this table before
+downloading, or you will train an adapter on a model 16x larger (or smaller) than
+you intended.
+
+| checkpoint on HF | repo config | width | params | **paper's name** |
+|---|---|---|---|---|
+| `pp_nerf_m1_k30.ckpt` | `d9_m1_k30_p20` | 256 | 5.3M | **m3** |
+| `pp_nerf_m3_k30.ckpt` | `d9_m3_k30_p20` | 512 | 21M | **m4** |
+| `pp_nerf_m4_k30.ckpt` | `d9_m4_k30_p20` | 1024 | 84M | **m5** |
+| `pp_nerf_m5_k30.ckpt` | `d9_m5_k30_p20` | 1536 | 188M | **m6** |
+
+The paper's `m1` (width 64, 0.34M) and `m2` (width 128, 1.3M) are configs
+`d9_m64_k30_p20` and `d9_m128_k30_p20`; their checkpoints are not published.
+
+All released checkpoints are **Mamba2** backbones (`mambaversion: mamba2`), and they
+require `mamba-ssm`. Earlier text here said the opposite. Without the compiled kernels
+`fm4npp/models/mamba2.py` takes a pure-PyTorch fallback which, until [B29], was not the
+same model: it applied an ungated RMSNorm to the SSM input and replaced the SSD scan with
+an EMA that discarded `B` and `C`. Checkpoints loaded into it with `strict=True` and then
+scored about 0.09 ARI below the paper, with nothing to indicate why. The fallback is
+corrected and still available for machines that cannot build the kernels, but it must be
+requested with `FM4NPP_ALLOW_FALLBACK=1` and validated with
+`scripts/check_kernel_equivalence.py`.
+
+## Running on Perlmutter
+
+A step-by-step walkthrough for NERSC Perlmutter -- environment, data, SLURM scripts, the
+checks to run at each stage, and the numbers to expect -- is in
+**[PERLMUTTER.md](PERLMUTTER.md)**.
 
 ## Repository Structure
 
@@ -62,9 +95,11 @@ conda activate fm4npp
 # Install PyTorch
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# Install Mamba dependencies
-pip install mamba-ssm causal-conv1d
+# Install Mamba dependencies.
+# NOT `pip install mamba-ssm causal-conv1d`: PyPI ships source only for both, so that
+# compiles for 20-60 minutes and fails without --no-build-isolation.
 pip install triton
+bash tutorials/01_environment/install_kernels.sh
 
 # Install other requirements
 pip install pyyaml numpy scipy tqdm mmap-ninja
@@ -160,17 +195,31 @@ wget https://zenodo.org/records/16970029/files/TPCpp-10M.tar.gz
 # Extract
 tar -xzf TPCpp-10M.tar.gz
 
-# Dataset structure after extraction:
+# Dataset structure after extraction (flat .npz, NOT RaggedMmap):
 TPCpp-10M/
-├── unlabeled/        # 10M events for pretraining (100 files)
-├── labeled_train/    # 70k labeled events (7 file sets)
-│   ├── spacepoints/
-│   ├── track_ids/
-│   ├── particle_ids/
-│   └── noise_tags/
-├── labeled_val/      # 13k validation events
-└── labeled_test/     # 7k test events
+├── unlabeled/
+└── labeled/
+    ├── train/        # 70k labeled events
+    │   ├── spacepoints.npz    # 'data' (N, 4) float32 + 'size' (n_events,)
+    │   ├── track_ids.npz
+    │   ├── pid_labels.npz
+    │   └── noise_tags.npz
+    ├── val/          # 13k
+    └── test/         # 7k
 ```
+
+The training code does not read `.npz` -- it reads memory-mapped `RaggedMmap`
+directories. Convert first:
+
+```bash
+python scripts/prepare_data.py --in_dir TPCpp-10M/labeled/train \
+                               --out /path/to/mmap_train --split pretrain
+python scripts/prepare_data.py --in_dir TPCpp-10M/labeled/test \
+                               --out /path/to/mmap_test  --split test
+```
+
+Note `--split pretrain` for the *training* data: the training dataloader is
+hardcoded to the `pretrain` suffix. See `SETUP.md`.
 
 ### Data Format Details
 
@@ -182,10 +231,12 @@ Each spacepoint includes:
   - Particle IDs: 5 classes (electron, photon, pion, kaon, proton)
   - Noise tags: Binary labels (signal/noise)
 
-**Feature dimensions**: 30D per point
-- Position: (x, y, z)
-- Momentum: (px, py, pz)
-- Energy, time, detector metadata
+**Feature dimensions**: 4D per point -- `(E, x, y, z)`
+
+(Earlier revisions of this README claimed 30D with momentum and detector metadata.
+That is wrong: the published spacepoints are 4-dimensional. See `SETUP.md` for the
+target formats and for the `reg_target` layout that carries the momentum/vertex
+information.)
 
 ### Usage with Code
 

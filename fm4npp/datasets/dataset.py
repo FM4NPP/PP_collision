@@ -332,12 +332,22 @@ class TPCBatchDataset(Dataset):
         self.memmap_pid_target = RaggedMmap(os.path.join(data_root, 'pid_target_{}'.format(split)))
 
         # Try to load mid_target if available
-        try:
-            self.memmap_mid_target = RaggedMmap(os.path.join(data_root, 'mid_target_{}'.format(split)))
-            self.has_mid_target = True
-        except (FileNotFoundError, OSError):
-            self.memmap_mid_target = None
-            self.has_mid_target = False
+        # [FIX B18] RaggedMmap does NOT raise on a missing directory -- it constructs an
+        # empty object and only raises IndexError("RaggedMmap is empty!") on access. The
+        # original try/except therefore set has_mid_target=True for datasets that have no
+        # mid_target at all (including the published Zenodo release, which ships no
+        # mother-particle IDs), and every __getitem__ died inside the DataLoader worker.
+        mid_dir = os.path.join(data_root, 'mid_target_{}'.format(split))
+        self.memmap_mid_target = None
+        self.has_mid_target = False
+        if os.path.isdir(mid_dir):
+            try:
+                candidate = RaggedMmap(mid_dir)
+                if len(candidate) > 0:
+                    self.memmap_mid_target = candidate
+                    self.has_mid_target = True
+            except (FileNotFoundError, OSError, IndexError, ValueError):
+                pass
 
         # voxelization ablation
         self.voxelize = voxelize

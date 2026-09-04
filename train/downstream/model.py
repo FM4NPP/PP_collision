@@ -163,7 +163,8 @@ class MambaAttentionHead(nn.Module):
     def __init__(self, input_dim, embed_dim=256, num_layers=3, d_state=64, d_conv=4, expand=2, 
                  num_feature_layers=15, num_output_dim=256, num_prototypes=10, num_heads=4, ffn_dim=512,
                  num_pid_classes=5, num_track_features= 4, num_jet_preposoals=5, num_jet_features=4,
-                 num_self_attn_layers=2, softmax_mask=False, do_masked_attn=True, do_holistic=True, return_embedding=False):
+                 num_self_attn_layers=2, softmax_mask=False, do_masked_attn=True, do_holistic=True,
+                 return_embedding=False, embed_method='add'):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
@@ -173,6 +174,14 @@ class MambaAttentionHead(nn.Module):
         self.num_heads = num_heads
         self.do_holistic = do_holistic
         self.return_embedding = return_embedding
+
+        # [FIX B2] `Embedder` is not a name that exists: fm4npp/models/embed.py has that
+        # class commented out, so `from fm4npp.models.embed import *` never binds it.
+        # Select the concrete embedder from embed_method, as the pretraining backbone does.
+        if embed_method == 'concat':
+            Embedder = EmbedderConcat
+        else:
+            Embedder = EmbedderAdd
 
         # Input processing
         self.input_proj = nn.Sequential(
@@ -215,7 +224,10 @@ class MambaAttentionHead(nn.Module):
         # Noise prediction head go from point embedding
         self.noise_mlp = MLPHead(embed_dim, 2)
 
-        self.embedder = Embedder(embed_dim=input_dim)
+        # [FIX B2] pe_method must be passed explicitly; EmbedderAdd/Concat take it as a
+        # required positional arg and the released checkpoints are nerf-encoded
+        # (embedder.embed.projection is (63, D) = 3 dims x (1 + 2*10) nerf bands).
+        self.embedder = Embedder(pe_method='nerf', embed_dim=input_dim)
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
 
     def make_predictions(self, refined_protos, point_features):
@@ -426,7 +438,8 @@ class MambaHead(nn.Module):
         # Noise prediction head go from point embedding
         self.out_mlp = MLPHead(embed_dim, num_output_dim, dropout=dropout)
 
-        self.embedder = Embedder(embed_dim=input_dim)
+        # [FIX B2] same undefined-name defect as MambaAttentionHead.
+        self.embedder = EmbedderAdd(pe_method='nerf', embed_dim=input_dim)
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
 
 
@@ -480,10 +493,16 @@ class AttentionHead(nn.Module):
         self.embed_dim = embed_dim
         self.return_embedding = return_embedding
         self.FFN = adapter_FFN
+        # [B33] 'legacy' is the embedder the released PID/NID heads were trained with:
+        # the original `Embedder`, energy -> embed_dim//4 and position -> the rest.
+        # The public rewrite offered only EmbedderAdd/EmbedderConcat, which build
+        # different tensors, so those checkpoints could not be reconstructed at all.
         if embed_method == 'concat':
-            Embedder = EmbedderConcat
+            Embedder_cls = EmbedderConcat
+        elif embed_method == 'legacy':
+            Embedder_cls = Embedder
         else:
-            Embedder = EmbedderAdd
+            Embedder_cls = EmbedderAdd
 
         # Input processing
         self.input_proj = nn.Sequential(
@@ -529,7 +548,9 @@ class AttentionHead(nn.Module):
         # Noise prediction head go from point embedding
         self.out_mlp = MLPHead(embed_dim, num_output_dim, dropout=dropout)
 
-        self.embedder = Embedder(pe_method = 'nerf', embed_dim=input_dim)
+        self.embedder = (Embedder_cls(embed_dim=input_dim)
+                         if embed_method == 'legacy'
+                         else Embedder_cls(pe_method='nerf', embed_dim=input_dim))
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
 
 

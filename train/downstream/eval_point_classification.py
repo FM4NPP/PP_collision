@@ -63,6 +63,27 @@ def main():
         help="Batch size for evaluation",
     )
     parser.add_argument("--global_log_dir", default='globallogs', type=str, help="Global dir to store logging only")
+    parser.add_argument(
+        "--data_root_test",
+        type=str,
+        default=None,
+        help="Test-split root. Without this the config value is overwritten by a BNL "
+             "mount that exists on no other machine, with no way to override it.",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="Directory holding the trained head. Without this it is read from a "
+             "hardcoded /home/shuhang path, so a head you trained yourself is never found.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed suffix in the checkpoint name, matching train_point_classification.py. "
+             "Omit for checkpoints written before seeds were recorded.",
+    )
     args = parser.parse_args()
 
     # Default mapping from config to checkpoint if not provided via --checkpoint
@@ -111,10 +132,17 @@ def main():
     params.pretrained_ckpt = model2ckpt[args.config]
     params.log_file_name = f"{args.config}_eval_{params.task}_d{params.limit_size}_{args.run_num}.log"
     params.num_embedder_layers = 0
-    params.data_root_test = "/mldata/sli/sphenix_fm/pp_test_9k/"
-    checkpoint_name = f"{args.config}_nerf_{params.task}_d{params.limit_size}_{args.run_num}_checkpoint.pth"
-    checkpoint_base_dir = "/home/shuhang/FM4NPP/downstream_log/"
-    checkpoint_path = checkpoint_base_dir + checkpoint_name
+    # [B31] Both of these used to be unconditional literals pointing at the author's own
+    # machine: the test root silently overrode whatever the config said, and the checkpoint
+    # directory ignored --root_dir, so a head trained anywhere else could never be scored.
+    # Tracking got this treatment in [FIX B21]; the point-classification tasks did not.
+    if args.data_root_test:
+        params.data_root_test = args.data_root_test
+    seed_suffix = "" if args.seed is None else f"_seed{args.seed}"
+    checkpoint_name = (f"{args.config}_nerf_{params.task}_d{params.limit_size}"
+                       f"_{args.run_num}{seed_suffix}_checkpoint.pth")
+    checkpoint_base_dir = args.checkpoint_dir or args.root_dir
+    checkpoint_path = os.path.join(checkpoint_base_dir, checkpoint_name)
 
     # Ensure output directory exists
     log_dir = args.root_dir

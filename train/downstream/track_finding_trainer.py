@@ -35,6 +35,7 @@ from fm4npp.models.linformer_gpt import LinformerGPT
 
 from trackinghead import *
 from loss import *
+from cached_dataset import get_cached_data_loader
 
 
 class DownstreamTrainer():
@@ -327,8 +328,39 @@ class DownstreamTrainer():
 
         
         # get the dataloaders
-        self.train_data_loader, self.train_sampler, self.val_data_loader, _ = get_data_loader(self.params, 
-                                                                                              dist.is_initialized())
+        # [B27] With a feature cache the frozen backbone forward and the CPU preprocessing
+        # are both skipped. Measured on one GB10 at batch 32: backbone 786 ms/batch (~45% of
+        # step time) and dataloading 379 ms (~22%). For the 175M model this is the difference
+        # between ~48 min/epoch and ~8 min/epoch.
+        self.feature_cache = getattr(self.params, 'feature_cache', None)
+        self.feature_cache_val = getattr(self.params, 'feature_cache_val', None)
+        if self.feature_cache:
+            self.train_data_loader, ds_tr = get_cached_data_loader(
+                self.feature_cache, batch_size=self.params.local_batch_size, shuffle=True,
+                num_workers=self.params.num_data_workers, limit_size=self.params.limit_size)
+            self.train_sampler = None
+            if ds_tr.embed_dim != self.params.embed_dim:
+                raise ValueError(
+                    f'feature cache width {ds_tr.embed_dim} != config embed_dim '
+                    f'{self.params.embed_dim} -- wrong cache for this config')
+            # [B28] A combined cache stores the softmax-weighted sum over layers rather than
+            # the stack, which is 12x smaller (3,072 vs 36,864 bytes/point at width 1536 --
+            # the difference between 185 GB and 2.17 TB for the 70k split). The head must be
+            # told, so it builds with num_feature_layers=1 instead of 12.
+            self.cache_combined = ds_tr.combine_layers
+            if self.cache_combined:
+                self.cache_layer_weights = ds_tr.layer_weights
+                print(f'[cache] layer-combined cache: head layer mixing frozen to '
+                      f'{[round(w, 4) for w in (self.cache_layer_weights or [])]}')
+            if self.feature_cache_val:
+                self.val_data_loader, _ = get_cached_data_loader(
+                    self.feature_cache_val, batch_size=self.params.local_valid_batch_size,
+                    shuffle=False, num_workers=self.params.num_data_workers)
+            else:
+                _, _, self.val_data_loader, _ = get_data_loader(self.params, dist.is_initialized())
+        else:
+            self.train_data_loader, self.train_sampler, self.val_data_loader, _ = get_data_loader(self.params,
+                                                                                                  dist.is_initialized())
 
         # set loss functions
         self.loss_func = nn.MSELoss(reduction='none')
@@ -406,9 +438,19 @@ class DownstreamTrainer():
         #    num_prototypes=self.params.max_gt_classes
         #).to(self.device)
 
+        # [FIX B3] embed_method='concat' is what the published downstream head uses;
+        # dropping it silently builds EmbedderAdd instead of EmbedderConcat, which is a
+        # different architecture with a different parameter count.
+        # [B28] Same layer-combination rule as the other construction site below: a head
+        # trained against a --combine_layers cache was built with num_feature_layers=1, and
+        # must be rebuilt that way to load its checkpoint at all. Missing this made such a
+        # head trainable but not evaluable -- state_dict load failed on weighted_avg_weights
+        # with shape [1] vs [12].
+        n_feat_layers = 1 if getattr(self, 'cache_combined', False) else self.params.num_layers_backbone
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
-                                  num_embedder_layers= self.params.num_embedder_layers, 
-                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes, dropout= self.params.downstream_dropout).to(self.device)
+                                  num_embedder_layers= self.params.num_embedder_layers,
+                                  d_state=64, d_conv=4, expand=2, num_feature_layers=n_feat_layers, num_prototypes = self.params.max_gt_classes, dropout= self.params.downstream_dropout,
+                                  embed_method=getattr(self.params, 'embed_method', 'add')).to(self.device)
     
         total_params = sum(p.numel() for p in self.down_model.parameters())
         print(f"Total parameters in down_model: {total_params}")
@@ -443,12 +485,23 @@ class DownstreamTrainer():
         try:
             self.load_checkpoint(checkpoint_path, inference=True)
         except Exception as e:
-            print(f"❌ Checkpoint loading failed: {str(e)}")
+            # [FIX B22] this used to print and fall through, so evaluation returned exit 0
+            # having scored nothing. A missing checkpoint, or a state-dict shape mismatch
+            # (the classic symptom of a head built with the wrong embed_method), read as
+            # success to any batch harness. Fail loudly instead.
+            raise RuntimeError(
+                f"Checkpoint loading failed for {checkpoint_path}: {e}"
+            ) from e
             return None
         
         self.down_model.eval()
         self.model.eval()
         print(f"✅ Model loaded from {checkpoint_path}")
+        # [FIX B20] this assignment was deleted from inference() but the variable is still
+        # used at the autocast() call below -> NameError on every evaluation run.
+        # (downstream_end_to_end_one_epoch and validate_end_to_end_one_epoch both keep
+        # their own copy, which is why only eval was broken.)
+        amp_enabled = torch.cuda.is_available() and self.use_amp
 
         seg_target = []
         segmentation_result = []
@@ -464,8 +517,11 @@ class DownstreamTrainer():
             for i, (grouped, label, knearest, reg) in enumerate(tqdm(self.val_data_loader)):
             #for i, (grouped, label, knearest) in enumerate(tqdm(self.train_data_loader)):
                 #reg = 0
-                #validate for 500 samples
-                if i > 20000:
+                # [B34] The hardcoded 20000 never fired on a 6,943-event test set, so
+                # there was no way to score a subset without editing code -- which makes
+                # a quick setup check ("does this environment give 0.95 or 0.05?") cost a
+                # full pass over the test data.
+                if i >= getattr(self, 'max_eval_events', 20000):
                     break
                 b, c = grouped.size(0), grouped.size(-1)
                 labels = label.to(self.device)
@@ -678,9 +734,16 @@ class DownstreamTrainer():
             print(f"✅ Mamba v2 Model Initialized (Safe Scaling for {num_layers} Layers")
                 
     
+        # [B28] With a layer-combined cache the softmax over layers was already applied at
+        # cache time, so the head sees L=1. softmax over a single element is identically 1.0,
+        # so the head's own mixing becomes an exact pass-through -- verified at max
+        # difference 0.000e+00 against the full-stack path. Costs 11 of 5,565,326 parameters.
+        n_feat_layers = 1 if getattr(self, 'cache_combined', False) else self.params.num_layers_backbone
+        # [FIX B3] see above.
         self.down_model = MambaAttentionHead(input_dim=self.params.embed_dim, num_layers=0,
-                                  num_embedder_layers= self.params.num_embedder_layers, 
-                                  d_state=64, d_conv=4, expand=2, num_feature_layers=self.params.num_layers_backbone, num_prototypes = self.params.max_gt_classes).to(self.device)
+                                  num_embedder_layers= self.params.num_embedder_layers,
+                                  d_state=64, d_conv=4, expand=2, num_feature_layers=n_feat_layers, num_prototypes = self.params.max_gt_classes,
+                                  embed_method=getattr(self.params, 'embed_method', 'add')).to(self.device)
         
         initialize_mamba2(self.down_model, 3, num_residuals=1)
 
@@ -693,8 +756,18 @@ class DownstreamTrainer():
         
         torch.nn.utils.clip_grad_norm_(self.down_model.parameters(), max_norm=1.0)
 
+        # [FIX B26] The cosine cycle length used to be hardwired to max_epochs, and this
+        # scheduler is stepped once per epoch. That silently coupled "how long do I train"
+        # to "what learning-rate schedule do I use": lowering max_epochs for a quick test
+        # compressed the whole cycle while warmup_steps stayed fixed, so a 40-epoch run
+        # spent 50% of itself in warmup and then annealed to min_lr, versus 10% warmup at
+        # the intended 200. Training loss was still falling when the LR hit its floor.
+        # first_cycle_steps is now its own config key (it already existed in the yaml and
+        # was being ignored here); max_epochs remains the fallback for old configs.
+        first_cycle = int(getattr(self.params, 'first_cycle_steps', self.params.max_epochs)
+                          or self.params.max_epochs)
         self.down_scheduler = CosineAnnealingWarmupRestarts(self.down_optimizer,
-                                          first_cycle_steps=self.params.max_epochs,
+                                          first_cycle_steps=first_cycle,
                                           max_lr=self.params.max_lr,
                                           min_lr=self.params.min_lr,
                                           warmup_steps=self.params.warmup_steps)
@@ -877,13 +950,18 @@ class DownstreamTrainer():
 
             with autocast('cuda', dtype=torch.bfloat16) if amp_enabled else nullcontext():
                 if pretrain:
-                    if not self.use_lora:
+                    if getattr(self, 'feature_cache', None):
+                        # [B27] Third slot carries precomputed per-layer features
+                        # (L, B, N, D). The backbone is frozen, so these are the tensors it
+                        # would recompute every epoch. See scripts/cache_features.py.
+                        feature = knearest.to(self.device, dtype=torch.bfloat16)
+                    elif not self.use_lora:
                         with torch.no_grad():
                             _, pre_embed, _ = self.model(grouped, return_z=True)
+                        feature = torch.stack(pre_embed)
                     else:
                         _, pre_embed, _ = self.model(grouped, return_z=True)
-                    #feature = torch.stack(pre_embed).mean(0)
-                    feature = torch.stack(pre_embed)
+                        feature = torch.stack(pre_embed)
                     #print('feature: ', feature.size())
                     pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
 
@@ -998,9 +1076,11 @@ class DownstreamTrainer():
                 with autocast('cuda', dtype=torch.bfloat16) if amp_enabled else nullcontext():
                     if pretrain:
                         #print(grouped.size())
-                        _, pre_embed, _ = self.model(grouped, return_z=True)
-                        #feature = torch.stack(pre_embed).mean(0)
-                        feature = torch.stack(pre_embed)
+                        if getattr(self, 'feature_cache_val', None):
+                            feature = knearest.to(self.device, dtype=torch.bfloat16)
+                        else:
+                            _, pre_embed, _ = self.model(grouped, return_z=True)
+                            feature = torch.stack(pre_embed)
                         pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
                         #pred_logit = self.down_model(grouped, feature, pretrain=pretrain) #B X N X C_classes
                     else:
@@ -1030,10 +1110,17 @@ class DownstreamTrainer():
                 segmentation_result_opt2 = infrence_result_opt2["assignments"]
                 #calculate adjust rand score between segmentation result and label
                 
+                # [FIX B24] these accumulated with '=' instead of '+=', so the loop kept
+                # only the LAST event's score and then divided it by the batch size. The
+                # reported ARI was ARI(last event)/b -- correct only at batch size 1, which
+                # is what train_track_finding.py happens to set. The shared &default in the
+                # config declares valid_batch_size: 128, so anyone using that path, or
+                # passing --eval_batch_size > 1, silently got a near-zero ARI.
+                adjusted_rand_index = 0.0
+                adjusted_rand_index_opt2 = 0.0
                 for j in range(b):
-                    adjusted_rand_index = adjusted_rand_score(inverse_indices_list[j].cpu().numpy(), segmentation_result[j].cpu().numpy())
-                    adjusted_rand_index_opt2 = adjusted_rand_score(inverse_indices_list[j].cpu().numpy(), segmentation_result_opt2[j].cpu().numpy())
-                    
+                    adjusted_rand_index += adjusted_rand_score(inverse_indices_list[j].cpu().numpy(), segmentation_result[j].cpu().numpy())
+                    adjusted_rand_index_opt2 += adjusted_rand_score(inverse_indices_list[j].cpu().numpy(), segmentation_result_opt2[j].cpu().numpy())
 
                 adjusted_rand_index /= b
                 adjusted_rand_index_opt2 /= b

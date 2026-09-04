@@ -489,13 +489,21 @@ def compute_point_loss(outputs, targets, mask, matcher, no_object_class=0):
 
     #optional perpoint noise classification loss
     #first pad the input to (B, N, 1)
-    if "noise_probs" in outputs:
+    # [FIX B4] the guard tested "noise_probs", which no head ever emits
+    # (MambaAttentionHead.forward returns 'noise_logits'), so the noise cross-entropy
+    # term was silently dropped from the total loss for every caller.
+    if "noise_logits" in outputs:
         noise_logits = outputs["noise_logits"] # (B, N, 2)
         noise_gt = torch.stack([t["noise_labels"] for t in targets], dim=0) # (B, N)
         loss_noise_ce = compute_masked_cross_entropy_loss(noise_logits, noise_gt, mask)
     else:
         loss_noise_ce = torch.tensor(0., device=device)
 
+
+    # [FIX B6] initialise before the branch: with num_matched == 0 these names were
+    # never bound, and the return statement below raised UnboundLocalError.
+    loss_track_reg = torch.tensor(0., device=device)
+    loss_pid_ce = torch.tensor(0., device=device)
 
     # Matched classification loss
     if num_matched > 0:
@@ -508,7 +516,11 @@ def compute_point_loss(outputs, targets, mask, matcher, no_object_class=0):
     
         # optional: matched track info regression loss
         
-        if all("track_info" in t for t in targets):
+        # [FIX B5] also require the model to have produced a regression output. Callers
+        # deliberately omit "track_reg_result" when track regression is off (see
+        # joint_track_finding_trainer._build_joint_outputs); keying only on the targets
+        # made this raise KeyError on outputs["track_reg_result"].
+        if "track_reg_result" in outputs and all("track_info" in t for t in targets):
             target_track_info = torch.cat([t["track_info"][J] for t, (_, J) in zip(targets, indices)]) #(num_matched_total, num_track_features)
             pred_track_info = outputs["track_reg_result"][src_batch_idx, src_idx] #(num_matched_total, num_track_features)
             valid_track = torch.cat([t["valid_tracks"][J] for t, (_, J) in zip(targets, indices)]) #(num_matched_total,)
@@ -517,17 +529,21 @@ def compute_point_loss(outputs, targets, mask, matcher, no_object_class=0):
                 pred_track_info = pred_track_info[valid_track]
                 target_track_info = target_track_info[valid_track]
             loss_track_reg = F.l1_loss(pred_track_info, target_track_info, reduction='sum') #(num_matched_total, num_track_features)
-        else:
-            loss_track_reg = torch.tensor(0., device=device)
 
         # Matched PID classification loss (Cross Entropy)
         if all("pid_labels" in t for t in targets):
+            # [FIX B7] fail loudly and specifically: the head returns 'pid_logits', so a
+            # caller must softmax them into 'pid_probs' itself. Previously this raised a
+            # bare KeyError from deep inside the loss.
+            if "pid_probs" not in outputs:
+                raise ValueError(
+                    "targets contain 'pid_labels' but outputs is missing 'pid_probs'. "
+                    "Ensure the model head produces pid_probs when pid_labels are provided."
+                )
             target_pid_labels = torch.cat([t["pid_labels"][J] for t, (_, J) in zip(targets, indices)]) #(num_matched_total,)
-            pred_pid_probs = outputs["pid_probs"][src_batch_idx, src_idx]  #(num_matched_total, num_pid_classes + 1) 
-            loss_pid_ce = F.nll_loss(torch.log(pred_pid_probs + 1e-6), 
+            pred_pid_probs = outputs["pid_probs"][src_batch_idx, src_idx]  #(num_matched_total, num_pid_classes)
+            loss_pid_ce = F.nll_loss(torch.log(pred_pid_probs + 1e-6),
                                      target_pid_labels, reduction='sum')
-        else:
-            loss_pid_ce = torch.tensor(0., device=device)
         
 
 

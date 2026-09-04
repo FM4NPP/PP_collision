@@ -2,7 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mamba_ssm import Mamba
+try:
+    from mamba_ssm import Mamba
+except ImportError:  # [FIX B16] mamba-ssm is only required by Mamba1GPT. The published
+    Mamba = None     # checkpoints are Mamba2 and use fm4npp.models.mamba2.Mamba2, which
+                     # is pure PyTorch -- do not make every user compile mamba-ssm.
 
 from fm4npp.models.mamba2 import Mamba2
 from fm4npp.models.embed import *

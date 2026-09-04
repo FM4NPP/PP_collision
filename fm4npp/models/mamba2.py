@@ -5,6 +5,8 @@
 # - Keeps the same class name, args, and forward signature for easy swap-in
 
 import math
+import warnings
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,25 +81,95 @@ def _maybe_reduce(x, process_group=None, sequence_parallel=False):
     # In this simplified environment, do nothing.
     return x
 
+FM4NPP_ALLOW_FALLBACK = "FM4NPP_ALLOW_FALLBACK"
+_fallback_warned = False
+
+
+def _require_kernels_or_optin():
+    """Refuse to run the pure-PyTorch path unless the caller has opted in.
+
+    History: this fallback silently replaced two kernels with functions that are not
+    equivalent -- an ungated RMSNorm applied to the SSM input, and an EMA in place of the
+    SSD scan that discarded B and C. Released checkpoints loaded into it with
+    strict=True, verify_repro scored 22/22, and two independently built trees agreed
+    bit-for-bit, because none of those observe forward semantics. The only symptom was a
+    number ~0.09 ARI lower than the paper, which looked like a research result rather
+    than a bug. A head trained elsewhere scored 0.054 here against 0.948 in its own log.
+
+    Both errors are fixed, and the fallback now tracks the kernels. It is still slower by
+    orders of magnitude (a Python loop over sequence positions) and still unverified
+    against the kernels on any given machine, so it must be asked for explicitly.
+    """
+    global _fallback_warned
+    if os.environ.get(FM4NPP_ALLOW_FALLBACK, "") not in ("1", "true", "TRUE", "yes"):
+        raise ImportError(
+            "mamba-ssm is not installed, so fm4npp would run its pure-PyTorch fallback.\n"
+            "That path has silently produced wrong features before -- see the docstring of\n"
+            "_require_kernels_or_optin in fm4npp/models/mamba2.py.\n\n"
+            "  pip install mamba-ssm causal-conv1d\n\n"
+            "If the kernels cannot be built on this machine (e.g. aarch64), opt in with\n"
+            "  export FM4NPP_ALLOW_FALLBACK=1\n"
+            "and validate first:  python scripts/check_kernel_equivalence.py"
+        )
+    if not _fallback_warned:
+        _fallback_warned = True
+        warnings.warn(
+            "fm4npp: running the pure-PyTorch Mamba2 fallback (mamba-ssm not installed). "
+            "It is corrected but unverified on this machine and far slower. "
+            "Validate with scripts/check_kernel_equivalence.py before quoting any number.",
+            RuntimeWarning, stacklevel=2)
+
+
 class _PlainRMSNorm(nn.Module):
-    """Plain RMSNorm without fused gating (drop-in enough for this block)."""
-    def __init__(self, dim, eps=1e-5, **_):
+    """Gated RMSNorm, matching mamba_ssm.ops.triton.layernorm_gated.RMSNorm.
+
+    The previous fallback dropped the gate and normalised over the full channel
+    axis, which is a DIFFERENT FUNCTION from the kernel the pretrained weights
+    were trained with -- so a checkpoint would load cleanly and then produce
+    features the trained head has never seen.
+
+    The real op, with norm_before_gate=False (the setting this repo uses):
+
+        x = x * silu(z);  out = rmsnorm(x, over group_size) * weight
+
+    and with norm_before_gate=True the gate is applied after the norm instead.
+    group_size restricts the reduction to d_ssm // ngroups channels, so a single
+    full-width mean is also wrong whenever ngroups > 1.
+    """
+    def __init__(self, dim, eps=1e-5, norm_before_gate=False, group_size=None, **_):
         super().__init__()
         self.eps = eps
+        self.norm_before_gate = norm_before_gate
+        self.group_size = group_size
         self.weight = nn.Parameter(torch.ones(dim))
-    def forward(self, x):
-        # x: (..., dim)
-        norm = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(norm + self.eps)
-        return x * self.weight
+
+    def _rms(self, x):
+        if self.group_size is None or self.group_size == x.shape[-1]:
+            var = x.pow(2).mean(dim=-1, keepdim=True)
+            return x * torch.rsqrt(var + self.eps)
+        shp = x.shape
+        xg = x.reshape(*shp[:-1], shp[-1] // self.group_size, self.group_size)
+        var = xg.pow(2).mean(dim=-1, keepdim=True)
+        return (xg * torch.rsqrt(var + self.eps)).reshape(shp)
+
+    def forward(self, x, z=None):
+        dt = x.dtype
+        x = x.float()
+        if z is not None:
+            z = z.float()
+            if self.norm_before_gate:
+                return (self._rms(x) * self.weight.float() * F.silu(z)).to(dt)
+            x = x * F.silu(z)
+        return (self._rms(x) * self.weight.float()).to(dt)
 
 def _get_rmsnorm(d_ssm, eps=1e-5, norm_before_gate=False, group_size=None, device=None, dtype=None):
     if RMSNormGated is not None:
         # Use the fused/gated variant if available
         return RMSNormGated(d_ssm, eps=eps, norm_before_gate=norm_before_gate, group_size=group_size,
                             device=device, dtype=dtype)
-    # Otherwise, a simple RMSNorm (without gated behavior)
-    return _PlainRMSNorm(d_ssm, eps=eps).to(device=device, dtype=dtype)
+    # Otherwise, the gated equivalent implemented above.
+    return _PlainRMSNorm(d_ssm, eps=eps, norm_before_gate=norm_before_gate,
+                         group_size=group_size).to(device=device, dtype=dtype)
 
 class _MaybeColumnParallelLinear(nn.Linear):
     """Fallback to plain Linear if TP not available or process_group is None."""
@@ -187,6 +259,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.chunk_size = chunk_size
         # Only enable fused path if kernel is present
         self.use_mem_eff_path = bool(use_mem_eff_path and (mamba_split_conv1d_scan_combined is not None))
+        if not self.use_mem_eff_path:
+            _require_kernels_or_optin()
         self.layer_idx = layer_idx
 
         # (z, x, dt) from in_proj => shape (2*d_inner + nheads)
@@ -273,56 +347,57 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
     # Pure-PyTorch manual SSM path
     # ---------------------------
 
-    def _manual_ssm(self, x_ssm, dt_slice):
+    def _manual_ssm(self, x_ssm, dt_slice, B_ssm, C_ssm):
+        """Mamba2 SSD recurrence -- the reference math of mamba_chunk_scan_combined.
+
+            s[t] = exp(A*dt[t]) * s[t-1] + dt[t] * (x[t] outer B[t])
+            y[t] = C[t] . s[t] + D * x[t]
+
+        The previous stand-in was, by its own description, "a simplified EMA SSM":
+        it dropped B and C entirely and collapsed the state from rank d_state to a
+        scalar per channel. That is a different model, not an approximation -- and
+        because it touches no parameter shapes, a pretrained checkpoint loads into
+        it without complaint and then produces features it was never trained to
+        produce.
+
+        x_ssm    (B, L, d_ssm)          dt_slice (B, L, nheads)
+        B_ssm    (B, L, ngroups*d_state)  C_ssm  (B, L, ngroups*d_state)
+        returns  (B, L, d_ssm)
         """
-        x_ssm: (B, L, d_ssm)
-        dt_slice: (B, L, nheads)
-        Returns y_ssm: (B, L, d_ssm)
-        A simplified EMA SSM:
-            s[t] = alpha[t] * s[t-1] + (1 - alpha[t]) * x[t]
-            y[t] = s[t] + D * x[t]
-        with alpha[t] = exp(A_neg * dt[t]), A_neg < 0.
-        """
-        B, L, Dssm = x_ssm.shape
-        H = self.nheads
-        P = self.headdim
+        Bsz, L, Dssm = x_ssm.shape
+        H, P, G, N = self.nheads, self.headdim, self.ngroups, self.d_state
         assert Dssm == H * P
+        assert H % G == 0, f'nheads {H} not divisible by ngroups {G}'
 
-        # Parameters per head
-        A_neg = -torch.exp(self.A_log.float())       # (H,), negative
-        # Turn dt_slice + bias into positive step sizes
-        dt = F.softplus(dt_slice + self.dt_bias)     # (B, L, H)
-
-        # Optional clamp of dt if requested
+        A = -torch.exp(self.A_log.float())                       # (H,)
+        dt = F.softplus(dt_slice.float() + self.dt_bias.float())  # (B,L,H)
         lo, hi = self.dt_limit
-        if (lo != 0.0) or (hi != float("inf")):
+        if (lo != 0.0) or (hi != float('inf')):
             dt = torch.clamp(dt, min=lo, max=hi)
 
-        # Prepare tensors
-        x_hp = rearrange(x_ssm, 'b l (h p) -> b l h p', h=H, p=P)   # (B, L, H, P)
+        x = rearrange(x_ssm.float(), 'b l (h p) -> b l h p', h=H, p=P)
+        Bm = rearrange(B_ssm.float(), 'b l (g n) -> b l g n', g=G, n=N)
+        Cm = rearrange(C_ssm.float(), 'b l (g n) -> b l g n', g=G, n=N)
+        # each head reads the group its index falls in
+        rep = H // G
+        Bm = Bm.repeat_interleave(rep, dim=2)                    # (B,L,H,N)
+        Cm = Cm.repeat_interleave(rep, dim=2)
 
-        # alpha in (0,1)
-        alpha = torch.exp(A_neg.view(1, 1, H) * dt)                 # (B, L, H)
-        alpha = alpha.unsqueeze(-1)                                 # (B, L, H, 1)
-
-        # Skip D (per head or per (head, p))
+        dA = torch.exp(dt * A.view(1, 1, H))                     # (B,L,H)
         if self.D_has_hdim:
-            D_param = rearrange(self.D, '(h p) -> 1 h p', h=H, p=P)  # (1,H,P)
+            Dp = rearrange(self.D.float(), '(h p) -> 1 h p', h=H, p=P)
         else:
-            D_param = self.D.view(1, H, 1)                           # (1,H,1)
+            Dp = self.D.float().view(1, H, 1)
 
-        # Run the scan (plain Python loop; OK for short sequences)
-        s = torch.zeros(B, H, P, device=x_ssm.device, dtype=x_ssm.dtype)
+        s = x.new_zeros(Bsz, H, P, N)
         outs = []
         for t in range(L):
-            at = alpha[:, t, :, :]          # (B, H, 1)
-            xt = x_hp[:, t, :, :]           # (B, H, P)
-            s = at * s + (1.0 - at) * xt
-            yt = s + D_param * xt           # add skip
-            outs.append(yt)
-        y_hp = torch.stack(outs, dim=1)     # (B, L, H, P)
-        y = rearrange(y_hp, 'b l h p -> b l (h p)')
-        return y
+            xt, bt, ct = x[:, t], Bm[:, t], Cm[:, t]             # (B,H,P) (B,H,N) (B,H,N)
+            dt_t = dt[:, t].unsqueeze(-1).unsqueeze(-1)          # (B,H,1,1)
+            s = dA[:, t].unsqueeze(-1).unsqueeze(-1) * s + dt_t * (xt.unsqueeze(-1) * bt.unsqueeze(-2))
+            outs.append(torch.einsum('bhpn,bhn->bhp', s, ct) + Dp * xt)
+        y = torch.stack(outs, dim=1)                             # (B,L,H,P)
+        return rearrange(y, 'b l h p -> b l (h p)').to(x_ssm.dtype)
 
     # ---------------------------
 
@@ -411,13 +486,22 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             conv_out = rearrange(conv_out, "b c l -> b l c")
 
             ssm_in = conv_out[..., :self.d_ssm]
-            ssm_in = self.act(ssm_in)
+            gn = self.ngroups * self.d_state
+            B_conv = conv_out[..., self.d_ssm:self.d_ssm + gn]
+            C_conv = conv_out[..., self.d_ssm + gn:self.d_ssm + 2 * gn]
+            # the fused kernel applies the activation to x, B and C alike
+            ssm_in, B_conv, C_conv = self.act(ssm_in), self.act(B_conv), self.act(C_conv)
 
+            # The norm belongs on the SSM OUTPUT and is gated by z, not on the
+            # input and not ungated. mamba_split_conv1d_scan_combined applies
+            # rmsnorm(y * silu(z)) after the scan; doing it here on ssm_in with a
+            # plain norm, then gating with sigmoid(z) instead of silu(z), is three
+            # separate departures from the trained computation.
+            y_ssm = self._manual_ssm(ssm_in, dt_slice, B_conv, C_conv)  # (B, L, d_ssm)
             if self.rmsnorm_enabled and (self.norm is not None):
-                ssm_in = self.norm(ssm_in)
-
-            y_ssm = self._manual_ssm(ssm_in, dt_slice)  # (B, L, d_ssm)
-            y = y_ssm * torch.sigmoid(z0)
+                y = self.norm(y_ssm, z0)
+            else:
+                y = y_ssm * F.silu(z0)
 
             if is_packed:
                 y = rearrange(y, "b l d -> (b l) d")

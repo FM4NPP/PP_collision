@@ -385,9 +385,16 @@ class DownstreamTrainer():
 
 
         if self.params.use_attention_head:
-            self.down_model = AttentionHead(input_dim=self.params.embed_dim, num_layers=1, num_output_dim = self.params.num_output_classes,
+            # [B33] Defaults here must reproduce the released PID/NID heads, and the
+            # public rewrite's defaults do not: embed_method defaults to 'add' and
+            # adapter_FFN to True, which builds 677,905 parameters where the released
+            # head is 399,249. 'legacy' + no adapter FFN matches it tensor for tensor.
+            self.down_model = AttentionHead(input_dim=self.params.embed_dim, num_layers=self.params.num_layers, num_output_dim = self.params.num_output_classes,
                           num_heads = 4, num_feature_layers=self.params.num_layers_backbone,
-                          num_embedder_layers= self.params.num_embedder_layers, 
+                          num_embedder_layers= self.params.num_embedder_layers,
+                          embed_method=getattr(self.params, 'head_embed_method', 'legacy'),
+                          adapter_FFN=getattr(self.params, 'adapter_FFN', False),
+                          dropout=getattr(self.params, 'downstream_dropout', 0.0),
                           ).to(self.device)
         
         else:
@@ -441,14 +448,22 @@ class DownstreamTrainer():
                 mask = grouped[..., 0] != -100 # B X N
                 reg = inputdict['reg_target'].to(self.device)  # B X N X 8
                 pid = inputdict['pid_target'].to(self.device)  # B X N tensor containing particle IDs
-                mid = inputdict['mid_target'].to(self.device)  # B X N tensor containing mother IDs
+                # [B30] mid_target is optional. [FIX B18] made the dataset omit the key when
+                # the memmap is absent, and scripts/prepare_data.py never writes it, so an
+                # unconditional read is a KeyError on any Zenodo-derived dataset -- which is
+                # every dataset a reader of this repo can build. Only weak_decay_class needs
+                # it, and that value is computed and then never used.
+                mid = inputdict.get('mid_target')
+                if mid is not None:
+                    mid = mid.to(self.device)
 
                 trackinfo_noiselabel_dict = get_trackinfo_noiselabel(reg)
                 noise_labels = trackinfo_noiselabel_dict["noise_labels"]
                 pid_label_dict = get_pidlabel(pid)
                 pid_class = pid_label_dict["pid_class"]  # B X N tensor with particle class information
-                weak_decay_label_dict = get_weakdecaylabel(mid)
-                weak_decay_class = weak_decay_label_dict["weak_decay_class"]  # B X N tensor with weak decay labels
+                weak_decay_label_dict = get_weakdecaylabel(mid) if mid is not None else None
+                weak_decay_class = (weak_decay_label_dict['weak_decay_class']
+                                    if weak_decay_label_dict is not None else None)
                 if self.params.task == "pid":
                     targets = {
                         'labels': pid_class,  # B X N tensor with particle class information
@@ -571,9 +586,16 @@ class DownstreamTrainer():
         #                          ).to(self.device)
 
         if self.params.use_attention_head:
-            self.down_model = AttentionHead(input_dim=self.params.embed_dim, num_layers=1, num_output_dim = self.params.num_output_classes,
+            # [B33] Defaults here must reproduce the released PID/NID heads, and the
+            # public rewrite's defaults do not: embed_method defaults to 'add' and
+            # adapter_FFN to True, which builds 677,905 parameters where the released
+            # head is 399,249. 'legacy' + no adapter FFN matches it tensor for tensor.
+            self.down_model = AttentionHead(input_dim=self.params.embed_dim, num_layers=self.params.num_layers, num_output_dim = self.params.num_output_classes,
                           num_heads = 4, num_feature_layers=self.params.num_layers_backbone,
-                          num_embedder_layers= self.params.num_embedder_layers, 
+                          num_embedder_layers= self.params.num_embedder_layers,
+                          embed_method=getattr(self.params, 'head_embed_method', 'legacy'),
+                          adapter_FFN=getattr(self.params, 'adapter_FFN', False),
+                          dropout=getattr(self.params, 'downstream_dropout', 0.0),
                           ).to(self.device)
         
         else:
@@ -709,14 +731,22 @@ class DownstreamTrainer():
             mask = grouped[..., 0] != -100 # B X N
             reg = inputdict['reg_target'].to(self.device)  # B X N X 8
             pid = inputdict['pid_target'].to(self.device)  # B X N tensor containing particle IDs
-            mid = inputdict['mid_target'].to(self.device)  # B X N tensor containing mother IDs
+            # [B30] mid_target is optional. [FIX B18] made the dataset omit the key when
+            # the memmap is absent, and scripts/prepare_data.py never writes it, so an
+            # unconditional read is a KeyError on any Zenodo-derived dataset -- which is
+            # every dataset a reader of this repo can build. Only weak_decay_class needs
+            # it, and that value is computed and then never used.
+            mid = inputdict.get('mid_target')
+            if mid is not None:
+                mid = mid.to(self.device)
 
             trackinfo_noiselabel_dict = get_trackinfo_noiselabel(reg)
             noise_labels = trackinfo_noiselabel_dict["noise_labels"]
             pid_label_dict = get_pidlabel(pid)
             pid_class = pid_label_dict["pid_class"]  # B X N tensor with particle class information
-            weak_decay_label_dict = get_weakdecaylabel(mid)
-            weak_decay_class = weak_decay_label_dict["weak_decay_class"]  # B X N tensor with weak decay labels
+            weak_decay_label_dict = get_weakdecaylabel(mid) if mid is not None else None
+            weak_decay_class = (weak_decay_label_dict['weak_decay_class']
+                                if weak_decay_label_dict is not None else None)
 
             if self.params.task == "pid":
                 targets = {
@@ -783,14 +813,22 @@ class DownstreamTrainer():
                 mask = grouped[..., 0] != -100 # B X N
                 reg = inputdict['reg_target'].to(self.device)  # B X N X 8
                 pid = inputdict['pid_target'].to(self.device)  # B X N tensor containing particle IDs
-                mid = inputdict['mid_target'].to(self.device)  # B X N tensor containing mother IDs
+                # [B30] mid_target is optional. [FIX B18] made the dataset omit the key when
+                # the memmap is absent, and scripts/prepare_data.py never writes it, so an
+                # unconditional read is a KeyError on any Zenodo-derived dataset -- which is
+                # every dataset a reader of this repo can build. Only weak_decay_class needs
+                # it, and that value is computed and then never used.
+                mid = inputdict.get('mid_target')
+                if mid is not None:
+                    mid = mid.to(self.device)
 
                 trackinfo_noiselabel_dict = get_trackinfo_noiselabel(reg)
                 noise_labels = trackinfo_noiselabel_dict["noise_labels"]
                 pid_label_dict = get_pidlabel(pid)
                 pid_class = pid_label_dict["pid_class"]  # B X N tensor with particle class information
-                weak_decay_label_dict = get_weakdecaylabel(mid)
-                weak_decay_class = weak_decay_label_dict["weak_decay_class"]  # B X N tensor with weak decay labels
+                weak_decay_label_dict = get_weakdecaylabel(mid) if mid is not None else None
+                weak_decay_class = (weak_decay_label_dict['weak_decay_class']
+                                    if weak_decay_label_dict is not None else None)
 
                 if self.params.task == "pid":
                     targets = {
