@@ -14,8 +14,26 @@ sys.path.append('../..')
 sys.path.append('/home/shuhang/FM4NPP/FM4NPP')
 sys.path.append('/home/shuhang/FM4NPP/FM4NPP/train/downstream')
 
+import random
+
+import numpy as np
+
 from fm4npp.utils import YParams
 from point_classification_trainer import DownstreamTrainer
+
+
+def set_seed(seed):
+    """[B32] Same seeding train_track_finding.py got in [FIX B8].
+
+    Without it PID and NID are non-deterministic, which makes the paper's
+    multi-seed studies unreproducible for two of the three downstream tasks.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    print(f"Random seed set to: {seed}")
 
 def main():
     parser = argparse.ArgumentParser(description="Downstream tracking training script")
@@ -27,7 +45,13 @@ def main():
     parser.add_argument("--eventnumber", default=70000, type=int, help="downstream training event number")
     parser.add_argument("--usepretrain", default=True, type=str, help="use pretrain model")
     parser.add_argument("--train_batch_size", default=32, type=int, help="train batch size")
+    parser.add_argument("--seed", default=None, type=int,
+                        help="Random seed. Recorded in the checkpoint name so eval can find it. "
+                             "run_pid.sh and run_nid.sh have always passed this flag; until now "
+                             "it did not exist and they failed with unrecognized arguments.")
     args = parser.parse_args()
+    if args.seed is not None:
+        set_seed(args.seed)
 
     # Mapping from model name to log file and checkpoint paths
     model2log = {
@@ -87,7 +111,9 @@ def main():
     params.limit_size = int(args.eventnumber)
     params.valid_batch_size = 1
     params.pretrained_ckpt = model2ckpt[args.config]
-    params.log_file_name = f"{args.config}_nerf_{params.task}_d{params.limit_size}_{args.run_num}.log"
+    seed_suffix = "" if args.seed is None else f"_seed{args.seed}"
+    params.log_file_name = (f"{args.config}_nerf_{params.task}_d{params.limit_size}"
+                            f"_{args.run_num}{seed_suffix}.log")
     params.num_embedder_layers = 0
 
     # Launch and train

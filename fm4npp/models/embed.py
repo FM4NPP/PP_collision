@@ -5,29 +5,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# class Embedder(nn.Module):
-#     def __init__(self, embed_dim, init_scale = 0.02, dropout = 0.2):
-#         super(Embedder, self).__init__()
-        
-#         # assert embed_dim % 6 == 0, "embed_dim should be divisible by 6"
-#         in_dim = 1  # E, θ, φ, ψ instead of just E
-#         E_emb_dim = embed_dim // 4
-#         pos_emb_dim = embed_dim - E_emb_dim
-#         self.proj = nn.Parameter(torch.randn(in_dim, E_emb_dim) * init_scale, requires_grad=True)
-#         self.proj_pos = nn.Parameter(torch.randn(3, pos_emb_dim) * init_scale, requires_grad=True)
-#         self.norm = nn.LayerNorm(embed_dim)
-#         self.dropout = nn.Dropout(dropout)
+# [B33] Restored from the author's tree. This was commented out in the public repo,
+# but it is the embedder the released PID and NID heads actually use:
+#   embedder.proj (1, 64) + embedder.proj_pos (3, 192) at embed_dim 256,
+# i.e. energy gets embed_dim//4 and position the rest. EmbedderAdd/EmbedderConcat
+# produce different tensors, so without this class those checkpoints cannot be
+# rebuilt at all -- their state_dict does not fit anything the repo can construct.
+class Embedder(nn.Module):
+    def __init__(self, embed_dim, init_scale = 0.02, dropout = 0.2):
+        super(Embedder, self).__init__()
+      
+        # assert embed_dim % 6 == 0, "embed_dim should be divisible by 6"
+        in_dim = 1  # E, θ, φ, ψ instead of just E
+        E_emb_dim = embed_dim // 4
+        pos_emb_dim = embed_dim - E_emb_dim
+        self.proj = nn.Parameter(torch.randn(in_dim, E_emb_dim) * init_scale, requires_grad=True)
+        self.proj_pos = nn.Parameter(torch.randn(3, pos_emb_dim) * init_scale, requires_grad=True)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
 
-#     def forward(self, neighborhood):
-#         B, P, _ = neighborhood.shape
-#         E = neighborhood[..., 0:1]  # First coordinate as Energy (or time-dependent variable)
-#         E_embed = torch.matmul(E, self.proj)
-        
-#         pos_embed = torch.matmul(neighborhood[..., 1:4], self.proj_pos)
-        
-#         out = self.dropout(torch.cat([E_embed, pos_embed], dim=-1))       
-#         return self.norm(out)
-    
+    def forward(self, neighborhood):
+        B, P, _ = neighborhood.shape
+        E = neighborhood[..., 0:1]  # First coordinate as Energy (or time-dependent variable)
+        E_embed = torch.matmul(E, self.proj)
+      
+        pos_embed = torch.matmul(neighborhood[..., 1:4], self.proj_pos)
+      
+        out = self.dropout(torch.cat([E_embed, pos_embed], dim=-1))       
+        return self.norm(out)
+
+
 class EmbedderAdd(nn.Module):
     def __init__(self, pe_method, embed_dim, learnable_projection = False):
         super(EmbedderAdd, self).__init__()

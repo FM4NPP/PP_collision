@@ -1,0 +1,304 @@
+# Particle-ID (PID) classification (downstream) -- original config from the author's tree.
+#
+# Recovered verbatim from aaai2026_fm4npp_downstream/scripts/configs/. An earlier note in
+# this repo said this file "exists nowhere public" and shipped a reconstruction; that is
+# superseded -- this is the original.
+#
+# Three keys were ADDED because the shipped file omits them and the trainer reads them:
+#   num_layers          point_classification_trainer.py reads params.num_layers whenever
+#                       use_attention_head is true (it is, line 52). Absent -> AttributeError
+#                       before the first batch.
+#   downstream_dropout  read when the head is built; same failure mode.
+#   first_cycle_steps   [B26] decouples the cosine LR cycle from max_epochs. Without it the
+#                       cycle length silently follows max_epochs, so shortening a run for a
+#                       test rewrites the schedule and the result is not comparable.
+#
+# Paths below are the author's BNL mounts and will not exist elsewhere.
+# Run scripts/repoint_config.py to rewrite them.
+d9_m1_k5_p20: &default
+  base_dim: 256
+  batch_size: 4
+  data_root: /mldata/sli/sphenix_fm/pp_100k_mmap-particle_ids/
+  data_root_train: /mldata/sli/sphenix_fm/pp_100k_mmap-particle_ids/
+  #data_root_test: /mldata/sli/sphenix_fm/pp_test_9k/
+  data_root_test: /mldata/sli/sphenix_fm/pp_100k_mmap-particle_ids/
+  stat_dir: /home/shuhang/FM4NPP/PRETRAIN_MAMBA/stats
+  downstream_dir: /home/shuhang/FM4NPP/downstream_log
+  checkpoint_dir: /home/shuhang/FM4NPP/downstream_log
+  log_file_base: /home/shuhangli/FMNP/FM4NPP/train/downstream/evallog/
+  data_version: pp_100k
+  embed_dim: 256
+  group_size: 8
+  init_std: 0.025
+  limit_data: false
+  limit_size: 100
+  log_to_screen: false
+  max_epochs: 600
+  #max_lr: 0.0002
+  #min_lr: 0.00002
+  max_lr: 0.001
+  min_lr: 0.0001
+  model_version: mtest1
+  n_data_idx: 1000000
+  n_eval_steps: 1000
+  num_data_workers: 4
+  num_heads_backbone: 4
+  num_heads_decoder: 2
+  num_heads_encoder: 2
+  num_layers_backbone: 12
+  num_layers_decoder: 3
+  num_layers_encoder: 3
+  order: EPR
+  out_scale: 0.01
+  save_checkpoint: true
+  save_version: mamba2
+  total_steps: 200
+  valid_batch_size: 128
+  warmup_steps: 20
+  weight_decay: 0.01
+  continue_from_best: false
+  d_state: 16
+  nleave: 1e6
+  klen: 5
+  len_chunk: 512
+  portion: 0.2
+  dropout: 0.0
+  chunk_training: false
+  return_reg_test: false
+  return_dict: true
+  use_attention_head: true
+  num_layers: 1                # [ADDED] read by point_classification_trainer.py:388,574
+  downstream_dropout: 0.1      # [ADDED] read when the head is built
+  first_cycle_steps: 600       # [ADDED][B26] cosine cycle, independent of max_epochs
+  head_embed_method: legacy    # [ADDED][B33] matches the released head exactly
+  adapter_FFN: false           # [ADDED][B33] released head has no FFN blocks
+  num_output_classes: 5
+  task: pid
+  embed_method: add 
+  pe_method: nerf
+  mambaversion: mamba2
+  voxelize: true
+  space_filling_order: false
+  space_filling_curve: z # hilbert
+
+
+d9_m64_k5_p20:
+  <<: *default
+  embed_dim: 64
+  d_state: 4
+  num_layers_backbone: 12
+  dropout: 0.0
+  mambaversion: mamba1
+
+d9_m96_k5_p20:
+  <<: *default
+  embed_dim: 96
+  d_state: 6
+  num_layers_backbone: 12
+  dropout: 0.0
+  mambaversion: mamba1
+
+d9_m128_k5_p20:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  num_layers_backbone: 12
+  dropout: 0.0
+  mambaversion: mamba1
+
+d9_m192_k5_p20:
+  <<: *default
+  embed_dim: 192
+  d_state: 12
+  num_layers_backbone: 12
+  dropout: 0.0
+  mambaversion: mamba1
+
+d9_m64_k30_p20:
+  <<: *default
+  embed_dim: 64
+  d_state: 4
+  num_layers_backbone: 12
+  dropout: 0.0
+  mambaversion: mamba1
+  klen: 30
+
+d9_m96_k30_p20:
+  <<: *default
+  embed_dim: 96
+  d_state: 6
+  num_layers_backbone: 12
+  dropout: 0.0
+  mambaversion: mamba1
+  klen: 30
+
+d9_m128_k30_p20:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  num_layers_backbone: 12
+  dropout: 0.0
+  mambaversion: mamba1
+  klen: 30
+
+d9_m192_k30_p20:
+  <<: *default
+  embed_dim: 192
+  d_state: 12
+  num_layers_backbone: 12
+  dropout: 0.0
+  mambaversion: mamba1
+  klen: 30
+
+d9_m1_k30_p20:
+  <<: *default
+  embed_dim: 256
+  d_state: 16
+  num_layers_backbone: 12
+  dropout: 0.0
+  klen: 30
+
+d9_m3_k30_p20:
+  <<: *default
+  embed_dim: 512
+  d_state: 32
+  num_layers_backbone: 12
+  dropout: 0.0
+  klen: 30
+
+d9_m3_k5_p20:
+  <<: *default
+  embed_dim: 512
+  d_state: 32
+  num_layers_backbone: 12
+  dropout: 0.0
+
+d9_m4_k5_p20:
+  <<: *default
+  embed_dim: 1024
+  d_state: 64
+  num_layers_backbone: 12
+  dropout: 0.0
+  continue_from_best: true
+
+d9_m4_k30_p20:
+  <<: *default
+  embed_dim: 1024
+  d_state: 64
+  num_layers_backbone: 12
+  dropout: 0.0
+  klen: 30
+  continue_from_best: true
+
+d9_m5_k5_p20:
+  <<: *default
+  embed_dim: 1536
+  d_state: 96
+  num_layers_backbone: 12
+  dropout: 0.0
+
+d9_m5_k30_p20:
+  <<: *default
+  embed_dim: 1536
+  d_state: 96
+  num_layers_backbone: 12
+  dropout: 0.0
+  klen: 30
+
+d9_m6_k5_p20:
+  <<: *default
+  embed_dim: 2048
+  d_state: 128
+  num_layers_backbone: 24
+  dropout: 0.0
+
+#--------------------------------
+ablate_reference:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  mambaversion: mamba1
+
+ablate_pe_PROJ:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  pe_method: none
+  mambaversion: mamba1
+
+ablate_pe_FF:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  pe_method: ff
+  mambaversion: mamba1
+
+ablate_pe_CPE:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  pe_method: cpe
+  mambaversion: mamba1
+
+ablate_order_RPE:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  order: RPE
+  mambaversion: mamba1
+
+ablate_order_REP:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  order: REP
+  mambaversion: mamba1
+
+ablate_order_PER:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  dropout: 0.0
+  order: PER
+  mambaversion: mamba1
+
+ablate_lossreweight:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  dropout: 0.0
+  mambaversion: mamba1
+
+ablate_embedconcat:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  dropout: 0.0
+  embed_method: concat
+  mambaversion: mamba1
+
+ablate_space_filling_z:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  dropout: 0.0
+  mambaversion: mamba1
+  space_filling_order: true
+  
+ablate_space_filling_hilbert:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  dropout: 0.0
+  mambaversion: mamba1
+  space_filling_order: true
+  space_filling_curve: hilbert
+
+ablate_novoxelize:
+  <<: *default
+  embed_dim: 128
+  d_state: 8
+  dropout: 0.0
+  voxelize: false
+  mambaversion: mamba1
+

@@ -493,10 +493,16 @@ class AttentionHead(nn.Module):
         self.embed_dim = embed_dim
         self.return_embedding = return_embedding
         self.FFN = adapter_FFN
+        # [B33] 'legacy' is the embedder the released PID/NID heads were trained with:
+        # the original `Embedder`, energy -> embed_dim//4 and position -> the rest.
+        # The public rewrite offered only EmbedderAdd/EmbedderConcat, which build
+        # different tensors, so those checkpoints could not be reconstructed at all.
         if embed_method == 'concat':
-            Embedder = EmbedderConcat
+            Embedder_cls = EmbedderConcat
+        elif embed_method == 'legacy':
+            Embedder_cls = Embedder
         else:
-            Embedder = EmbedderAdd
+            Embedder_cls = EmbedderAdd
 
         # Input processing
         self.input_proj = nn.Sequential(
@@ -542,7 +548,9 @@ class AttentionHead(nn.Module):
         # Noise prediction head go from point embedding
         self.out_mlp = MLPHead(embed_dim, num_output_dim, dropout=dropout)
 
-        self.embedder = Embedder(pe_method = 'nerf', embed_dim=input_dim)
+        self.embedder = (Embedder_cls(embed_dim=input_dim)
+                         if embed_method == 'legacy'
+                         else Embedder_cls(pe_method='nerf', embed_dim=input_dim))
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
 
 

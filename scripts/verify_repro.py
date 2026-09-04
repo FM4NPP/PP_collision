@@ -110,6 +110,27 @@ check('B29c', 'falling back without mamba-ssm raises unless FM4NPP_ALLOW_FALLBAC
 check('B29d', 'scripts/check_kernel_equivalence.py exists to validate the fallback',
       os.path.isfile(os.path.join(REPO, 'scripts', 'check_kernel_equivalence.py')))
 
+# --- B30-B33: PID and NID must be runnable and must match the released heads ---
+for _cfg in ('mamba_pointclass.yaml', 'mamba_noiseid.yaml'):
+    check('B30', f'{_cfg} ships (PID/NID cannot run without it)',
+          os.path.isfile(os.path.join(REPO, 'scripts', 'configs', _cfg)))
+_pc = src('train/downstream/point_classification_trainer.py')
+check('B30b', "params.num_layers is supplied by the shipped configs (it is read when "
+              "use_attention_head is true, and the author's file omits it)",
+      'num_layers: 1' in src('scripts/configs/mamba_pointclass.yaml'))
+check('B30c', 'mid_target is optional (prepare_data.py never writes it)',
+      "inputdict.get('mid_target')" in _pc)
+_ep = src('train/downstream/eval_point_classification.py')
+check('B31', 'PID/NID eval takes --data_root_test and --checkpoint_dir '
+             '(both were hardcoded to the author\'s machine)',
+      '--data_root_test' in _ep and '--checkpoint_dir' in _ep)
+check('B32', 'train_point_classification.py accepts --seed (run_pid.sh always passed it)',
+      '--seed' in src('train/downstream/train_point_classification.py'))
+check('B33', 'the legacy Embedder is available and selectable '
+             '(the released PID/NID heads use it)',
+      'class Embedder(nn.Module):' in src('fm4npp/models/embed.py')
+      and "elif embed_method == 'legacy'" in src('train/downstream/model.py'))
+
 # --- B18: mid_target detection must not trust RaggedMmap to raise ---
 check('B18', 'mid_target presence checked via isdir/len, not a bare try/except',
       'os.path.isdir(mid_dir)' in src('fm4npp/datasets/dataset.py'))
