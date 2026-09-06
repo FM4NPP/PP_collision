@@ -800,6 +800,12 @@ class DownstreamTrainer():
             self.down_model.eval()
             print(f"✅ Model loaded from {checkpoint_path}")
 
+        self.down_model_train = self.down_model
+        if getattr(self.params, 'compile_track_head', False):
+            if self.world_size > 1:
+                raise RuntimeError('compile_track_head has not been validated with DDP: compile after the DDP wrapper and call through it, or run with world_size 1')
+            self.down_model_train = torch.compile(self.down_model)
+
         log_file_path = os.path.join(self.params.checkpoint_dir, self.params.log_file_name)
 
         checkpoint_file_name = self.params.log_file_name.split('.')[0] + '_checkpoint.pth'
@@ -963,7 +969,7 @@ class DownstreamTrainer():
                         _, pre_embed, _ = self.model(grouped, return_z=True)
                         feature = torch.stack(pre_embed)
                     #print('feature: ', feature.size())
-                    pred_dict = self.down_model(grouped, feature, pretrain=pretrain, padding_mask=mask)
+                    pred_dict = self.down_model_train(grouped, feature, pretrain=pretrain, padding_mask=mask)
 
                 else:
                     pred_dict = self.down_model(grouped, feature=None)
