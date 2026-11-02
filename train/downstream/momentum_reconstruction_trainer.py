@@ -5,8 +5,8 @@ momentum_reconstruction_trainer.py: MomentumHead after an already-trained track-
 
 DownstreamTrainer is standalone: its setup is a verbatim copy of track_finding_trainer's, and
 train() and the epoch loops are phase-2 hooks. The entry point is inference(), as in the other
-trainers (driven by eval_momentum_reconstruction.py). save_momentum_checkpoint() writes the head
-for the vertex trainer's momentum_ckpt. Each fitted track is scored against the truth particle
+trainers (driven by eval_momentum_reconstruction.py, which also saves the head for the vertex
+trainer's momentum_ckpt). Each fitted track is scored against the truth particle
 owning most of its hits; truth (reg, label) is used only for scoring.
 
 Per-point CSV: track_finding_trainer.inference()'s, row for row, then MOMENTUM_COLUMNS, the fitted
@@ -800,10 +800,6 @@ class DownstreamTrainer():
         if weights is None:
             return feature
         return torch.einsum("lbnd,l->bnd", feature, feature.new_tensor(weights)).unsqueeze(0)
-
-    def save_momentum_checkpoint(self, path):
-        """Write MomentumHead's config and weights for the vertex trainer's momentum_ckpt."""
-        self.momentum_head.save_checkpoint(path, params=vars(self.params))
 
     @torch.no_grad()
     def run_momentum(self, pretrain=True, max_events=None, save_csv=False):

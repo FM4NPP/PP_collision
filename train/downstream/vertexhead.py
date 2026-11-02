@@ -178,32 +178,6 @@ def _fit_vertex_by_helix_closest_approach(
     result["track_closest_approach_point"] = result["track_closest_approach_point"].masked_fill(failed.unsqueeze(-1), float("nan"))
     return result
 
-def _pairwise_doca_and_midpoint(track_position, track_direction, eps=1e-12):
-    """
-    All-pairs straight-line DOCA per event; nearly parallel pairs (1 - c^2 < eps) get a finite but
-    meaningless value.
-
-    Returns:
-        doca (B, T, T) and the closest-approach midpoint (B, T, T, 3).
-    """
-    P1, P2 = track_position.unsqueeze(2), track_position.unsqueeze(1)
-    d1, d2 = track_direction.unsqueeze(2), track_direction.unsqueeze(1)
-
-    dp = P2 - P1
-    c = (d1 * d2).sum(dim=-1)
-    dp_d1 = (dp * d1).sum(dim=-1)
-    dp_d2 = (dp * d2).sum(dim=-1)
-
-    denom = (1.0 - c ** 2).clamp(min=eps)
-    cpa1 = P1 + ((dp_d1 - c * dp_d2) / denom).unsqueeze(-1) * d1
-    cpa2 = P2 + ((c * dp_d1 - dp_d2) / denom).unsqueeze(-1) * d2
-    return (cpa2 - cpa1).norm(dim=-1), (cpa1 + cpa2) * 0.5
-
-def _track_dca_to_point(point, track_position, track_direction):
-    """Straight-line DCA (B, T) of each track to one point (B, 3) per event."""
-    diff = point.unsqueeze(1) - track_position
-    return (diff - (diff * track_direction).sum(-1, keepdim=True) * track_direction).norm(dim=-1)
-
 class VertexHead(nn.Module):
 
     """
@@ -284,20 +258,12 @@ class VertexHead(nn.Module):
     def setNoisePtThreshold(self, noise_pt_threshold: float = 0.25):
         self.momentum_head.noise_pt_threshold = noise_pt_threshold
 
-    @property
-    def Bz(self):
-        return self.momentum_head.Bz
-
-    @property
-    def is_cosmics(self):
-        return self.momentum_head.is_cosmics
-
     def _fit(self, track_position, track_direction, track_weight, params):
         """
         Straight-line fit, refined by the helix fit when use_helix and Bz != 0 (PV, SVs and refit).
         """
         fit = _fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
-        if self.use_helix and self.Bz != 0.0:
+        if self.use_helix and self.momentum_head.Bz != 0.0:
             fit = _fit_vertex_by_helix_closest_approach(
                 params["circle_centre"],
                 params["R_s"],
@@ -306,48 +272,9 @@ class VertexHead(nn.Module):
                 track_weight,               # already zeroed for bad tracks
                 n_iterations=self.helix_iterations,
                 linear_fit=fit,
-                is_cosmics=self.is_cosmics,
+                is_cosmics=self.momentum_head.is_cosmics,
             )
         return fit
-
-    def _seed_secondary_vertices(self, track_position, track_direction, displaced_mask):
-        """
-        Up to K seeds per event, tightest candidate pair first.
-
-        Returns:
-            seeds (B, K, 3), NaN where empty, and seed_valid (B, K).
-        """
-        n_events, n_tracks, _ = track_position.shape
-        doca, midpoint = _pairwise_doca_and_midpoint(track_position, track_direction)
-
-        # each unordered pair once (i < j), both tracks candidates, DOCA within the cut
-        upper_tri = torch.triu(torch.ones(n_tracks, n_tracks, device=track_position.device, dtype=torch.bool), diagonal=1)
-        pair_valid = (displaced_mask.unsqueeze(2) & displaced_mask.unsqueeze(1) & upper_tri.unsqueeze(0)
-                      & (doca < self.max_pair_doca))
-
-        flat_valid = pair_valid.view(n_events, -1)
-        top_idx = doca.view(n_events, -1).masked_fill(~flat_valid, float("inf")).argsort(dim=-1)[:, :self.max_sv_per_event]
-
-        seeds = midpoint.view(n_events, -1, 3).gather(1, top_idx.unsqueeze(-1).expand(-1, -1, 3))
-        seed_valid = flat_valid.gather(1, top_idx)
-        # fewer than max_sv_per_event pairs (n_tracks^2 < K): pad with empty slots
-        n_missing = self.max_sv_per_event - top_idx.shape[1]
-        if n_missing > 0:
-            seeds = torch.cat([seeds, seeds.new_zeros(n_events, n_missing, 3)], dim=1)
-            seed_valid = torch.cat([seed_valid, seed_valid.new_zeros(n_events, n_missing)], dim=1)
-        return seeds.masked_fill(~seed_valid.unsqueeze(-1), float("nan")), seed_valid
-
-    def _suppress_duplicate_secondaries(self, sv_estimate, sv_chi2_per_dof, sv_is_valid):
-        """
-        keep (B, K): False for an SV within seed_merge_distance of a valid SV with lower chi2/ndf.
-        """
-        K = sv_estimate.shape[1]
-        dist = (sv_estimate.unsqueeze(2) - sv_estimate.unsqueeze(1)).nan_to_num().norm(dim=-1)
-        q1 = sv_chi2_per_dof.unsqueeze(2).nan_to_num(nan=float("inf"))
-        q2 = sv_chi2_per_dof.unsqueeze(1).nan_to_num(nan=float("inf"))
-        eye = torch.eye(K, device=sv_estimate.device, dtype=torch.bool).unsqueeze(0)
-        dominated = (sv_is_valid.unsqueeze(1) & (dist < self.seed_merge_distance) & (q2 < q1) & ~eye).any(dim=2)
-        return sv_is_valid & ~dominated
 
     def _find_secondary_vertices(self, pv_fit, track_position, track_direction, track_weight, params):
         """
@@ -364,7 +291,30 @@ class VertexHead(nn.Module):
                           & params["usable"])
         displaced_weight = track_weight * displaced_mask.to(track_weight.dtype)
 
-        seeds, seed_valid = self._seed_secondary_vertices(track_position, track_direction, displaced_mask)
+        # seeds: closest-approach midpoints of candidate pairs (each once, i < j) with straight-line
+        # DOCA < max_pair_doca, tightest first; nearly parallel pairs (1 - c^2 < 1e-12) get a finite
+        # but meaningless DOCA
+        P1, P2 = track_position.unsqueeze(2), track_position.unsqueeze(1)
+        d1, d2 = track_direction.unsqueeze(2), track_direction.unsqueeze(1)
+        dp = P2 - P1
+        c = (d1 * d2).sum(dim=-1)
+        dp_d1, dp_d2 = (dp * d1).sum(dim=-1), (dp * d2).sum(dim=-1)
+        denom = (1.0 - c ** 2).clamp(min=1e-12)
+        cpa1 = P1 + ((dp_d1 - c * dp_d2) / denom).unsqueeze(-1) * d1
+        cpa2 = P2 + ((c * dp_d1 - dp_d2) / denom).unsqueeze(-1) * d2
+        doca = (cpa2 - cpa1).norm(dim=-1)
+        flat_valid = (displaced_mask.unsqueeze(2) & displaced_mask.unsqueeze(1)
+                      & torch.triu(torch.ones(n_tracks, n_tracks, device=device, dtype=torch.bool), diagonal=1)
+                      & (doca < self.max_pair_doca)).view(n_events, -1)
+        top_idx = doca.view(n_events, -1).masked_fill(~flat_valid, float("inf")).argsort(dim=-1)[:, :K]
+        seeds = ((cpa1 + cpa2) * 0.5).view(n_events, -1, 3).gather(1, top_idx.unsqueeze(-1).expand(-1, -1, 3))
+        seed_valid = flat_valid.gather(1, top_idx)
+        # fewer pairs than slots (n_tracks^2 < K): pad with empty slots
+        n_missing = K - top_idx.shape[1]
+        if n_missing > 0:
+            seeds = torch.cat([seeds, seeds.new_zeros(n_events, n_missing, 3)], dim=1)
+            seed_valid = torch.cat([seed_valid, seed_valid.new_zeros(n_events, n_missing)], dim=1)
+        seeds = seeds.masked_fill(~seed_valid.unsqueeze(-1), float("nan"))
 
         sv_estimate = torch.full((n_events, K, 3), float("nan"), device=device, dtype=dtype)
         sv_chi2 = torch.full((n_events, K), float("nan"), device=device, dtype=dtype)
@@ -376,8 +326,10 @@ class VertexHead(nn.Module):
         sv_track_dca = torch.full((n_events, K, n_tracks), float("nan"), device=device, dtype=dtype)
 
         for k in range(K):
-            # candidates close enough to this seed (an empty slot's NaN seed becomes the origin)
-            in_sv = ((_track_dca_to_point(seeds[:, k].nan_to_num(), track_position, track_direction)
+            # candidates within max_track_sv_doca (straight line) of this seed; an empty slot's NaN
+            # seed becomes the origin
+            diff = seeds[:, k].nan_to_num().unsqueeze(1) - track_position
+            in_sv = (((diff - (diff * track_direction).sum(-1, keepdim=True) * track_direction).norm(dim=-1)
                       < self.max_track_sv_doca) & (displaced_weight > 0))
             sv_weight = displaced_weight * in_sv.to(displaced_weight.dtype)
             fit = self._fit(track_position, track_direction, sv_weight, params)
@@ -400,7 +352,12 @@ class VertexHead(nn.Module):
             sv_track_mask[:, k] = in_sv & is_ok.unsqueeze(-1)
             sv_track_dca[:, k] = fit["track_dca"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
 
-        sv_is_valid = sv_is_valid & self._suppress_duplicate_secondaries(sv_estimate, sv_chi2_per_dof, sv_is_valid)
+        # drop SVs within seed_merge_distance of a valid SV with a strictly lower chi2/ndf
+        dist = (sv_estimate.unsqueeze(2) - sv_estimate.unsqueeze(1)).nan_to_num().norm(dim=-1)
+        q = sv_chi2_per_dof.nan_to_num(nan=float("inf"))
+        sv_is_valid = sv_is_valid & ~(sv_is_valid.unsqueeze(1) & (dist < self.seed_merge_distance)
+                                      & (q.unsqueeze(1) < q.unsqueeze(2))
+                                      & ~torch.eye(K, device=device, dtype=torch.bool)).any(dim=2)
         result = {
             "sv_estimate": sv_estimate.masked_fill(~sv_is_valid.unsqueeze(-1), float("nan")),
             "sv_is_valid": sv_is_valid,

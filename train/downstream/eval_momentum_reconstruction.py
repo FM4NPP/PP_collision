@@ -253,7 +253,7 @@ def save_results(result, trainer, params, args, checkpoint_path, logfile):
     np.savez(npz_path, **result["tracks"])
 
     ckpt_path = logfile.replace(".log", "_momentum_head.pth")
-    trainer.save_momentum_checkpoint(ckpt_path)
+    trainer.momentum_head.save_checkpoint(ckpt_path, params=vars(params))
 
     summary = {
         "config": args.config,
