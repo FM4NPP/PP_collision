@@ -21,7 +21,7 @@ K = max_sv_per_event SV slots. Positions in cm.
 import torch
 import torch.nn as nn
 
-from momentumhead import MomentumHead
+from momentumhead import MomentumHead, _arc_length
 
 def _fit_vertex_by_closest_approach(
     track_position,
@@ -95,8 +95,7 @@ def _fit_vertex_by_helix_closest_approach(
     track_weight,
     n_iterations=100,
     linear_fit=None,
-    d_angle=0.005,
-    is_cosmics = False,
+    is_cosmics=False,
     **linear_fit_kwargs,
 ):
     """
@@ -105,11 +104,11 @@ def _fit_vertex_by_helix_closest_approach(
 
     Args:
         circle_centre (B, T, 2), R_s (B, T): MomentumHead's circle; sign(R_s) = sign(q Bz).
-        zslope, z0: (B, T) z line z = zslope * r + z0 (r -> x if is_cosmics).
+        zslope, z0: (B, T) z line z = zslope * s + z0, s the signed arc length from the circle's
+            closest approach to the beam line (momentumhead._arc_length; s -> x if is_cosmics).
         track_weight: (B, T); tracks with NaN parameters are excluded.
         n_iterations: maximum; stops once every vertex moves < 1e-4; below 1 returns linear_fit.
         linear_fit: straight-line fit result whose vertex is the start (origin if None or NaN).
-        d_angle: step along the circle (rad) that forms the tangent.
         **linear_fit_kwargs: passed to _fit_vertex_by_closest_approach.
 
     Returns:
@@ -135,33 +134,21 @@ def _fit_vertex_by_helix_closest_approach(
     x0, y0 = circle_centre.unbind(-1)
 
     for _ in range(n_iterations):
-        diff = PV[:, None, :2] - circle_centre
-        pca_circle = (circle_centre + radius.unsqueeze(-1) * diff / 
-                      diff.norm(dim=-1, keepdim=True).clamp(min=1e-12))
-
-        angle_pca = torch.atan2(diff[..., 1], diff[..., 0])
+        # nearest point on each circle to the vertex in x-y, and the exact tangent there along the
+        # direction of travel (anticlockwise <=> R_s < 0); dz/ds = zslope (dz/dx * dx/ds for cosmics)
+        n = PV[:, None, :2] - circle_centre
+        n = n / n.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        pca_circle = circle_centre + radius.unsqueeze(-1) * n
+        t_xy = torch.sign(R_s).unsqueeze(-1) * torch.stack([n[..., 1], -n[..., 0]], dim=-1)
 
         if is_cosmics:
-            pca_z = pca_circle[..., 0] * zslope + z0
+            pca_z, dz = pca_circle[..., 0] * zslope + z0, zslope * t_xy[..., 0]
         else:
-            pca_z = pca_circle.norm(dim=-1) * zslope + z0
+            pca_z, dz = _arc_length(pca_circle[..., 0], pca_circle[..., 1], x0, y0, R_s) * zslope + z0, zslope
         pca = torch.cat([pca_circle, pca_z.unsqueeze(-1)], dim=-1)
-
-        # second point a small step along the circle gives the local tangent
-        new_angle = angle_pca - torch.sign(R_s) * d_angle
-        newx = radius * torch.cos(new_angle) + x0
-        newy = radius * torch.sin(new_angle) + y0
-        new_xy = torch.stack([newx, newy], dim=-1)
-        
-        if is_cosmics:
-            new_z = newx * zslope + z0
-        else:
-            new_z = new_xy.norm(dim=-1) * zslope + z0
-
-        second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
-
-        raw_tangent = second_point_pca - pca
-        tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        tangent = torch.cat([t_xy, dz.unsqueeze(-1)], dim=-1)
+        # clamped: a stand-in track (centre at the origin) with the vertex at the origin has no direction
+        tangent = tangent / tangent.norm(dim=-1, keepdim=True).clamp(min=1e-12)
 
         result = _fit_vertex_by_closest_approach(pca, tangent, track_weight, **linear_fit_kwargs)
 
@@ -261,6 +248,7 @@ class VertexHead(nn.Module):
     def _fit(self, track_position, track_direction, track_weight, params):
         """
         Straight-line fit, refined by the helix fit when use_helix and Bz != 0 (PV, SVs and refit).
+        Tracks without a fitted circle and z line get NaN track_dca and track_closest_approach_point.
         """
         fit = _fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
         if self.use_helix and self.momentum_head.Bz != 0.0:
@@ -274,12 +262,15 @@ class VertexHead(nn.Module):
                 linear_fit=fit,
                 is_cosmics=self.momentum_head.is_cosmics,
             )
+        fit["track_dca"] = fit["track_dca"].masked_fill(~params["fit_ok"], float("nan"))
+        fit["track_closest_approach_point"] = fit["track_closest_approach_point"].masked_fill(
+            ~params["fit_ok"].unsqueeze(-1), float("nan"))
         return fit
 
     def _find_secondary_vertices(self, pv_fit, track_position, track_direction, track_weight, params):
         """
         SV search after the PV fit (module docstring steps 1-6): the sv_* outputs, displaced_mask,
-        displaced_weight and, with refit_pv, pv_refit.
+        displaced_weight and, with refit_pv and any SV in the batch, pv_refit.
         """
         n_events, n_tracks = track_weight.shape
         K = self.max_sv_per_event
@@ -326,6 +317,8 @@ class VertexHead(nn.Module):
         sv_track_dca = torch.full((n_events, K, n_tracks), float("nan"), device=device, dtype=dtype)
 
         for k in range(K):
+            if not seed_valid[:, k].any():
+                continue                 # no event has a seed in this slot: its outputs stay empty
             # candidates within max_track_sv_doca (straight line) of this seed; an empty slot's NaN
             # seed becomes the origin
             diff = seeds[:, k].nan_to_num().unsqueeze(1) - track_position
@@ -370,7 +363,7 @@ class VertexHead(nn.Module):
             "displaced_mask": displaced_mask,
             "displaced_weight": displaced_weight,
         }
-        if self.refit_pv:
+        if self.refit_pv and result["sv_is_valid"].any():     # without an SV the refit is never reported
             refit_weight = track_weight * (~result["sv_track_mask"].any(dim=1)).to(track_weight.dtype)
             result["pv_refit"] = self._fit(track_position, track_direction, refit_weight, params)
         return result

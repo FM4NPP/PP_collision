@@ -2,8 +2,8 @@
 momentumhead.py: track parameters (momentum, charge, direction) fitted from track-finder output.
 
 Each track's hits (argmax of mask_probs) get a Taubin circle fit in x-y (pT, charge, circle) and a
-line fit of z against r (against x for cosmics) for theta; no truth is used. VertexHead's helix fit
-steps along the circle and z line.
+line fit of z against signed arc length s along that circle (against x for cosmics) for theta and z
+at the beam line; no truth is used. VertexHead's helix fit steps along the circle and z line.
 
 Inputs: mask_probs (B, N, T), normalized points (B, N, 4), padding_mask (B, N). B events, N hits,
 T track slots. Positions in cm.
@@ -11,29 +11,36 @@ T track slots. Positions in cm.
 import torch
 import torch.nn as nn
 
-def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
+def _per_track_sum(values, track, n_tracks):
+    """Sum per-hit values (B, N) into their track slots (B, T); hits on no track must carry 0."""
+    return values.new_zeros(values.shape[0], n_tracks).scatter_add_(1, track, values)
+
+def _line_fit(u, v, track, assigned, n_tracks, min_hits=2, eps=1e-12):
     """
     Deming (orthogonal-distance) line fit v = slope * u + intercept, per track.
 
     Args:
-        u, v: (B, N, T); mask: (B, N, T) the hits of each track.
+        u, v: (B, N) per hit; track: (B, N) each hit's track slot; assigned: (B, N) bool, the hit is on
+            that track; n_tracks: T.
 
     Returns:
         slope, intercept: (B, T); NaN with fewer than min_hits hits.
     """
-    mask = mask.to(u.dtype)
-    n_valid = mask.sum(dim=1).clamp(min=eps)
+    mask = assigned.to(u.dtype)
+    u, v = u.masked_fill(~assigned, 0.0), v.masked_fill(~assigned, 0.0)    # unassigned hits can't add NaN
+    n_valid = _per_track_sum(mask, track, n_tracks).clamp(min=eps)
     valid = n_valid >= min_hits
 
-    mean_u = (u * mask).sum(dim=1) / n_valid
-    mean_v = (v * mask).sum(dim=1) / n_valid
+    mean_u = _per_track_sum(u, track, n_tracks) / n_valid
+    mean_v = _per_track_sum(v, track, n_tracks) / n_valid
 
-    du = u - mean_u.unsqueeze(1)
-    dv = v - mean_v.unsqueeze(1)
+    # each hit is centred on its own track's mean
+    du = (u - mean_u.gather(1, track)) * mask
+    dv = (v - mean_v.gather(1, track)) * mask
 
-    ssd_u  = (du * du * mask).sum(dim=1)
-    ssd_v  = (dv * dv * mask).sum(dim=1)
-    ssd_uv = (du * dv * mask).sum(dim=1)
+    ssd_u  = _per_track_sum(du * du, track, n_tracks)
+    ssd_v  = _per_track_sum(dv * dv, track, n_tracks)
+    ssd_uv = _per_track_sum(du * dv, track, n_tracks)
 
     slope = ((ssd_v - ssd_u + torch.sqrt((ssd_v - ssd_u) ** 2 + 4 * ssd_uv ** 2)) / 2.0 /
               torch.where(ssd_uv.abs() < eps, eps, ssd_uv))
@@ -43,25 +50,28 @@ def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     intercept = intercept.masked_fill(~valid, float("nan"))
     return slope, intercept
 
-def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
+def _circle_fit(x, y, track, assigned, n_tracks, min_hits=3, newton_iters=20, eps=1e-12):
     """
     Taubin circle fit per track, in float64.
 
     Args:
-        x, y: (B, N, T); mask: (B, N, T) the hits of each track.
+        x, y: (B, N) per hit; track: (B, N) each hit's track slot; assigned: (B, N) bool, the hit is on
+            that track; n_tracks: T.
 
     Returns:
         radius, x_centre, y_centre: (B, T) float64; NaN with fewer than min_hits hits.
     """
-    x, y, mask = x.double(), y.double(), mask.double()
-    n_valid = mask.sum(dim=1).clamp(min=eps)
+    mask = assigned.double()
+    x, y = x.double().masked_fill(~assigned, 0.0), y.double().masked_fill(~assigned, 0.0)
+    n_valid = _per_track_sum(mask, track, n_tracks).clamp(min=eps)
     valid = n_valid >= min_hits
-    mean_x = (x * mask).sum(dim=1) / n_valid
-    mean_y = (y * mask).sum(dim=1) / n_valid
-    Xi, Yi = x - mean_x.unsqueeze(1), y - mean_y.unsqueeze(1)
+    mean_x = _per_track_sum(x, track, n_tracks) / n_valid
+    mean_y = _per_track_sum(y, track, n_tracks) / n_valid
+    # each hit is centred on its own track's mean
+    Xi, Yi = (x - mean_x.gather(1, track)) * mask, (y - mean_y.gather(1, track)) * mask
     Zi = Xi * Xi + Yi * Yi
-    Mxy, Mxx, Myy = ((v * mask).sum(dim=1) / n_valid for v in (Xi * Yi, Xi * Xi, Yi * Yi))
-    Mxz, Myz, Mzz = ((v * mask).sum(dim=1) / n_valid for v in (Xi * Zi, Yi * Zi, Zi * Zi))
+    Mxy, Mxx, Myy = (_per_track_sum(v, track, n_tracks) / n_valid for v in (Xi * Yi, Xi * Xi, Yi * Yi))
+    Mxz, Myz, Mzz = (_per_track_sum(v, track, n_tracks) / n_valid for v in (Xi * Zi, Yi * Zi, Zi * Zi))
 
     Mz = Mxx + Myy
     Cov_xy = Mxx * Myy - Mxy * Mxy
@@ -89,6 +99,29 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
     return (radius.masked_fill(~valid, float("nan")),
             Xc.masked_fill(~valid, float("nan")) + mean_x,
             Yc.masked_fill(~valid, float("nan")) + mean_y)
+
+def _extreme_hit(r, track, assigned, n_tracks, outermost=False):
+    """
+    Hit index (B, T) of each track's innermost (or outermost) assigned hit by r: the first such hit on
+    ties, and 0 for a track with none, as argmin / argmax over a masked (B, N, T) grid would give.
+    """
+    n_events, n_hits = r.shape
+    key = torch.where(assigned, r if outermost else -r, -torch.inf)
+    best = key.new_full((n_events, n_tracks), -torch.inf).scatter_reduce_(1, track, key, "amax")
+    hit = torch.arange(n_hits, device=r.device).expand_as(track)
+    first = torch.full((n_events, n_tracks), n_hits, dtype=torch.long, device=r.device).scatter_reduce_(
+        1, track, torch.where(assigned & (key == best.gather(1, track)), hit, n_hits), "amin")
+    return first.masked_fill(first == n_hits, 0)
+
+def _arc_length(x, y, xc, yc, R_s):
+    """
+    Signed arc length along a circle (centre xc, yc; signed radius R_s, sign(R_s) = sign(q Bz)) from its
+    closest approach to the beam line to the circle point at the angle of (x, y); positive in the
+    direction of travel (anticlockwise <=> R_s < 0). All inputs broadcast.
+    """
+    # in place, so a long per-hit array costs one allocation
+    s = torch.atan2(y - yc, x - xc)
+    return s.sub_(torch.atan2(-yc, -xc)).add_(torch.pi).remainder_(2 * torch.pi).sub_(torch.pi).mul_(-R_s)
 
 def _unnormalize_hits(points):
     """
@@ -122,30 +155,18 @@ def _track_position_from_hits(points, hit_r, mask_probs, padding_mask):
         total_hit_weight: (B, T) sum of mask_probs over real hits.
         is_assigned: (B, N, T) each real hit on its argmax track (none if all probabilities are 0).
     """
-    hit_position = points[..., 1:4]
-    hit_weight = mask_probs * padding_mask.unsqueeze(-1).to(mask_probs.dtype)
-    total_hit_weight = hit_weight.sum(dim=1)
+    n_tracks = mask_probs.shape[-1]
+    total_hit_weight = (mask_probs * padding_mask.unsqueeze(-1).to(mask_probs.dtype)).sum(dim=1)
 
-    n_events, n_hits, n_tracks = mask_probs.shape
+    # each real hit belongs to the track slot with the largest mask_probs; hits with zero probability for
+    # every track are unassigned
+    track = mask_probs.argmax(dim=-1)
+    assigned = padding_mask & (mask_probs.max(dim=-1).values > 0)
+    is_assigned = (torch.arange(n_tracks, device=track.device) == track.unsqueeze(-1)) & assigned.unsqueeze(-1)
 
-    # each hit belongs to the track slot with the largest mask_probs
-    hard_assigned_track = mask_probs.argmax(dim=-1)
-
-    is_assigned = torch.nn.functional.one_hot(hard_assigned_track, num_classes=n_tracks).bool()
-    # Exclude hits with zero assignment probability for every track.
-    has_assignment = mask_probs.max(dim=-1).values > 0
-    is_assigned = (is_assigned & padding_mask.unsqueeze(-1) & has_assignment.unsqueeze(-1))
-
-    radius_if_assigned = torch.where(is_assigned
-                                   , hit_r.unsqueeze(-1).expand(-1, -1, n_tracks)
-                                   , torch.full((n_events, n_hits, n_tracks), float("inf"), device=points.device, dtype=hit_r.dtype),)
-    innermost_hit_index = radius_if_assigned.argmin(dim=1)
-    has_any_assigned_hit = is_assigned.any(dim=1)
-
-    event_index = torch.arange(n_events, device=points.device).unsqueeze(-1).expand(-1, n_tracks)
-    innermost_hit_position = hit_position[event_index, innermost_hit_index]
-
-    track_position = torch.where(has_any_assigned_hit.unsqueeze(-1), innermost_hit_position, torch.zeros_like(innermost_hit_position))
+    innermost = _extreme_hit(hit_r, track, assigned, n_tracks)
+    track_position = points[..., 1:4].gather(1, innermost.unsqueeze(-1).expand(-1, -1, 3))
+    track_position = track_position.masked_fill(~is_assigned.any(dim=1).unsqueeze(-1), 0.0)
     return track_position, total_hit_weight, is_assigned
 
 def _track_params_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4,
@@ -161,39 +182,44 @@ def _track_params_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1
         noise_pt_threshold: GeV; lower fitted pT -> not usable.
         Bz: Tesla; scaling_factor: converts metres to the units of points.
         valid_radius: the circle must pass within this of the beam line to be usable.
-        min_hits: fewer assigned hits -> not fitted; is_cosmics: fit z against x instead of r.
+        min_hits: fewer assigned hits -> not fitted; is_cosmics: fit z against x instead of s.
 
     Returns:
         dict, NaN (or filler / False) where fit_ok is False:
             track_reg_result (B, T, 4): (q/(pT+1), theta, sin phi, cos phi).
             usable (B, T): pT >= noise_pt_threshold and beam_dca < valid_radius.
             pT, radius, beam_dca, fit_ok (B, T).
-            circle_centre (B, T, 2), R_s, zslope, z0 (B, T): for the helix fit (dtype of points).
+            circle_centre (B, T, 2), R_s, zslope, z0 (B, T): the circle and z line z = zslope * s + z0
+                (s from _arc_length), for the helix fit (dtype of points).
     """
+    # per hit (B, N): each hit's track slot (0 if unassigned) and coordinates
     n_tracks = is_assigned.shape[-1]
-    x = points[..., 1].unsqueeze(-1).expand(-1, -1, n_tracks).double()
-    y = points[..., 2].unsqueeze(-1).expand(-1, -1, n_tracks).double()
-    z = points[..., 3].unsqueeze(-1).expand(-1, -1, n_tracks).double()
-    r = hit_r.unsqueeze(-1).expand(-1, -1, n_tracks).double()
+    assigned = is_assigned.any(dim=-1)
+    track = is_assigned.to(torch.uint8).argmax(dim=-1)
+    x, y, z = (points[..., k].double() for k in (1, 2, 3))
+    r = hit_r.double()
 
-    radius, xc, yc = _circle_fit(x, y, is_assigned, min_hits=min_hits)
-    zslope, z0 = _line_fit(x if is_cosmics else r, z, is_assigned, min_hits=min_hits)
+    radius, xc, yc = _circle_fit(x, y, track, assigned, n_tracks, min_hits=min_hits)
 
     # innermost and outermost assigned hit of each track
-    inf = torch.full_like(r, float("inf"))
-    i_in = torch.where(is_assigned, r, inf).argmin(dim=1, keepdim=True)
-    i_out = torch.where(is_assigned, r, -inf).argmax(dim=1, keepdim=True)
-    xin, yin = x.gather(1, i_in).squeeze(1), y.gather(1, i_in).squeeze(1)
-    xout, yout = x.gather(1, i_out).squeeze(1), y.gather(1, i_out).squeeze(1)
+    i_in, i_out = (_extreme_hit(r, track, assigned, n_tracks, outermost=o) for o in (False, True))
+    xin, yin = x.gather(1, i_in), y.gather(1, i_in)
+    xout, yout = x.gather(1, i_out), y.gather(1, i_out)
 
     # travel inner -> outer: anticlockwise about the centre <=> R_s < 0
     anticlockwise = ((xin - xc) * (yout - yc) - (yin - yc) * (xout - xc)) > 0
     sign_Rs = torch.where(anticlockwise, -1.0, 1.0).to(radius.dtype)
+
+    # a helix is linear in arc length, not in r: fit z against the signed arc length along the circle
+    # from its closest approach to the beam line (positive in the direction of travel)
+    s = x if is_cosmics else _arc_length(x, y, xc.gather(1, track), yc.gather(1, track),
+                                         (sign_Rs * radius).gather(1, track))
+    zslope, z0 = _line_fit(s, z, track, assigned, n_tracks, min_hits=min_hits)
     ux, uy = (xc - xin) / radius, (yc - yin) / radius
     sin_phi, cos_phi = sign_Rs * ux, -sign_Rs * uy
     q = sign_Rs * (1.0 if Bz >= 0 else -1.0)
-    pT = 0.3 * abs(Bz) * radius / scaling_factor
-    # cot(theta) = dz/ds: dz/dr for tracks from the beam line, dz/dx * dx/ds = zslope cos(phi) for cosmics
+    pT = 0.299792458 * abs(Bz) * radius / scaling_factor     # pT [GeV] = c [1e9 m/s] * B [T] * R [m]
+    # cot(theta) = dz/ds: the arc-length slope, or dz/dx * dx/ds = zslope cos(phi) for cosmics
     cot_theta = zslope * cos_phi if is_cosmics else zslope
     theta = torch.atan2(torch.ones_like(cot_theta), cot_theta)
     beam_dca = (torch.sqrt(xc * xc + yc * yc) - radius).abs()
@@ -223,8 +249,8 @@ class MomentumHead(nn.Module):
 
     Args:
         Bz: solenoid field along z, Tesla.
-        is_cosmics: fit z against x instead of transverse radius r.
-        scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
+        is_cosmics: fit z against x instead of arc length.
+        scaling_factor: converts the radius pT / (0.2998 Bz), in metres, to the units of points.
         noise_pt_threshold: GeV; tracks with lower fitted pT are labelled noise (not usable).
     """
     def __init__(
