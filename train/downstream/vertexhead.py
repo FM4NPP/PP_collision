@@ -1,24 +1,27 @@
 """
-vertexhead.py
-=============
-Primary-vertex fit from track-finder output.
+vertexhead.py: primary- and secondary-vertex fit from track-finder output.
 
-Track parameters and quality labels (noise, beam-line validity) are fitted from each track's
-assigned hits. VertexHead finds the point minimising the weighted sum of squared distances of
-closest approach to every usable track, anchoring each track at its innermost assigned hit and
-weighting it by (soft hit count) x P(real). With use_helix and Bz != 0 that straight-line vertex
-seeds an iterative helix fit (uniform Bz along z in Tesla; scaling_factor converts metres to cm).
+Track parameters come from MomentumHead (momentumhead.py). The PV is the weighted least-squares
+point of closest approach to the usable tracks (each anchored at its innermost hit, weight = soft
+hit count x P(real)), refined by an iterative helix fit when use_helix and Bz != 0.
 
-Inputs (from MambaAttentionHead.forward and TPCBatchDataset):
-    class_probs      (n_events, n_tracks, 2)        P(slot empty), P(slot real)
-    mask_probs       (n_events, n_hits, n_tracks)   hit-to-track assignment
-    points           (n_events, n_hits, 4)          normalized (E, eta, phi, r), as the model sees them
-    padding_mask     (n_events, n_hits)             True = real hit
+Secondary vertices (find_secondary=True, the default):
+    1. candidates: DCA to the PV > min_track_pv_dca and to the beam line > min_track_beam_dca
+    2. seeds: midpoints of closest approach of candidate pairs with DOCA < max_pair_doca
+    3. each seed is fitted (same fit as the PV) from the candidates within max_track_sv_doca of it
+    4. kept if valid, >= min_sv_tracks, >= min_sv_displacement from the PV, chi2/ndf <= max
+    5. SVs within seed_merge_distance of a lower chi2/ndf SV are dropped
+    6. the PV is refitted without SV tracks and reported where the event has an SV and the refit
+       is valid; elsewhere the original fit (pv_original) is reported
 
-VertexHead.forward inverts the normalization to (E, x, y, z) in cm; every fit below works in cm.
+Inputs (MambaAttentionHead.forward, TPCBatchDataset): class_probs (B, T, 2), mask_probs (B, N, T),
+normalized points (B, N, 4), padding_mask (B, N). B events, N hits, T track slots,
+K = max_sv_per_event SV slots. Positions in cm.
 """
 import torch
 import torch.nn as nn
+
+from momentumhead import MomentumHead
 
 def _fit_vertex_by_closest_approach(
     track_position,
@@ -32,20 +35,17 @@ def _fit_vertex_by_closest_approach(
     Weighted least-squares point of closest approach to straight tracks, per event.
 
     Args:
-        track_position: (n_events, n_tracks, 3) a point on each track's line.
-        track_direction: (n_events, n_tracks, 3) unit direction of each line.
-        track_weight: (n_events, n_tracks) non-negative weight; 0 = track ignored.
-        minimum_total_weight: an event needs more total weight than this to be valid.
-        regularization: added to the normal matrix's diagonal so the solve stays well-posed.
-        minimum_eigenvalue_ratio: smallest/largest eigenvalue ratio below which the event is degenerate.
+        track_position, track_direction: (B, T, 3) a point on each line and its unit direction.
+        track_weight: (B, T) non-negative; 0 = ignored.
+        minimum_total_weight, minimum_eigenvalue_ratio: limits below which an event is not valid.
+        regularization: added to the normal matrix's diagonal.
 
     Returns:
         dict:
-            vertex_estimate: (n_events, 3) fitted vertex; NaN where fit_is_valid is False.
-            chi_square: (n_events,) weighted sum of squared DCAs at the vertex; no ndf applied.
-            fit_is_valid: (n_events,) bool; False without >= 2 non-parallel weighted tracks.
-            track_closest_approach_point: (n_events, n_tracks, 3) point on each line nearest the vertex; NaN where invalid.
-            track_dca: (n_events, n_tracks) each track's distance of closest approach; NaN where invalid.
+            vertex_estimate (B, 3); chi_square (B,), the weighted sum of squared DCAs.
+            fit_is_valid (B,): False without 2 non-parallel weighted tracks.
+            track_closest_approach_point (B, T, 3), track_dca (B, T).
+            NaN where not valid (except chi_square).
     """
     weight = track_weight.clamp(min=0.0)
 
@@ -100,27 +100,20 @@ def _fit_vertex_by_helix_closest_approach(
     **linear_fit_kwargs,
 ):
     """
-    Helix-aware vertex fit: iterates _fit_vertex_by_closest_approach on each track's local
-    tangent at its point of closest approach to the current vertex.
+    Helix-aware vertex fit: repeats the straight-line fit on each track's tangent at its point of
+    closest approach to the current vertex.
 
     Args:
-        circle_centre: (n_events, n_tracks, 2) centre of each track's x-y circle, cm.
-        R_s: (n_events, n_tracks) signed circle radius, cm; sign(R_s) = sign(q Bz).
-        zslope, z0: (n_events, n_tracks) z line, z = zslope * r + z0 (r -> x if is_cosmics).
-            The circle and z line come from _track_params_from_hits.
-        track_weight: (n_events, n_tracks) non-negative weight; 0 = track ignored.
-        n_iterations: maximum iterations; stops early once every event moves < 1e-4. Below 1,
-            linear_fit is returned unchanged.
-        linear_fit: _fit_vertex_by_closest_approach's output dict for the same tracks; its
-            vertex_estimate is the starting vertex (origin where NaN, or if None).
-        d_angle: angular step (radians) along the circle used to form the tangent.
-        is_cosmics: the z line is z against x instead of z against transverse radius r.
+        circle_centre (B, T, 2), R_s (B, T): MomentumHead's circle; sign(R_s) = sign(q Bz).
+        zslope, z0: (B, T) z line z = zslope * r + z0 (r -> x if is_cosmics).
+        track_weight: (B, T); tracks with NaN parameters are excluded.
+        n_iterations: maximum; stops once every vertex moves < 1e-4; below 1 returns linear_fit.
+        linear_fit: straight-line fit result whose vertex is the start (origin if None or NaN).
+        d_angle: step along the circle (rad) that forms the tangent.
         **linear_fit_kwargs: passed to _fit_vertex_by_closest_approach.
 
     Returns:
-        dict, same keys as _fit_vertex_by_closest_approach, from the last iteration (linear_fit
-        itself when n_iterations < 1). Tracks without a fitted circle and z line (NaN) are
-        excluded from it and get NaN track_dca and track_closest_approach_point.
+        dict as _fit_vertex_by_closest_approach, from the last iteration; excluded tracks get NaN.
     """
     n_events = R_s.shape[0]
 
@@ -185,254 +178,50 @@ def _fit_vertex_by_helix_closest_approach(
     result["track_closest_approach_point"] = result["track_closest_approach_point"].masked_fill(failed.unsqueeze(-1), float("nan"))
     return result
 
-def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
+def _pairwise_doca_and_midpoint(track_position, track_direction, eps=1e-12):
     """
-    Deming (orthogonal-distance) line fit v = slope * u + intercept, per track.
-
-    Args:
-        u, v: (n_events, n_hits, n_tracks) coordinates to fit.
-        mask: (n_events, n_hits, n_tracks) bool/float, which hits belong to each track.
-        min_hits: tracks with fewer hits get NaN.
-        eps: numerical floor for divisions.
+    All-pairs straight-line DOCA per event; nearly parallel pairs (1 - c^2 < eps) get a finite but
+    meaningless value.
 
     Returns:
-        slope, intercept: (n_events, n_tracks) each; NaN where fewer than min_hits hits.
+        doca (B, T, T) and the closest-approach midpoint (B, T, T, 3).
     """
-    mask = mask.to(u.dtype)
-    n_valid = mask.sum(dim=1).clamp(min=eps)
-    valid = n_valid >= min_hits
+    P1, P2 = track_position.unsqueeze(2), track_position.unsqueeze(1)
+    d1, d2 = track_direction.unsqueeze(2), track_direction.unsqueeze(1)
 
-    mean_u = (u * mask).sum(dim=1) / n_valid
-    mean_v = (v * mask).sum(dim=1) / n_valid
+    dp = P2 - P1
+    c = (d1 * d2).sum(dim=-1)
+    dp_d1 = (dp * d1).sum(dim=-1)
+    dp_d2 = (dp * d2).sum(dim=-1)
 
-    du = u - mean_u.unsqueeze(1)
-    dv = v - mean_v.unsqueeze(1)
+    denom = (1.0 - c ** 2).clamp(min=eps)
+    cpa1 = P1 + ((dp_d1 - c * dp_d2) / denom).unsqueeze(-1) * d1
+    cpa2 = P2 + ((c * dp_d1 - dp_d2) / denom).unsqueeze(-1) * d2
+    return (cpa2 - cpa1).norm(dim=-1), (cpa1 + cpa2) * 0.5
 
-    ssd_u  = (du * du * mask).sum(dim=1)
-    ssd_v  = (dv * dv * mask).sum(dim=1)
-    ssd_uv = (du * dv * mask).sum(dim=1)
-
-    slope = ((ssd_v - ssd_u + torch.sqrt((ssd_v - ssd_u) ** 2 + 4 * ssd_uv ** 2)) / 2.0 /
-              torch.where(ssd_uv.abs() < eps, eps, ssd_uv))
-    intercept = mean_v - slope * mean_u
-
-    slope = slope.masked_fill(~valid, float("nan"))
-    intercept = intercept.masked_fill(~valid, float("nan"))
-    return slope, intercept
-
-def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
-    """
-    Taubin algebraic circle fit per track, computed in float64.
-
-    Args:
-        x, y: (n_events, n_hits, n_tracks) hit coordinates.
-        mask: (n_events, n_hits, n_tracks) bool/float, which hits belong to each track.
-        min_hits: tracks with fewer hits get NaN.
-        newton_iters: fixed Newton iterations for the Taubin root.
-        eps: numerical floor for divisions.
-
-    Returns:
-        radius, x_centre, y_centre: (n_events, n_tracks) float64 each; NaN where fewer than min_hits hits.
-    """
-    x, y, mask = x.double(), y.double(), mask.double()
-    n_valid = mask.sum(dim=1).clamp(min=eps)
-    valid = n_valid >= min_hits
-    mean_x = (x * mask).sum(dim=1) / n_valid
-    mean_y = (y * mask).sum(dim=1) / n_valid
-    Xi, Yi = x - mean_x.unsqueeze(1), y - mean_y.unsqueeze(1)
-    Zi = Xi * Xi + Yi * Yi
-    Mxy, Mxx, Myy = ((v * mask).sum(dim=1) / n_valid for v in (Xi * Yi, Xi * Xi, Yi * Yi))
-    Mxz, Myz, Mzz = ((v * mask).sum(dim=1) / n_valid for v in (Xi * Zi, Yi * Zi, Zi * Zi))
-
-    Mz = Mxx + Myy
-    Cov_xy = Mxx * Myy - Mxy * Mxy
-    Var_z = Mzz - Mz * Mz
-    A3, A2 = 4 * Mz, -3 * Mz * Mz - Mzz
-    A1 = Var_z * Mz + 4 * Cov_xy * Mz - Mxz * Mxz - Myz * Myz
-    A0 = Mxz * (Mxz * Myy - Myz * Mxy) + Myz * (Myz * Mxx - Mxz * Mxy) - Var_z * Cov_xy
-
-    xk, yk = torch.zeros_like(Mz), A0.clone()
-    improving_any = torch.ones_like(Mz, dtype=torch.bool)
-    for _ in range(newton_iters):
-        Dy = A1 + xk * (2 * A2 + 3 * A3 * xk)
-        xnew = xk - yk / torch.where(Dy.abs() < eps, eps, Dy)
-        ynew = A0 + xnew * (A1 + xnew * (A2 + xnew * A3))
-        better = (ynew.abs() < yk.abs()) & torch.isfinite(xnew) & improving_any
-        xk, yk = torch.where(better, xnew, xk), torch.where(better, ynew, yk)
-        improving_any = improving_any & better
-
-    DET = xk * xk - xk * Mz + Cov_xy
-    DET = torch.where(DET.abs() < eps, eps, DET)
-    Xc = (Mxz * (Myy - xk) - Myz * Mxy) / DET / 2
-    Yc = (Myz * (Mxx - xk) - Mxz * Mxy) / DET / 2
-    radius = torch.sqrt((Xc * Xc + Yc * Yc + Mz).clamp(min=0.0))
-
-    return (radius.masked_fill(~valid, float("nan")),
-            Xc.masked_fill(~valid, float("nan")) + mean_x,
-            Yc.masked_fill(~valid, float("nan")) + mean_y)
-
-def _unnormalize_hits(points):
-    """
-    Invert TPCBatchDataset's normalization and polar transform.
-
-    Args:
-        points: (..., 4) normalized (E, eta, phi, r): z-scored E; eta, phi and transverse r
-            min-max scaled to [0, 1]. eta is the hit position's, seen from the origin.
-
-    Returns:
-        points: (..., 4) (E, x, y, z), cm.
-        r: (...) transverse radius, cm.
-    """
-    # TPCBatchDataset's normalization (fm4npp/datasets/dataset.py, TPCBatchDataset.__init__);
-    # keep these in line with it
-    eta_lim = (-2.0, 2.0)
-    phi_lim = (-torch.pi, torch.pi)
-    r_lim = (31.371997833251953, 75.38493347167969)    # transverse radius, cm
-    E_mean, E_std = 253.0982, 268.7093
-
-    E = points[..., 0] * E_std + E_mean
-    eta = points[..., 1] * (eta_lim[1] - eta_lim[0]) + eta_lim[0]
-    phi = points[..., 2] * (phi_lim[1] - phi_lim[0]) + phi_lim[0]
-    r = points[..., 3] * (r_lim[1] - r_lim[0]) + r_lim[0]
-    return torch.stack([E, r * torch.cos(phi), r * torch.sin(phi), r * torch.sinh(eta)], dim=-1), r
-
-def _track_position_from_hits(points, hit_r, mask_probs, padding_mask):
-    """
-    Per-track reference point, hit weight and hard hit assignment.
-
-    Args:
-        points: (n_events, n_hits, 4) hits (E, x, y, z), cm.
-        hit_r: (n_events, n_hits) transverse radius of each hit, cm.
-        mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
-        padding_mask: (n_events, n_hits) True = real hit.
-
-    Returns:
-        track_position: (n_events, n_tracks, 3) innermost assigned hit by transverse radius
-            (the hit _track_params_from_hits gives phi at); (0, 0, 0) for a track with none.
-        total_hit_weight: (n_events, n_tracks) sum of mask_probs over real hits.
-        is_assigned: (n_events, n_hits, n_tracks) bool, each real hit assigned to its argmax track;
-        hits with zero probability for every track are unassigned.
-    """
-    hit_position = points[..., 1:4]
-    hit_weight = mask_probs * padding_mask.unsqueeze(-1).to(mask_probs.dtype)
-    total_hit_weight = hit_weight.sum(dim=1)
-
-    n_events, n_hits, n_tracks = mask_probs.shape
-
-    # each hit belongs to the track slot with the largest mask_probs
-    hard_assigned_track = mask_probs.argmax(dim=-1)
-
-    is_assigned = torch.nn.functional.one_hot(hard_assigned_track, num_classes=n_tracks).bool()
-    # Exclude hits with zero assignment probability for every track.
-    has_assignment = mask_probs.max(dim=-1).values > 0
-    is_assigned = (is_assigned & padding_mask.unsqueeze(-1) & has_assignment.unsqueeze(-1))
-
-    radius_if_assigned = torch.where(is_assigned
-                                   , hit_r.unsqueeze(-1).expand(-1, -1, n_tracks)
-                                   , torch.full((n_events, n_hits, n_tracks), float("inf"), device=points.device, dtype=hit_r.dtype),)
-    innermost_hit_index = radius_if_assigned.argmin(dim=1)
-    has_any_assigned_hit = is_assigned.any(dim=1)
-
-    event_index = torch.arange(n_events, device=points.device).unsqueeze(-1).expand(-1, n_tracks)
-    innermost_hit_position = hit_position[event_index, innermost_hit_index]
-
-    track_position = torch.where(has_any_assigned_hit.unsqueeze(-1), innermost_hit_position, torch.zeros_like(innermost_hit_position))
-    return track_position, total_hit_weight, is_assigned
-
-def _track_params_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4,
-                           scaling_factor=100.0, valid_radius=1.0, min_hits=3, is_cosmics=False):
-    """
-    Track parameters and quality labels fitted from each track's assigned hits -- no truth needed.
-
-    Circle fit in x-y gives pT and the circle; the direction of travel (innermost -> outermost hit)
-    gives the charge and phi at the innermost hit, in VertexHead's convention
-    (centre = innermost hit + R_s (sin phi, -cos phi), sign(R_s) = sign(q Bz)).
-    A z-against-r line fit (z against x for cosmics) gives theta.
-
-    Args:
-        points: (n_events, n_hits, 4) hits (E, x, y, z), cm.
-        hit_r: (n_events, n_hits) transverse radius of each hit, cm.
-        is_assigned: (n_events, n_hits, n_tracks) bool, hard hit-to-track assignment
-            (from _track_position_from_hits).
-        noise_pt_threshold: fitted pT below this (GeV) -> not usable (noise).
-        Bz: solenoid field along z, Tesla.
-        scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
-        valid_radius: fitted circle's closest approach to the beam line at or above this -> not usable.
-        min_hits: tracks with fewer assigned hits are not fitted.
-        is_cosmics: fit z against x instead of z against transverse radius r.
-
-    Returns:
-        dict:
-            track_reg_result: (n_events, n_tracks, 4) (q/(pT+1), theta, sin phi, cos phi), phi at the
-                innermost hit; finite filler where fit_ok is False.
-            usable: (n_events, n_tracks) bool, pT >= noise_pt_threshold and the circle passes within
-                valid_radius of the beam line; False where fit_ok is False.
-            pT, radius, beam_dca: (n_events, n_tracks); NaN where fit_ok is False.
-            fit_ok: (n_events, n_tracks) bool, enough hits and finite fit.
-            circle_centre (n_events, n_tracks, 2); R_s, zslope, z0 (n_events, n_tracks): the fitted
-                circle (sign(R_s) = sign(q Bz)) and z line, in the dtype of points, for
-                _fit_vertex_by_helix_closest_approach; NaN where fit_ok is False.
-    """
-    n_tracks = is_assigned.shape[-1]
-    x = points[..., 1].unsqueeze(-1).expand(-1, -1, n_tracks).double()
-    y = points[..., 2].unsqueeze(-1).expand(-1, -1, n_tracks).double()
-    z = points[..., 3].unsqueeze(-1).expand(-1, -1, n_tracks).double()
-    r = hit_r.unsqueeze(-1).expand(-1, -1, n_tracks).double()
-
-    radius, xc, yc = _circle_fit(x, y, is_assigned, min_hits=min_hits)
-    zslope, z0 = _line_fit(x if is_cosmics else r, z, is_assigned, min_hits=min_hits)
-
-    # innermost and outermost assigned hit of each track
-    inf = torch.full_like(r, float("inf"))
-    i_in = torch.where(is_assigned, r, inf).argmin(dim=1, keepdim=True)
-    i_out = torch.where(is_assigned, r, -inf).argmax(dim=1, keepdim=True)
-    xin, yin = x.gather(1, i_in).squeeze(1), y.gather(1, i_in).squeeze(1)
-    xout, yout = x.gather(1, i_out).squeeze(1), y.gather(1, i_out).squeeze(1)
-
-    # travel inner -> outer: anticlockwise about the centre <=> R_s < 0
-    anticlockwise = ((xin - xc) * (yout - yc) - (yin - yc) * (xout - xc)) > 0
-    sign_Rs = torch.where(anticlockwise, -1.0, 1.0).to(radius.dtype)
-    ux, uy = (xc - xin) / radius, (yc - yin) / radius
-    sin_phi, cos_phi = sign_Rs * ux, -sign_Rs * uy
-    q = sign_Rs * (1.0 if Bz >= 0 else -1.0)
-    pT = 0.3 * abs(Bz) * radius / scaling_factor
-    # cot(theta) = dz/ds: dz/dr for tracks from the beam line, dz/dx * dx/ds = zslope cos(phi) for cosmics
-    cot_theta = zslope * cos_phi if is_cosmics else zslope
-    theta = torch.atan2(torch.ones_like(cot_theta), cot_theta)
-    beam_dca = (torch.sqrt(xc * xc + yc * yc) - radius).abs()
-
-    params = torch.stack([q / (pT + 1.0), theta, sin_phi, cos_phi], dim=-1)
-    fit_ok = torch.isfinite(params).all(dim=-1)
-    filler = params.new_tensor([0.5, torch.pi / 2, 0.0, 1.0])
-    params = torch.where(fit_ok.unsqueeze(-1), params, filler)
-    nan = torch.full_like(pT, float("nan"))
-    pT, radius, beam_dca = (torch.where(fit_ok, v, nan) for v in (pT, radius, beam_dca))
-
-    circle_centre = torch.where(fit_ok.unsqueeze(-1), torch.stack([xc, yc], dim=-1), nan.unsqueeze(-1))
-    R_s, zslope, z0 = (torch.where(fit_ok, v, nan) for v in (sign_Rs * radius, zslope, z0))
-
-    return {
-        "track_reg_result": params.to(points.dtype),
-        "usable": (pT >= noise_pt_threshold) & (beam_dca < valid_radius),    # NaN where fit_ok is False -> False
-        "pT": pT, "radius": radius, "beam_dca": beam_dca, "fit_ok": fit_ok,
-        "circle_centre": circle_centre.to(points.dtype), "R_s": R_s.to(points.dtype),
-        "zslope": zslope.to(points.dtype), "z0": z0.to(points.dtype),
-    }
+def _track_dca_to_point(point, track_position, track_direction):
+    """Straight-line DCA (B, T) of each track to one point (B, 3) per event."""
+    diff = point.unsqueeze(1) - track_position
+    return (diff - (diff * track_direction).sum(-1, keepdim=True) * track_direction).norm(dim=-1)
 
 class VertexHead(nn.Module):
 
     """
-    Primary-vertex fit from track-finder output. No learnable parameters unless learn_weights=True.
+    Primary-vertex fit, with secondary-vertex finding by default (see the module docstring). No
+    learnable parameters unless learn_weights.
 
     Args:
-        learn_weights: if True, a small network rescales each track's weight.
-        weight_hidden_dim: hidden width of that network.
-        use_helix: refine the straight-line vertex with the helix fit (when Bz != 0).
-        helix_iterations: maximum helix-fit iterations.
-        Bz: solenoid field along z, Tesla.
-        is_cosmics: fit z against x instead of z against transverse radius r.
-        scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
-        noise_pt_threshold: tracks with fitted pT below this (GeV) are labelled noise and excluded.
+        learn_weights, weight_hidden_dim: a small network that rescales each track's weight.
+        use_helix, helix_iterations: helix refinement of the straight-line fit (when Bz != 0).
+        Bz, is_cosmics, scaling_factor, noise_pt_threshold: MomentumHead settings.
+        momentum_head: ready-built MomentumHead to use instead; the four settings above are ignored.
+        find_secondary: find SVs and report the refitted PV; False = original PV-only fit.
+        min_track_pv_dca, min_track_beam_dca: cm, SV candidate cuts.
+        max_pair_doca, max_track_sv_doca: cm, seeding and attachment cuts.
+        seed_merge_distance: cm, duplicate-SV radius.
+        min_sv_tracks, min_sv_displacement (cm), max_sv_chi2_per_dof: SV cuts; ndf = 2 n_tracks - 3.
+        max_sv_per_event: SV slots per event (K).
+        refit_pv: report the PV refitted without SV tracks where valid; False = original fit.
     """
     def __init__(
         self,
@@ -444,15 +233,36 @@ class VertexHead(nn.Module):
         is_cosmics: bool = False,
         scaling_factor: float = 100.0,
         noise_pt_threshold: float = 0.25,
+        momentum_head: MomentumHead = None,
+        find_secondary: bool = True,
+        min_track_pv_dca: float = 0.05,
+        min_track_beam_dca: float = 0.05,
+        max_pair_doca: float = 1.0,
+        max_track_sv_doca: float = 0.5,
+        seed_merge_distance: float = 0.1,
+        min_sv_tracks: int = 2,
+        min_sv_displacement: float = 0.02,
+        max_sv_chi2_per_dof: float = 10.0,
+        max_sv_per_event: int = 6,
+        refit_pv: bool = True,
     ):
         super().__init__()
         self.learn_weights = learn_weights
         self.use_helix = use_helix
         self.helix_iterations = helix_iterations
-        self.Bz = Bz
-        self.is_cosmics = is_cosmics
-        self.scaling_factor = scaling_factor
-        self.noise_pt_threshold = noise_pt_threshold
+        self.find_secondary = find_secondary
+        self.min_track_pv_dca = min_track_pv_dca
+        self.min_track_beam_dca = min_track_beam_dca
+        self.max_pair_doca = max_pair_doca
+        self.max_track_sv_doca = max_track_sv_doca
+        self.seed_merge_distance = seed_merge_distance
+        self.min_sv_tracks = min_sv_tracks
+        self.min_sv_displacement = min_sv_displacement
+        self.max_sv_chi2_per_dof = max_sv_chi2_per_dof
+        self.max_sv_per_event = max_sv_per_event
+        self.refit_pv = refit_pv
+        self.momentum_head = momentum_head if momentum_head is not None else MomentumHead(
+            Bz=Bz, is_cosmics=is_cosmics, scaling_factor=scaling_factor, noise_pt_threshold=noise_pt_threshold)
         if learn_weights:
             # 6 inputs: class_probs (2) + track_reg_result (4); position deliberately excluded
             self.track_weight_network = nn.Sequential(
@@ -466,14 +276,148 @@ class VertexHead(nn.Module):
         self.use_helix = use_helix
 
     def isCosmics(self, is_cosmics: bool = True):
-        self.is_cosmics = is_cosmics
+        self.momentum_head.is_cosmics = is_cosmics
 
     def setScalingFactor(self, scaling_factor: float = 100.0):
-        self.scaling_factor = scaling_factor
+        self.momentum_head.scaling_factor = scaling_factor
 
     def setNoisePtThreshold(self, noise_pt_threshold: float = 0.25):
-        self.noise_pt_threshold = noise_pt_threshold
-    
+        self.momentum_head.noise_pt_threshold = noise_pt_threshold
+
+    @property
+    def Bz(self):
+        return self.momentum_head.Bz
+
+    @property
+    def is_cosmics(self):
+        return self.momentum_head.is_cosmics
+
+    def _fit(self, track_position, track_direction, track_weight, params):
+        """
+        Straight-line fit, refined by the helix fit when use_helix and Bz != 0 (PV, SVs and refit).
+        """
+        fit = _fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
+        if self.use_helix and self.Bz != 0.0:
+            fit = _fit_vertex_by_helix_closest_approach(
+                params["circle_centre"],
+                params["R_s"],
+                params["zslope"],
+                params["z0"],
+                track_weight,               # already zeroed for bad tracks
+                n_iterations=self.helix_iterations,
+                linear_fit=fit,
+                is_cosmics=self.is_cosmics,
+            )
+        return fit
+
+    def _seed_secondary_vertices(self, track_position, track_direction, displaced_mask):
+        """
+        Up to K seeds per event, tightest candidate pair first.
+
+        Returns:
+            seeds (B, K, 3), NaN where empty, and seed_valid (B, K).
+        """
+        n_events, n_tracks, _ = track_position.shape
+        doca, midpoint = _pairwise_doca_and_midpoint(track_position, track_direction)
+
+        # each unordered pair once (i < j), both tracks candidates, DOCA within the cut
+        upper_tri = torch.triu(torch.ones(n_tracks, n_tracks, device=track_position.device, dtype=torch.bool), diagonal=1)
+        pair_valid = (displaced_mask.unsqueeze(2) & displaced_mask.unsqueeze(1) & upper_tri.unsqueeze(0)
+                      & (doca < self.max_pair_doca))
+
+        flat_valid = pair_valid.view(n_events, -1)
+        top_idx = doca.view(n_events, -1).masked_fill(~flat_valid, float("inf")).argsort(dim=-1)[:, :self.max_sv_per_event]
+
+        seeds = midpoint.view(n_events, -1, 3).gather(1, top_idx.unsqueeze(-1).expand(-1, -1, 3))
+        seed_valid = flat_valid.gather(1, top_idx)
+        # fewer than max_sv_per_event pairs (n_tracks^2 < K): pad with empty slots
+        n_missing = self.max_sv_per_event - top_idx.shape[1]
+        if n_missing > 0:
+            seeds = torch.cat([seeds, seeds.new_zeros(n_events, n_missing, 3)], dim=1)
+            seed_valid = torch.cat([seed_valid, seed_valid.new_zeros(n_events, n_missing)], dim=1)
+        return seeds.masked_fill(~seed_valid.unsqueeze(-1), float("nan")), seed_valid
+
+    def _suppress_duplicate_secondaries(self, sv_estimate, sv_chi2_per_dof, sv_is_valid):
+        """
+        keep (B, K): False for an SV within seed_merge_distance of a valid SV with lower chi2/ndf.
+        """
+        K = sv_estimate.shape[1]
+        dist = (sv_estimate.unsqueeze(2) - sv_estimate.unsqueeze(1)).nan_to_num().norm(dim=-1)
+        q1 = sv_chi2_per_dof.unsqueeze(2).nan_to_num(nan=float("inf"))
+        q2 = sv_chi2_per_dof.unsqueeze(1).nan_to_num(nan=float("inf"))
+        eye = torch.eye(K, device=sv_estimate.device, dtype=torch.bool).unsqueeze(0)
+        dominated = (sv_is_valid.unsqueeze(1) & (dist < self.seed_merge_distance) & (q2 < q1) & ~eye).any(dim=2)
+        return sv_is_valid & ~dominated
+
+    def _find_secondary_vertices(self, pv_fit, track_position, track_direction, track_weight, params):
+        """
+        SV search after the PV fit (module docstring steps 1-6): the sv_* outputs, displaced_mask,
+        displaced_weight and, with refit_pv, pv_refit.
+        """
+        n_events, n_tracks = track_weight.shape
+        K = self.max_sv_per_event
+        device, dtype = track_position.device, track_position.dtype
+        pv_position = pv_fit["vertex_estimate"].nan_to_num()
+
+        displaced_mask = ((pv_fit["track_dca"].nan_to_num() > self.min_track_pv_dca)
+                          & (params["beam_dca"].nan_to_num() > self.min_track_beam_dca)
+                          & params["usable"])
+        displaced_weight = track_weight * displaced_mask.to(track_weight.dtype)
+
+        seeds, seed_valid = self._seed_secondary_vertices(track_position, track_direction, displaced_mask)
+
+        sv_estimate = torch.full((n_events, K, 3), float("nan"), device=device, dtype=dtype)
+        sv_chi2 = torch.full((n_events, K), float("nan"), device=device, dtype=dtype)
+        sv_chi2_per_dof = torch.full((n_events, K), float("nan"), device=device, dtype=dtype)
+        sv_is_valid = torch.zeros((n_events, K), device=device, dtype=torch.bool)
+        sv_n_tracks = torch.zeros((n_events, K), device=device, dtype=torch.long)
+        sv_displacement = torch.full((n_events, K), float("nan"), device=device, dtype=dtype)
+        sv_track_mask = torch.zeros((n_events, K, n_tracks), device=device, dtype=torch.bool)
+        sv_track_dca = torch.full((n_events, K, n_tracks), float("nan"), device=device, dtype=dtype)
+
+        for k in range(K):
+            # candidates close enough to this seed (an empty slot's NaN seed becomes the origin)
+            in_sv = ((_track_dca_to_point(seeds[:, k].nan_to_num(), track_position, track_direction)
+                      < self.max_track_sv_doca) & (displaced_weight > 0))
+            sv_weight = displaced_weight * in_sv.to(displaced_weight.dtype)
+            fit = self._fit(track_position, track_direction, sv_weight, params)
+
+            n_used = sv_weight.gt(0).sum(dim=-1)
+            ndf = (2 * n_used.clamp(min=1) - 3).clamp(min=1).to(fit["chi_square"].dtype)
+            chi2_per_dof = (fit["chi_square"] / ndf).masked_fill(~fit["fit_is_valid"], float("nan"))
+            displacement = (fit["vertex_estimate"] - pv_position).norm(dim=-1)
+
+            is_ok = (seed_valid[:, k] & fit["fit_is_valid"] & (n_used >= self.min_sv_tracks)
+                     & (displacement >= self.min_sv_displacement)
+                     & (chi2_per_dof.nan_to_num(nan=float("inf")) <= self.max_sv_chi2_per_dof))
+
+            sv_estimate[:, k] = fit["vertex_estimate"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
+            sv_chi2[:, k] = fit["chi_square"].masked_fill(~is_ok, float("nan"))
+            sv_chi2_per_dof[:, k] = chi2_per_dof.masked_fill(~is_ok, float("nan"))
+            sv_is_valid[:, k] = is_ok
+            sv_n_tracks[:, k] = n_used.masked_fill(~is_ok, 0)
+            sv_displacement[:, k] = displacement.masked_fill(~is_ok, float("nan"))
+            sv_track_mask[:, k] = in_sv & is_ok.unsqueeze(-1)
+            sv_track_dca[:, k] = fit["track_dca"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
+
+        sv_is_valid = sv_is_valid & self._suppress_duplicate_secondaries(sv_estimate, sv_chi2_per_dof, sv_is_valid)
+        result = {
+            "sv_estimate": sv_estimate.masked_fill(~sv_is_valid.unsqueeze(-1), float("nan")),
+            "sv_is_valid": sv_is_valid,
+            "sv_chi2": sv_chi2.masked_fill(~sv_is_valid, float("nan")),
+            "sv_chi2_per_dof": sv_chi2_per_dof.masked_fill(~sv_is_valid, float("nan")),
+            "sv_displacement": sv_displacement.masked_fill(~sv_is_valid, float("nan")),
+            "sv_n_tracks": sv_n_tracks.masked_fill(~sv_is_valid, 0),
+            "sv_track_mask": sv_track_mask & sv_is_valid.unsqueeze(-1),
+            "sv_track_dca": sv_track_dca.masked_fill(~sv_is_valid.unsqueeze(-1), float("nan")),
+            "displaced_mask": displaced_mask,
+            "displaced_weight": displaced_weight,
+        }
+        if self.refit_pv:
+            refit_weight = track_weight * (~result["sv_track_mask"].any(dim=1)).to(track_weight.dtype)
+            result["pv_refit"] = self._fit(track_position, track_direction, refit_weight, params)
+        return result
+
     def forward(
         self,
         class_probs,
@@ -483,34 +427,27 @@ class VertexHead(nn.Module):
     ):
         """
         Args:
-            class_probs: (n_events, n_tracks, 2) P(slot empty), P(slot real).
-            mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
-            points: (n_events, n_hits, 4) hits as TPCBatchDataset yields them, normalized
-                (E, eta, phi, r); inverted to (E, x, y, z) in cm before fitting.
-            padding_mask: (n_events, n_hits) True = real hit.
+            class_probs: (B, T, 2) P(slot empty), P(slot real).
+            mask_probs: (B, N, T) hit-to-track assignment.
+            points: (B, N, 4) normalized (E, eta, phi, r) hits, as TPCBatchDataset yields them.
+            padding_mask: (B, N) True = real hit.
 
         Returns:
-            dict, positions in cm:
-                vertex_estimate: (n_events, 3) fitted vertex; NaN where fit_is_valid is False.
-                chi_square: (n_events,) weighted sum of squared DCAs at the vertex; no ndf applied.
-                fit_is_valid: (n_events,) bool; False with fewer than 2 usable, non-parallel tracks.
-                track_position: (n_events, n_tracks, 3) innermost assigned hit of each track.
-                track_direction: (n_events, n_tracks, 3) straight-line flight direction.
-                track_weight: (n_events, n_tracks) weight after quality masking; tracks the helix fit
-                    later excludes for too few hits still show their weight here.
-                track_quality_mask: (n_events, n_tracks) bool, True = track passed the noise (pT) and
-                    beam-line cuts.
-                track_closest_approach_point: (n_events, n_tracks, 3) point on each track nearest the vertex.
-                track_dca: (n_events, n_tracks) each track's distance of closest approach.
+            dict, the PV (with find_secondary: the refit where used_refit, else the original fit):
+                vertex_estimate (B, 3), chi_square (B,), fit_is_valid (B,); NaN where not valid.
+                track_closest_approach_point (B, T, 3), track_dca (B, T): each track to the PV.
+                track_position, track_direction (B, T, 3): innermost hit, straight-line direction.
+                track_weight, track_quality_mask (B, T): fit weight, pT / beam-line cut.
+            With find_secondary also (NaN / False / 0 where sv_is_valid is False):
+                sv_estimate (B, K, 3); sv_is_valid, sv_chi2, sv_chi2_per_dof, sv_displacement,
+                    sv_n_tracks (B, K); sv_track_mask, sv_track_dca (B, K, T).
+                displaced_mask, displaced_weight (B, T): SV candidates and their weight.
+                pv_original: dict, the original PV fit.
+                used_refit (B,): the reported PV is the refit.
         """
-        # padded hits are -100 in every column, which overflows sinh(eta); any finite value will do
-        points, hit_r = _unnormalize_hits(points.masked_fill(~padding_mask.unsqueeze(-1), 0.0))
-        track_position, total_hit_weight, is_assigned = _track_position_from_hits(
-            points, hit_r, mask_probs, padding_mask)
-        params = _track_params_from_hits(points, hit_r, is_assigned, self.noise_pt_threshold,
-                                         Bz=self.Bz, scaling_factor=self.scaling_factor,
-                                         is_cosmics=self.is_cosmics)
-        track_reg_result = params["track_reg_result"]  
+        params = self.momentum_head(mask_probs, points, padding_mask)
+        track_position, total_hit_weight = params["track_position"], params["total_hit_weight"]
+        track_reg_result = params["track_reg_result"]
 
         theta = track_reg_result[..., 1]
         sin_theta = torch.sin(theta)
@@ -530,30 +467,32 @@ class VertexHead(nn.Module):
 
         track_weight = track_weight * params["usable"].to(dtype=track_weight.dtype)
 
-        fit = _fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
+        fit = self._fit(track_position, track_direction, track_weight, params)
 
-        if (self.use_helix and self.Bz != 0.0):
-            fit = _fit_vertex_by_helix_closest_approach(
-                params["circle_centre"],
-                params["R_s"],
-                params["zslope"],
-                params["z0"],
-                track_weight,               # already zeroed for bad tracks
-                n_iterations=self.helix_iterations,
-                linear_fit=fit,
-                is_cosmics=self.is_cosmics,
-            )
-        elif self.Bz == 0.0:
-            print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
-        
-        return {
-            "vertex_estimate": fit["vertex_estimate"],
-            "chi_square": fit["chi_square"],
-            "fit_is_valid": fit["fit_is_valid"],
+        result = {
             "track_position": track_position,
             "track_direction": track_direction,
             "track_weight": track_weight,
             "track_quality_mask": params["usable"],
+        }
+        if self.find_secondary:
+            secondary = self._find_secondary_vertices(fit, track_position, track_direction, track_weight, params)
+            refit = secondary.pop("pv_refit", None)
+            result.update(secondary)
+            result["pv_original"] = fit
+            # the refit PV where the event has an SV and the refit is valid; else the original PV fit
+            used_refit = secondary["sv_is_valid"].any(dim=1)
+            if refit is not None:
+                used_refit = used_refit & refit["fit_is_valid"]
+                fit = {k: torch.where(used_refit.view(-1, *[1] * (v.dim() - 1)), refit[k], v) for k, v in fit.items()}
+            else:
+                used_refit = torch.zeros_like(used_refit)
+            result["used_refit"] = used_refit
+        result.update({
+            "vertex_estimate": fit["vertex_estimate"],
+            "chi_square": fit["chi_square"],
+            "fit_is_valid": fit["fit_is_valid"],
             "track_closest_approach_point": fit["track_closest_approach_point"],
             "track_dca": fit["track_dca"],
-        }
+        })
+        return result
