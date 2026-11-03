@@ -744,8 +744,8 @@ class DownstreamTrainer():
 
         Args:
             track_ckpt: train_track_finding.py checkpoint.
-            momentum_ckpt: optional MomentumHead checkpoint to use instead of vertex_bz (obsolete with
-                the momentum task, which moves to ACTS).
+            momentum_ckpt: optional MomentumHead checkpoint to use instead of vertex_bz (experimental, as
+                the momentum task: ACTS computes momentum).
         """
         n_feat = 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone
         self.down_model = MambaAttentionHead(
@@ -765,7 +765,7 @@ class DownstreamTrainer():
         bz = float(getattr(self.params, "vertex_bz", 1.4))
 
         momentum_head = None
-        if momentum_ckpt:            # obsolete momentum task: imported only when its checkpoint is used
+        if momentum_ckpt:            # experimental momentum task: imported only when its checkpoint is used
             from momentumhead import MomentumHead
             momentum_head = MomentumHead.from_checkpoint(momentum_ckpt)
 
