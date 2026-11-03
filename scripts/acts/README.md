@@ -5,9 +5,25 @@ so it never touches `fm4npp-env`. It is used as a separate program for reference
 package's own (pure-torch, MIT) track maths, not for training. ACTS is run, not copied, so its licence
 places no conditions on this repository's code.
 
-## Build (once, by someone in the `docker` group)
+## Build (once)
 
-From the repository root (the ACTS compile takes a while; set `JOBS` to the cores you can use):
+The ACTS compile takes a while; set `JOBS` to the cores you can use. Either route gives the same image.
+
+### Without docker rights: Singularity
+
+From `scripts/acts` (`--fakeroot` needs the admin to have enabled it for your user; without it the build
+stops with a fakeroot or subuid error):
+
+```bash
+JOBS=8 singularity build --fakeroot acts-ref-48.2.0.sif acts.def
+```
+
+The build ends by importing `acts`; if that line prints `acts OK`, the image works. Put the `.sif` in a
+shared location.
+
+### With docker rights (the `docker` group)
+
+From the repository root:
 
 ```bash
 docker build --build-arg JOBS=8 -t acts-ref:48.2.0 scripts/acts
