@@ -3,8 +3,7 @@ vertexhead.py: primary- and secondary-vertex fit from track-finder output.
 
 Tracks are ACTS bound perigee parameters (d0, z0, phi, theta, q/p, t) w.r.t. the beam spot, in cm: either
 fitted from each track's assigned hits by the track model below (a Taubin circle in x-y and z against
-signed arc length along it; with use_acts, ACTS propagates that fitted helix to the beam spot), or given
-directly (track_parameters, e.g. from ACTS, in mm). The PV is the
+signed arc length along it), or given directly (track_parameters, e.g. from ACTS, in mm). The PV is the
 weighted least-squares point of closest approach to the usable tracks' straight lines at their perigee
 (weight = soft hit count x P(real)), refined by an iterative helix fit; an event where the helix fit
 gives no valid vertex (or Bz = 0) keeps the straight-line result.
@@ -313,91 +312,6 @@ def _circle_from_perigee(perigee, Bz, scaling_factor=100.0, beam_position=(0.0, 
     circle_centre = torch.stack([pca_x + R_s * sin_phi, pca_y - R_s * cos_phi], dim=-1)
     return circle_centre, R_s, torch.cos(theta) / torch.sin(theta), z0, pT, d0.abs()
 
-# ------------------------------------------------------------------------------------------------
-# ACTS hooks (optional; only use_acts and acts_perigee_parameters import acts). Needs the ACTS Python
-# bindings: acts-project/acts built with ACTS_BUILD_PYTHON_BINDINGS=ON, or conda-forge "acts" (Linux,
-# macOS); the "acts" package on PyPI is unrelated. Written against the binding source of ACTS main
-# (2026-11-02): Surface.createPerigee, BoundTrackParameters.createCurvilinear,
-# EigenVoidPropagator.propagateToSurface. ACTS's Python side cannot construct perigee-bound parameters
-# directly, so each track starts as curvilinear parameters and is propagated onto the perigee surface.
-# ------------------------------------------------------------------------------------------------
-
-def _import_acts():
-    try:
-        import acts
-    except ImportError as error:
-        raise ImportError("use_acts / acts_perigee_parameters need the ACTS Python bindings (acts-project/acts "
-                          "built with ACTS_BUILD_PYTHON_BINDINGS=ON, or conda-forge acts)") from error
-    return acts
-
-def acts_perigee_parameters(position, direction, qop, Bz=1.4, beam_position=(0.0, 0.0), field=None,
-                            particle_hypothesis=None, backward=False, length_scale=0.1):
-    """
-    Bound perigee parameters built in ACTS: each track's state becomes curvilinear parameters, propagated
-    (EigenStepper, no geometry) onto the perigee surface at the beam spot.
-
-    Args:
-        position (B, T, 3) cm, direction (B, T, 3) unit, qop (B, T) e/GeV: a state on each track;
-            non-finite = no track. E.g. VertexHead's track_position, track_direction and
-            track_parameters[..., 4] give each track's perigee state.
-        Bz: Tesla, for the default field acts.ConstantBField((0, 0, Bz)).
-        beam_position: (x, y) of the beam line, cm; the perigee surface is at (x, y, 0).
-        field: an ACTS magnetic field provider (e.g. a field map) instead of the constant field.
-        particle_hypothesis: acts.ParticleHypothesis (default pion).
-        backward: the perigee lies behind the state (e.g. a state at the innermost hit): the reversed,
-            charge-conjugated track (same helix) is propagated, and the result rebuilt at the perigee.
-        length_scale: cm per ACTS length unit (mm: 0.1).
-
-    Returns:
-        (B, T, 6) float64 tensor in ACTS units (d0, z0 mm, phi, theta, q/p e/GeV, t mm), NaN where there
-        is no track or the propagation failed; and a list (B x T, row-major) of acts.BoundTrackParameters
-        on the perigee surface (None for those). ACTS takes the first closest approach along the propagation:
-        for a looping track far from the beam (unusable anyway) that can be another turn than the track
-        model's, so z0 differs by whole turns.
-    """
-    acts = _import_acts()
-    u = acts.UnitConstants
-    field = acts.ConstantBField(acts.Vector3(0.0, 0.0, Bz * u.T)) if field is None else field
-    propagator = acts.EigenVoidPropagator(acts.EigenStepper(field), acts.VoidNavigator())
-    options = acts.PropagatorPlainOptions(acts.GeometryContext.dangerouslyDefaultConstruct(), acts.MagneticFieldContext())
-    bx, by = beam_position[0] / length_scale * u.mm, beam_position[1] / length_scale * u.mm
-    surface = acts.Surface.createPerigee(acts.Vector3(bx, by, 0.0))
-    hypothesis = acts.ParticleHypothesis.pion if particle_hypothesis is None else particle_hypothesis
-    flip = -1.0 if backward else 1.0
-
-    positions = position.detach().double().cpu().reshape(-1, 3) / length_scale * u.mm
-    directions = direction.detach().double().cpu().reshape(-1, 3) * flip
-    qops = qop.detach().double().cpu().reshape(-1) * flip * u.e / u.GeV
-    out = torch.full((positions.shape[0], 6), float("nan"), dtype=torch.float64)
-    bound = []
-    for i in range(positions.shape[0]):
-        if not (torch.isfinite(positions[i]).all() and torch.isfinite(directions[i]).all() and torch.isfinite(qops[i])):
-            bound.append(None)
-            continue
-        try:
-            end = propagator.propagateToSurface(
-                start=acts.BoundTrackParameters.createCurvilinear(
-                    pos4=acts.Vector4(*positions[i].tolist(), 0.0), dir=acts.Vector3(*directions[i].tolist()),
-                    qOverP=qops[i].item(), cov=None, particleHypothesis=hypothesis),
-                target=surface, options=options)
-            if backward:
-                # the reversed track's perigee: d0 and the direction flip with it, z0 doesn't; rebuilt
-                # forwards at the perigee point (a zero-length propagation onto the surface)
-                d0, z0, phi, theta, q_over_p, t = list(end.parameters)
-                d0, phi, theta, q_over_p, t = -d0, math.remainder(phi + math.pi, 2 * math.pi), math.pi - theta, -q_over_p, -t
-                end = propagator.propagateToSurface(
-                    start=acts.BoundTrackParameters.createCurvilinear(
-                        pos4=acts.Vector4(bx - d0 * math.sin(phi), by + d0 * math.cos(phi), z0, t), phi=phi,
-                        theta=theta, qOverP=q_over_p, cov=None, particleHypothesis=hypothesis),
-                    target=surface, options=options)
-        except RuntimeError:
-            bound.append(None)
-            continue
-        out[i] = torch.tensor(list(end.parameters), dtype=torch.float64)
-        bound.append(end)
-    out[:, [0, 1, 5]] /= u.mm
-    return out.reshape(*qop.shape, 6).to(qop.device), bound
-
 def _fit_vertex_by_closest_approach(
     track_position,
     track_direction,
@@ -571,10 +485,6 @@ class VertexHead(nn.Module):
         normalization: the dataset's hit normalization (see _unnormalize_hits); TPC_NORMALIZATION if None.
         momentum_head: an (obsolete) MomentumHead whose config() supplies the eight settings above.
         track_parameter_length_scale: cm per length unit of forward's track_parameters (ACTS mm: 0.1).
-        use_acts: ACTS builds the perigee parameters from the hit fit (acts_perigee_parameters: the fitted
-            helix's state nearest the innermost hit, propagated to the beam spot); needs the ACTS bindings.
-        acts_field: ACTS magnetic field provider for use_acts (e.g. a field map); acts.ConstantBField(Bz) if None.
-        acts_particle_hypothesis: acts.ParticleHypothesis for use_acts; pion if None.
         find_secondary: find SVs and report the refitted PV; False = original PV-only fit.
         min_track_pv_dca, min_track_beam_dca: cm, SV candidate cuts.
         max_pair_doca, max_track_sv_doca: cm, seeding and attachment cuts.
@@ -598,9 +508,6 @@ class VertexHead(nn.Module):
         normalization: dict = None,
         momentum_head=None,
         track_parameter_length_scale: float = 0.1,
-        use_acts: bool = False,
-        acts_field=None,
-        acts_particle_hypothesis=None,
         convergence_tolerance: float = 1e-4,
         minimum_total_weight: float = 1e-6,
         gate_width_pt: float = 0.05,
@@ -622,9 +529,6 @@ class VertexHead(nn.Module):
         self.helix_iterations = helix_iterations
         self.convergence_tolerance = convergence_tolerance
         self.track_parameter_length_scale = track_parameter_length_scale
-        self.use_acts = use_acts
-        self.acts_field = acts_field
-        self.acts_particle_hypothesis = acts_particle_hypothesis
         self.minimum_total_weight = minimum_total_weight
         self.find_secondary = find_secondary
         self.min_track_pv_dca = min_track_pv_dca
@@ -819,8 +723,7 @@ class VertexHead(nn.Module):
     ):
         """
         Two inputs: track-finder output (class_probs, mask_probs, points, padding_mask), whose hits the
-        track model fits (with use_acts, ACTS then builds the perigee parameters); or track_parameters,
-        e.g. from ACTS, used as they are.
+        track model fits; or track_parameters, e.g. from ACTS, used as they are.
 
         Args:
             class_probs: (B, T, 2) P(slot empty), P(slot real); with track_parameters optional (P(real) = 1).
@@ -836,8 +739,7 @@ class VertexHead(nn.Module):
             dict, the PV (with find_secondary: the refit where used_refit, else the original fit):
                 vertex_estimate (B, 3), chi_square (B,), fit_is_valid (B,); NaN where not valid.
                 track_closest_approach_point (B, T, 3), track_dca (B, T): each track to the PV.
-                track_parameters (B, T, 6): perigee parameters in cm; NaN without a fit. t = 0 from the hit fit;
-                    with use_acts, ACTS's c t from the innermost-hit state (t = 0) back to the perigee (< 0).
+                track_parameters (B, T, 6): perigee parameters in cm (t = 0 from hits); NaN without a fit.
                 track_position, track_direction (B, T, 3): perigee point and direction there.
                 track_weight, track_quality_mask (B, T): fit weight, pT / beam-line cut.
             With find_secondary also (NaN / False / 0 where sv_is_valid is False):
@@ -847,13 +749,11 @@ class VertexHead(nn.Module):
                 pv_original: dict, the original PV fit.
                 used_refit (B,): the reported PV is the refit.
         """
-        if self.is_cosmics and (self.use_acts or track_parameters is not None):
-            raise NotImplementedError("track_parameters input and use_acts are not supported with is_cosmics")
         if track_parameters is None:
             # track model: hits in cm (padded hits are -100 in every column, which overflows sinh(eta); any
             # finite value will do), hard hit assignment, then each track's circle and z line
             hits, hit_r = _unnormalize_hits(points.masked_fill(~padding_mask.unsqueeze(-1), 0.0), self.normalization)
-            innermost_hit, total_hit_weight, is_assigned = _track_position_from_hits(hits, hit_r, mask_probs, padding_mask)
+            _, total_hit_weight, is_assigned = _track_position_from_hits(hits, hit_r, mask_probs, padding_mask)
             params = _helix_from_hits(hits, hit_r, is_assigned, self.noise_pt_threshold, Bz=self.Bz,
                                       scaling_factor=self.scaling_factor, valid_radius=self.valid_radius,
                                       min_hits=self.min_hits, is_cosmics=self.is_cosmics,
@@ -862,34 +762,17 @@ class VertexHead(nn.Module):
             params.update({k: params[k].to(hits.dtype) for k in ("theta", "circle_centre", "R_s", "zslope", "z0")})
             theta = params["theta"].double()
             q = torch.sign(params["R_s"].double()) * (1.0 if self.Bz >= 0 else -1.0)
-            if self.use_acts:
-                # ACTS builds the perigee: the fitted helix's state nearest the innermost hit, propagated
-                # back to the beam spot in acts_field; then used as given track_parameters (ACTS units)
-                centre, R_s = params["circle_centre"].double(), params["R_s"].double()
-                n = innermost_hit[..., :2].double() - centre
-                n = n / n.norm(dim=-1, keepdim=True).clamp(min=1e-12)
-                start_xy = centre + R_s.abs().unsqueeze(-1) * n
-                start_z = (_arc_length(start_xy[..., 0], start_xy[..., 1], centre[..., 0], centre[..., 1], R_s,
-                                       self.beam_position) * params["zslope"].double() + params["z0"].double())
-                t_xy = torch.sign(R_s).unsqueeze(-1) * torch.stack([n[..., 1], -n[..., 0]], dim=-1)
-                theta = torch.atan2(torch.ones_like(theta), params["zslope"].double())
-                track_parameters, _ = acts_perigee_parameters(
-                    torch.cat([start_xy, start_z.unsqueeze(-1)], dim=-1),
-                    torch.cat([torch.sin(theta).unsqueeze(-1) * t_xy, torch.cos(theta).unsqueeze(-1)], dim=-1),
-                    q * torch.sin(theta) / params["pT"], Bz=self.Bz, beam_position=self.beam_position,
-                    field=self.acts_field, particle_hypothesis=self.acts_particle_hypothesis, backward=True,
-                    length_scale=self.track_parameter_length_scale)
-                track_parameters, track_weight = track_parameters.to(total_hit_weight.dtype), total_hit_weight
-            else:
-                perigee = _perigee_from_circle(params["circle_centre"].double(), params["R_s"].double(),
-                                               params["zslope"].double(), params["z0"].double(),
-                                               q * torch.sin(theta) / params["pT"], self.beam_position)
-                if self.is_cosmics:      # z line against x: the perigee z is the line at the perigee x
-                    pca_x = self.beam_position[0] - perigee[..., 0] * torch.sin(perigee[..., 2])
-                    perigee[..., 1] = params["zslope"].double() * pca_x + params["z0"].double()
-                    perigee[..., 3] = theta
-                base_weight = class_probs[..., 1] * total_hit_weight
-        if track_parameters is not None:
+            perigee = _perigee_from_circle(params["circle_centre"].double(), params["R_s"].double(),
+                                           params["zslope"].double(), params["z0"].double(),
+                                           q * torch.sin(theta) / params["pT"], self.beam_position)
+            if self.is_cosmics:      # z line against x: the perigee z is the line at the perigee x
+                pca_x = self.beam_position[0] - perigee[..., 0] * torch.sin(perigee[..., 2])
+                perigee[..., 1] = params["zslope"].double() * pca_x + params["z0"].double()
+                perigee[..., 3] = theta
+            base_weight = class_probs[..., 1] * total_hit_weight
+        else:
+            if self.is_cosmics:
+                raise NotImplementedError("track_parameters input is not supported with is_cosmics")
             perigee = track_parameters.double().clone()
             perigee[..., [0, 1, 5]] = perigee[..., [0, 1, 5]] * self.track_parameter_length_scale
             fit_ok = torch.isfinite(perigee[..., :5]).all(dim=-1)
