@@ -58,5 +58,26 @@ If the build printed `WARNING: acts import check failed`, the image is still usa
 singularity exec acts-ref-48.2.0.sif bash -c "source /opt/acts-build/python/setup.sh && python3 my_script.py"
 ```
 
+## Reference check: the package's track maths against ACTS
+
+Three steps, from the repository root: generate test tracks and MomentumHead fits in the training
+environment, let ACTS compute their perigee parameters in the container, compare in the training
+environment (ACTS and the torch maths against the exact answer and each other, MomentumHead's fit
+quality, and the time per track of each method):
+
+```bash
+python scripts/acts/compare_acts.py make states.npz
+```
+
+```bash
+singularity exec acts-ref-48.2.0.sif acts-python scripts/acts/acts_reference.py states.npz acts_out.npz
+```
+
+```bash
+python scripts/acts/compare_acts.py compare states.npz acts_out.npz
+```
+
+Add `--device cuda` to `make` (MomentumHead) and `compare` (the torch maths) to time them on the GPU.
+
 The container has Python 3.12 and NumPy only (no torch): exchange data with the training environment
 through files (e.g. `.npz`).
