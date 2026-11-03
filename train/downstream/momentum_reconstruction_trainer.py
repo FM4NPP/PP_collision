@@ -1,6 +1,9 @@
 """
 momentum_reconstruction_trainer.py: MomentumHead after an already-trained track-finding head.
 
+OBSOLETE (2026-11-02): momentum is to be calculated in ACTS, not in this package. Kept, not
+deleted, so the momentum task can be picked up again. Importing this module raises a FutureWarning.
+
     frozen backbone -> frozen track finder (train_track_finding.py checkpoint) -> MomentumHead
 
 DownstreamTrainer is standalone: its setup is a verbatim copy of track_finding_trainer's, and
@@ -52,8 +55,12 @@ from trackinghead import *
 from loss import *
 from cached_dataset import get_cached_data_loader
 import csv
+import warnings
 
 from momentumhead import MomentumHead
+
+warnings.warn("momentum_reconstruction_trainer is obsolete: momentum is to be calculated in ACTS (kept for a possible "
+              "return, not maintained)", FutureWarning, stacklevel=2)
 from loss import assign_points_to_masks
 
 PAD_VALUE = -100
@@ -92,12 +99,12 @@ def write_per_point_csv(columns, path):
             writer.writerow(["" if v != v else v for v in row])    # v != v only for NaN
 
 
-def track_momentum(tracks):
+def track_momentum(tracks, beam_position=(0.0, 0.0)):
     """
     Per-track momentum from MomentumHead's output.
 
     phi is taken where the circle passes closest to the beam line (where primary truth is defined):
-    direction s (c_x, -c_y) / |c| for centre c and s = sign(R_s).
+    direction s (c_x, -c_y) / |c| for centre c (relative to the beam line) and s = sign(R_s).
 
     Returns:
         dict of (B, T) float64 pt, charge, theta, phi, px, py, pz; NaN where fit_ok is False.
@@ -106,7 +113,10 @@ def track_momentum(tracks):
     pt = tracks["pT"].double()
     charge = torch.sign(tracks["track_reg_result"][..., 0].double()).masked_fill(~fit_ok, float("nan"))
     theta = tracks["track_reg_result"][..., 1].double().masked_fill(~fit_ok, float("nan"))
-    centre, s = tracks["circle_centre"].double(), torch.sign(tracks["R_s"].double())
+    # centre relative to the beam line (beam_position: x, y in cm, as in MomentumHead)
+    centre = tracks["circle_centre"].double() - torch.tensor(beam_position, dtype=torch.float64,
+                                                            device=tracks["circle_centre"].device)
+    s = torch.sign(tracks["R_s"].double())
     phi = torch.atan2(s * centre[..., 0], -s * centre[..., 1])
     return {"pt": pt, "charge": charge, "theta": theta, "phi": phi,
             "px": pt * torch.cos(phi), "py": pt * torch.sin(phi), "pz": pt / torch.tan(theta)}
@@ -837,7 +847,7 @@ class DownstreamTrainer():
                     out = self.down_model(grouped, feature=None)
 
             tracks = self.momentum_head(out["mask_probs"].float(), grouped, mask)
-            momentum = track_momentum(tracks)
+            momentum = track_momentum(tracks, self.momentum_head.beam_position)
             for r in match_tracks_to_truth(tracks, momentum, label, reg, mask):
                 r["event"] += n_events
                 rows.append(r)

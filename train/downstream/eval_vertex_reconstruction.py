@@ -79,7 +79,8 @@ def main():
         "--momentum_ckpt",
         type=str,
         default=None,
-        help="MomentumHead checkpoint for the PV fit's track parameters (default: one built from --bz)",
+        help="MomentumHead checkpoint for the PV fit's track parameters (default: one built from --bz); "
+             "obsolete with the momentum task, which moves to ACTS",
     )
     parser.add_argument(
         "--run_num",
@@ -269,7 +270,7 @@ def save_results(result, trainer, params, args, checkpoint_path, logfile):
         "pretrained_ckpt": params.pretrained_ckpt,
         "track_ckpt": os.path.abspath(checkpoint_path),
         "momentum_ckpt": os.path.abspath(args.momentum_ckpt) if args.momentum_ckpt else None,
-        "momentum_config": trainer.vertex_head.momentum_head.config(),
+        "track_fit_config": trainer.vertex_head.track_fit_config(),
         "max_eval_events": args.max_eval_events,
         "metrics": result["metrics"],
     }

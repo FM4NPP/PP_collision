@@ -55,7 +55,6 @@ from cached_dataset import get_cached_data_loader
 import csv
 
 from vertexhead import VertexHead
-from momentumhead import MomentumHead
 from downstream_util import get_vertex_label
 from loss import compute_vertex_metrics, assign_points_to_masks
 
@@ -745,7 +744,8 @@ class DownstreamTrainer():
 
         Args:
             track_ckpt: train_track_finding.py checkpoint.
-            momentum_ckpt: optional MomentumHead checkpoint to use instead of vertex_bz.
+            momentum_ckpt: optional MomentumHead checkpoint to use instead of vertex_bz (obsolete with
+                the momentum task, which moves to ACTS).
         """
         n_feat = 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone
         self.down_model = MambaAttentionHead(
@@ -764,7 +764,10 @@ class DownstreamTrainer():
 
         bz = float(getattr(self.params, "vertex_bz", 1.4))
 
-        momentum_head = MomentumHead.from_checkpoint(momentum_ckpt) if momentum_ckpt else None
+        momentum_head = None
+        if momentum_ckpt:            # obsolete momentum task: imported only when its checkpoint is used
+            from momentumhead import MomentumHead
+            momentum_head = MomentumHead.from_checkpoint(momentum_ckpt)
 
         # PV + SV head (secondary vertexing is VertexHead's default); SV cuts can be tuned via params
         def _p(name, default):

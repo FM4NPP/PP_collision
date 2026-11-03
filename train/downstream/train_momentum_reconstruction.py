@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
+OBSOLETE (2026-11-02): momentum is to be calculated in ACTS, not in this package. Kept, not
+deleted, so the momentum task can be picked up again. Running it raises a FutureWarning.
+
 Momentum reconstruction training (phase 2), laid out like train_track_finding.py. MomentumHead has
 no trainable parameters yet, so train() raises NotImplementedError; evaluate with
 eval_momentum_reconstruction.py. Artifacts: {config}_nerf_momentum_head_d{N}_{run}_seed{seed}.
 """
 import os
 import sys
+import warnings
 import argparse
 import gc
 import random
@@ -36,6 +40,8 @@ def set_seed(seed):
 
 
 def main():
+    warnings.warn("train_momentum_reconstruction.py is obsolete: momentum is to be calculated in ACTS (kept for a possible "
+                  "return, not maintained)", FutureWarning, stacklevel=2)
     parser = argparse.ArgumentParser(description="Downstream momentum reconstruction training script")
     parser.add_argument("--yaml_config", default=DEFAULT_YAML, type=str, help="Path to YAML config file")
     parser.add_argument("--config", default=DEFAULT_CONFIG, type=str, help="Model config name")

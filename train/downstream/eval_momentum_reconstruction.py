@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+OBSOLETE (2026-11-02): momentum is to be calculated in ACTS, not in this package. Kept, not
+deleted, so the momentum task can be picked up again. Running it raises a FutureWarning.
+
 Evaluate momentum reconstruction (MomentumHead) after a trained track-finding head, the way
 eval_track_finding.py evaluates that head. Run from train/downstream:
 
@@ -16,6 +19,7 @@ _momentum_head.pth (for eval_vertex_reconstruction.py --momentum_ckpt).
 """
 import os
 import sys
+import warnings
 import argparse
 import gc
 import json
@@ -35,6 +39,8 @@ DEFAULT_TRACK_CONFIG = "d9_m1_k30_p20"    # train_track_finding.py's name for th
 
 
 def main():
+    warnings.warn("eval_momentum_reconstruction.py is obsolete: momentum is to be calculated in ACTS (kept for a possible "
+                  "return, not maintained)", FutureWarning, stacklevel=2)
     parser = argparse.ArgumentParser(
         description="Evaluation script for the momentum reconstruction downstream task"
     )
