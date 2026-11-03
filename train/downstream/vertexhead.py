@@ -28,7 +28,7 @@ import torch.nn as nn
 
 # ------------------------------------------------------------------------------------------------
 # Track model: hit normalization, hard hit-to-track assignment, and each track's circle and z line
-# (moved here from momentumhead.py, which is obsolete and imports these; its momentum-only outputs,
+# (moved here from momentumhead.py, which is experimental and imports these; its momentum-only outputs,
 # track_reg_result and radius, stay there)
 # ------------------------------------------------------------------------------------------------
 
@@ -483,7 +483,7 @@ class VertexHead(nn.Module):
         min_hits: assigned hits needed for the circle and z-line fits.
         beam_position: (x, y) of the beam line, cm.
         normalization: the dataset's hit normalization (see _unnormalize_hits); TPC_NORMALIZATION if None.
-        momentum_head: an (obsolete) MomentumHead whose config() supplies the eight settings above.
+        momentum_head: an (experimental) MomentumHead whose config() supplies the eight settings above.
         track_parameter_length_scale: cm per length unit of forward's track_parameters (ACTS mm: 0.1).
         find_secondary: find SVs and report the refitted PV; False = original PV-only fit.
         min_track_pv_dca, min_track_beam_dca: cm, SV candidate cuts.
@@ -541,7 +541,7 @@ class VertexHead(nn.Module):
         self.max_sv_chi2_per_dof = max_sv_chi2_per_dof
         self.max_sv_per_event = max_sv_per_event
         self.refit_pv = refit_pv
-        # track-model settings (an obsolete MomentumHead's config() overrides them)
+        # track-model settings (an experimental MomentumHead's config() overrides them)
         settings = dict(Bz=Bz, is_cosmics=is_cosmics, scaling_factor=scaling_factor,
                         noise_pt_threshold=noise_pt_threshold, valid_radius=valid_radius, min_hits=min_hits,
                         beam_position=beam_position, normalization=normalization)
@@ -578,7 +578,7 @@ class VertexHead(nn.Module):
         self.noise_pt_threshold = noise_pt_threshold
 
     def track_fit_config(self):
-        """The track-model settings (the keys of an obsolete MomentumHead's config())."""
+        """The track-model settings (the keys of an experimental MomentumHead's config())."""
         return {k: getattr(self, k) for k in ("Bz", "is_cosmics", "scaling_factor", "noise_pt_threshold",
                                               "valid_radius", "min_hits", "beam_position", "normalization")}
 

@@ -1,8 +1,9 @@
 """
 momentum_reconstruction_trainer.py: MomentumHead after an already-trained track-finding head.
 
-OBSOLETE (2026-11-02): momentum is to be calculated in ACTS, not in this package. Kept, not
-deleted, so the momentum task can be picked up again. Importing this module raises a FutureWarning.
+EXPERIMENTAL (2026-11-03): ACTS computes momentum (scripts/acts); this torch route is kept
+experimental, so it can be picked up again, and is not maintained like the main tasks.
+Importing this module raises a UserWarning.
 
     frozen backbone -> frozen track finder (train_track_finding.py checkpoint) -> MomentumHead
 
@@ -59,8 +60,8 @@ import warnings
 
 from momentumhead import MomentumHead
 
-warnings.warn("momentum_reconstruction_trainer is obsolete: momentum is to be calculated in ACTS (kept for a possible "
-              "return, not maintained)", FutureWarning, stacklevel=2)
+warnings.warn("momentum_reconstruction_trainer is experimental: momentum is computed in ACTS (scripts/acts); this torch "
+              "route is kept but not maintained", UserWarning, stacklevel=2)
 from loss import assign_points_to_masks
 
 PAD_VALUE = -100

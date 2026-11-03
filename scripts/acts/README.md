@@ -1,9 +1,10 @@
 # ACTS reference container
 
 Unmodified [ACTS](https://github.com/acts-project/acts) (MPL-2.0) with its Python bindings, in a container,
-so it never touches `fm4npp-env`. It is used as a separate program for reference checks of the
-package's own (pure-torch, MIT) track maths, not for training. ACTS is run, not copied, so its licence
-places no conditions on this repository's code.
+so it never touches `fm4npp-env`. ACTS is how this package computes momentum and track parameters. It is
+run as a separate program and exchanges data through files; it is run, not copied, so its licence places
+no conditions on this repository's code. The package's own pure-torch alternative is kept, experimental,
+in `train/downstream/momentumhead.py`, and checked against ACTS below.
 
 ## Build (once)
 
@@ -58,7 +59,7 @@ If the build printed `WARNING: acts import check failed`, the image is still usa
 singularity exec acts-ref-48.2.0.sif bash -c "source /opt/acts-build/python/setup.sh && python3 my_script.py"
 ```
 
-## Reference check: the package's track maths against ACTS
+## Reference check: the experimental torch maths against ACTS
 
 Three steps, from the repository root: generate test tracks and MomentumHead fits in the training
 environment, let ACTS compute their perigee parameters in the container, compare in the training

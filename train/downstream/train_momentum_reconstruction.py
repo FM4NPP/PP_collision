@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-OBSOLETE (2026-11-02): momentum is to be calculated in ACTS, not in this package. Kept, not
-deleted, so the momentum task can be picked up again. Running it raises a FutureWarning.
+EXPERIMENTAL (2026-11-03): ACTS computes momentum (scripts/acts); this torch route is kept
+experimental, so it can be picked up again, and is not maintained like the main tasks.
+Running it raises a UserWarning.
 
 Momentum reconstruction training (phase 2), laid out like train_track_finding.py. MomentumHead has
 no trainable parameters yet, so train() raises NotImplementedError; evaluate with
@@ -40,8 +41,8 @@ def set_seed(seed):
 
 
 def main():
-    warnings.warn("train_momentum_reconstruction.py is obsolete: momentum is to be calculated in ACTS (kept for a possible "
-                  "return, not maintained)", FutureWarning, stacklevel=2)
+    warnings.warn("train_momentum_reconstruction.py is experimental: momentum is computed in ACTS (scripts/acts); this torch "
+                  "route is kept but not maintained", UserWarning, stacklevel=2)
     parser = argparse.ArgumentParser(description="Downstream momentum reconstruction training script")
     parser.add_argument("--yaml_config", default=DEFAULT_YAML, type=str, help="Path to YAML config file")
     parser.add_argument("--config", default=DEFAULT_CONFIG, type=str, help="Model config name")

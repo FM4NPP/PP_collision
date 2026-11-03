@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-OBSOLETE (2026-11-02): momentum is to be calculated in ACTS, not in this package. Kept, not
-deleted, so the momentum task can be picked up again. Running it raises a FutureWarning.
+EXPERIMENTAL (2026-11-03): ACTS computes momentum (scripts/acts); this torch route is kept
+experimental, so it can be picked up again, and is not maintained like the main tasks.
+Running it raises a UserWarning.
 
 Evaluate momentum reconstruction (MomentumHead) after a trained track-finding head, the way
 eval_track_finding.py evaluates that head. Run from train/downstream:
@@ -39,8 +40,8 @@ DEFAULT_TRACK_CONFIG = "d9_m1_k30_p20"    # train_track_finding.py's name for th
 
 
 def main():
-    warnings.warn("eval_momentum_reconstruction.py is obsolete: momentum is to be calculated in ACTS (kept for a possible "
-                  "return, not maintained)", FutureWarning, stacklevel=2)
+    warnings.warn("eval_momentum_reconstruction.py is experimental: momentum is computed in ACTS (scripts/acts); this torch "
+                  "route is kept but not maintained", UserWarning, stacklevel=2)
     parser = argparse.ArgumentParser(
         description="Evaluation script for the momentum reconstruction downstream task"
     )

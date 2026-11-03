@@ -1,5 +1,6 @@
 """
-compare_acts.py: check the package's own track maths against ACTS, and mark each method's performance.
+compare_acts.py: check the experimental torch track maths (momentumhead.py) against ACTS, and mark each
+method's performance.
 Runs in the training environment (torch); ACTS itself runs in its container (acts_reference.py).
 
     python scripts/acts/compare_acts.py make states.npz
@@ -13,7 +14,7 @@ make: exact helices from random perigee parameters (pT 0.1-20 GeV, uniform field
     exact, on: on the perigee itself (a zero-length propagation);
     MomentumHead: TPC-like hits where each helix crosses the layers (smeared in r-phi and z), fitted by
         MomentumHead (train/downstream/momentumhead.py); its fitted state at the innermost hit.
-compare: per set, ACTS and the torch maths (acts_port.propagate_to_perigee) against the exact perigee and
+compare: per set, ACTS and the torch maths (momentumhead.propagate_to_perigee) against the exact perigee and
     against each other; MomentumHead's own fit quality; and the time per track of each method. Exit
     status 0 when ACTS and the torch maths agree within the tolerances on the exact sets.
 """
@@ -28,11 +29,11 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                                 "train", "downstream"))
-import acts_port as ap  # noqa: E402
+import momentumhead as mh  # noqa: E402
 
 NAMES = ("d0 [mm]", "z0 [mm]", "phi", "theta", "q/p [e/GeV]", "t [mm]")
 SETS = ("exact, behind", "exact, on", "MomentumHead")
-CM = ap.UnitConstants.cm
+CM = mh.UnitConstants.cm
 
 
 def helix_points(start, phi0, theta, qop, bz, arc):
@@ -54,11 +55,11 @@ def momentumhead_states(truth, reference, args, gen):
     import vertexhead as vh
     from momentumhead import MomentumHead
 
-    bz = args.bz * ap.UnitConstants.T
+    bz = args.bz * mh.UnitConstants.T
     norm = vh.TPC_NORMALIZATION
     layers = np.linspace(norm["r_lim"][0] * CM + 5.0, norm["r_lim"][1] * CM - 5.0, args.n_layers)     # mm
     rng = np.random.default_rng(args.seed)
-    position, _, qop, _ = ap.perigee_to_free(truth, reference)
+    position, _, qop, _ = mh.perigee_to_free(truth, reference)
     hits = []
     for i in range(len(truth)):
         # dense samples along the outgoing half turn; each layer's first crossing
@@ -137,15 +138,15 @@ def make(args):
     truth = torch.stack([uniform(-5, 5), uniform(-100, 100), uniform(-math.pi, math.pi), theta,
                          q * torch.sin(theta) / pT, torch.zeros(n, dtype=torch.float64)], dim=-1)
     reference = torch.tensor(args.reference, dtype=torch.float64)
-    bz = args.bz * ap.UnitConstants.T
-    position, direction, qop, _ = ap.perigee_to_free(truth, reference)
+    bz = args.bz * mh.UnitConstants.T
+    position, direction, qop, _ = mh.perigee_to_free(truth, reference)
     arc = torch.minimum(torch.full_like(pT, 300.0), 0.9 * math.pi * pT / bz)
     down, down_dir = helix_points(position, truth[:, 2], theta, qop, bz, arc)
     fit, fit_seconds = momentumhead_states(truth, reference, args, gen)
 
     # sets stacked: exact behind, exact on, MomentumHead; truth t = time at the perigee relative to the
     # state (t = 0 there): -path / beta behind it, 0 on it, unknown for the fit (not compared)
-    behind_t = -arc / torch.sin(theta) * torch.sqrt(1.0 + (ap.PION_MASS * qop) ** 2)
+    behind_t = -arc / torch.sin(theta) * torch.sqrt(1.0 + (mh.PION_MASS * qop) ** 2)
     truths = [truth.clone(), truth.clone(), truth.clone()]
     truths[0][:, 5], truths[2][:, 5] = behind_t, float("nan")
     np.savez(args.states,
@@ -172,19 +173,19 @@ def compare(args):
     acts_params, acts_ok = out["params"], out["ok"]
 
     # the torch maths, timed per navigation group
-    field = ap.ConstantBField([0.0, 0.0, float(states["bz_tesla"]) * ap.UnitConstants.T])
+    field = mh.ConstantBField([0.0, 0.0, float(states["bz_tesla"]) * mh.UnitConstants.T])
     has_input = np.isfinite(states["qop"])
     port = np.full_like(truth, np.nan)
     port_seconds = 0.0
     for nav, rows in (("backward", backward & has_input), ("forward", ~backward & has_input)):
         args_ = [torch.from_numpy(states[k][rows]).to(args.device) for k in ("position", "direction", "qop")]
         # warm-up, untimed: CUDA start-up and first-call costs are not the maths'
-        ap.propagate_to_perigee(*args_, reference=torch.from_numpy(states["reference"]).to(args.device),
+        mh.propagate_to_perigee(*args_, reference=torch.from_numpy(states["reference"]).to(args.device),
                                 field=field, navigation=nav)
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        result = ap.propagate_to_perigee(*args_, reference=torch.from_numpy(states["reference"]).to(args.device),
+        result = mh.propagate_to_perigee(*args_, reference=torch.from_numpy(states["reference"]).to(args.device),
                                          field=field, navigation=nav)[0]
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()

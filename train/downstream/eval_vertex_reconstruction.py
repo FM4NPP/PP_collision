@@ -80,7 +80,7 @@ def main():
         type=str,
         default=None,
         help="MomentumHead checkpoint for the PV fit's track parameters (default: one built from --bz); "
-             "obsolete with the momentum task, which moves to ACTS",
+             "experimental, as the momentum task (ACTS computes momentum)",
     )
     parser.add_argument(
         "--run_num",
