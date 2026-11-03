@@ -52,5 +52,11 @@ or with docker:
 docker run --rm -v "$PWD":/work -w /work acts-ref:48.2.0 acts-python my_script.py
 ```
 
+If the build printed `WARNING: acts import check failed`, the image is still usable without the launcher:
+
+```bash
+singularity exec acts-ref-48.2.0.sif bash -c "source /opt/acts-build/python/setup.sh && python3 my_script.py"
+```
+
 The container has Python 3.12 and NumPy only (no torch): exchange data with the training environment
 through files (e.g. `.npz`).

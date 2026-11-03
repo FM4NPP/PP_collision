@@ -1,9 +1,10 @@
-#!/bin/sh
+#!/bin/bash
 # python3 with the ACTS bindings importable; works under docker run and singularity exec alike
-# (singularity ignores ENTRYPOINT, so the environment is set here, not in the image).
+# (singularity ignores ENTRYPOINT, so the environment is set here, not in the image). bash, not sh:
+# ACTS's setup scripts only support bash and zsh.
 for setup in /opt/acts-build/python/setup.sh /opt/acts-build/this_acts.sh /opt/acts-build/this_acts_withdeps.sh; do
     if [ -f "$setup" ]; then
-        . "$setup"
+        source "$setup"
         break
     fi
 done
