@@ -3,7 +3,8 @@ vertexhead.py: primary- and secondary-vertex fit from track-finder output.
 
 Tracks are ACTS bound perigee parameters (d0, z0, phi, theta, q/p, t) w.r.t. the beam spot, in cm: either
 fitted from each track's assigned hits by the track model below (a Taubin circle in x-y and z against
-signed arc length along it), or given directly (track_parameters, e.g. from ACTS, in mm). The PV is the
+signed arc length along it; with use_acts, ACTS propagates that fitted helix to the beam spot), or given
+directly (track_parameters, e.g. from ACTS, in mm). The PV is the
 weighted least-squares point of closest approach to the usable tracks' straight lines at their perigee
 (weight = soft hit count x P(real)), refined by an iterative helix fit; an event where the helix fit
 gives no valid vertex (or Bz = 0) keeps the straight-line result.
@@ -21,7 +22,13 @@ Inputs (MambaAttentionHead.forward, TPCBatchDataset): class_probs (B, T, 2), mas
 normalized points (B, N, 4), padding_mask (B, N). B events, N hits, T track slots,
 K = max_sv_per_event SV slots. Positions in cm.
 """
+import atexit
+import json
 import math
+import os
+import struct
+import subprocess
+import sys
 
 import torch
 import torch.nn as nn
@@ -312,6 +319,58 @@ def _circle_from_perigee(perigee, Bz, scaling_factor=100.0, beam_position=(0.0, 
     circle_centre = torch.stack([pca_x + R_s * sin_phi, pca_y - R_s * cos_phi], dim=-1)
     return circle_centre, R_s, torch.cos(theta) / torch.sin(theta), z0, pT, d0.abs()
 
+# ------------------------------------------------------------------------------------------------
+# ACTS worker (use_acts): unmodified ACTS, through its Python bindings, in its own container
+# (scripts/acts), run as one persistent process per configuration. This file never imports ACTS; it
+# streams track states to scripts/acts/acts_worker.py and reads the perigee parameters back.
+# ------------------------------------------------------------------------------------------------
+
+ACTS_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                  "scripts", "acts", "acts_worker.py")
+_ACTS_WORKERS = {}
+
+class _ActsWorker:
+    """One ACTS worker process: command (e.g. singularity exec <image> acts-python) + worker script + config."""
+    def __init__(self, command, config):
+        self.process = subprocess.Popen(list(command) + [ACTS_WORKER_SCRIPT, json.dumps(config)],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        while True:                     # start-up output (e.g. ACTS's setup) until the ready line
+            line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError(f"ACTS worker exited during start-up (code {self.process.wait()}): "
+                                   f"{' '.join(command)}; its error output is above")
+            if line.strip() == b"ACTS_WORKER_READY":
+                break
+            sys.stderr.write(line.decode(errors="replace"))
+
+    def propagate(self, position, direction, qop, backward):
+        """numpy (n, 3), (n, 3), (n,), (n,) bool in mm, e/GeV -> perigee parameters (n, 6) and ok (n,)."""
+        import numpy as np
+        n = len(qop)
+        self.process.stdin.write(struct.pack("<Q", n) + np.ascontiguousarray(position, "<f8").tobytes()
+                                 + np.ascontiguousarray(direction, "<f8").tobytes()
+                                 + np.ascontiguousarray(qop, "<f8").tobytes() + np.asarray(backward, np.uint8).tobytes())
+        self.process.stdin.flush()
+        reply = self.process.stdout.read(n * 49)
+        if len(reply) != n * 49:
+            raise RuntimeError(f"ACTS worker stopped (code {self.process.poll()}); its error output is above")
+        return (np.frombuffer(reply[: n * 48], "<f8").reshape(n, 6).copy(),
+                np.frombuffer(reply[n * 48:], np.uint8).astype(bool))
+
+    def close(self):
+        if self.process.poll() is None:
+            self.process.stdin.close()
+            self.process.wait(timeout=30)
+
+def _acts_worker(command, config):
+    """The running worker for this command and config, started on first use (and again if it died)."""
+    key = (tuple(command), json.dumps(config, sort_keys=True))
+    if key not in _ACTS_WORKERS or _ACTS_WORKERS[key].process.poll() is not None:
+        _ACTS_WORKERS[key] = _ActsWorker(command, config)
+    return _ACTS_WORKERS[key]
+
+atexit.register(lambda: [worker.close() for worker in _ACTS_WORKERS.values()])
+
 def _fit_vertex_by_closest_approach(
     track_position,
     track_direction,
@@ -485,6 +544,15 @@ class VertexHead(nn.Module):
         normalization: the dataset's hit normalization (see _unnormalize_hits); TPC_NORMALIZATION if None.
         momentum_head: an (experimental) MomentumHead whose config() supplies the eight settings above.
         track_parameter_length_scale: cm per length unit of forward's track_parameters (ACTS mm: 0.1).
+        use_acts: ACTS builds the perigee parameters from the hit fit: the fitted helix's state nearest the
+            innermost hit, propagated to the beam spot by ACTS (scripts/acts/acts_worker.py, one persistent
+            process); tracks ACTS fails on are dropped. Not with is_cosmics.
+        acts_image: the ACTS container image (scripts/acts: acts-ref-48.2.0.sif) for use_acts.
+        acts_command: instead of acts_image, the command that runs Python with ACTS (a list).
+        acts_field_map: a text field map for ACTS (scripts/acts/convert_field_map.py, mm and T), as the
+            container sees it; None = constant Bz. The hit fit itself still uses Bz.
+        acts_field_map_kind: "xyz" or "rz" map.
+        acts_max_steps: ACTS's propagation step limit (None: ACTS's default).
         find_secondary: find SVs and report the refitted PV; False = original PV-only fit.
         min_track_pv_dca, min_track_beam_dca: cm, SV candidate cuts.
         max_pair_doca, max_track_sv_doca: cm, seeding and attachment cuts.
@@ -508,6 +576,12 @@ class VertexHead(nn.Module):
         normalization: dict = None,
         momentum_head=None,
         track_parameter_length_scale: float = 0.1,
+        use_acts: bool = False,
+        acts_image: str = None,
+        acts_command: list = None,
+        acts_field_map: str = None,
+        acts_field_map_kind: str = "xyz",
+        acts_max_steps: int = None,
         convergence_tolerance: float = 1e-4,
         minimum_total_weight: float = 1e-6,
         gate_width_pt: float = 0.05,
@@ -529,6 +603,12 @@ class VertexHead(nn.Module):
         self.helix_iterations = helix_iterations
         self.convergence_tolerance = convergence_tolerance
         self.track_parameter_length_scale = track_parameter_length_scale
+        self.use_acts = use_acts
+        self.acts_image = acts_image
+        self.acts_command = acts_command
+        self.acts_field_map = acts_field_map
+        self.acts_field_map_kind = acts_field_map_kind
+        self.acts_max_steps = acts_max_steps
         self.minimum_total_weight = minimum_total_weight
         self.find_secondary = find_secondary
         self.min_track_pv_dca = min_track_pv_dca
@@ -576,6 +656,21 @@ class VertexHead(nn.Module):
 
     def setNoisePtThreshold(self, noise_pt_threshold: float = 0.25):
         self.noise_pt_threshold = noise_pt_threshold
+
+    def acts_worker_command(self):
+        """The command that runs Python with ACTS for use_acts."""
+        if self.acts_command:
+            return list(self.acts_command)
+        if not self.acts_image:
+            raise ValueError("use_acts needs acts_image (the ACTS container, scripts/acts) or acts_command")
+        return ["singularity", "exec", self.acts_image, "acts-python"]
+
+    def acts_worker_config(self):
+        """The ACTS worker's settings (ACTS units: mm, T)."""
+        return {"reference": [self.beam_position[0] / self.track_parameter_length_scale,
+                              self.beam_position[1] / self.track_parameter_length_scale, 0.0],
+                "bz_tesla": self.Bz, "field_map": self.acts_field_map, "field_map_kind": self.acts_field_map_kind,
+                "max_steps": self.acts_max_steps}
 
     def track_fit_config(self):
         """The track-model settings (the keys of an experimental MomentumHead's config())."""
@@ -723,7 +818,8 @@ class VertexHead(nn.Module):
     ):
         """
         Two inputs: track-finder output (class_probs, mask_probs, points, padding_mask), whose hits the
-        track model fits; or track_parameters, e.g. from ACTS, used as they are.
+        track model fits (with use_acts, ACTS then builds the perigee parameters); or track_parameters,
+        e.g. from ACTS, used as they are.
 
         Args:
             class_probs: (B, T, 2) P(slot empty), P(slot real); with track_parameters optional (P(real) = 1).
@@ -739,7 +835,9 @@ class VertexHead(nn.Module):
             dict, the PV (with find_secondary: the refit where used_refit, else the original fit):
                 vertex_estimate (B, 3), chi_square (B,), fit_is_valid (B,); NaN where not valid.
                 track_closest_approach_point (B, T, 3), track_dca (B, T): each track to the PV.
-                track_parameters (B, T, 6): perigee parameters in cm (t = 0 from hits); NaN without a fit.
+                track_parameters (B, T, 6): perigee parameters in cm; NaN without a fit. t = 0 from the hit fit;
+                    with use_acts, ACTS's c t from the innermost-hit state (t = 0) back to the perigee (< 0).
+                acts_failed (B, T), with use_acts: fitted tracks ACTS failed on (dropped).
                 track_position, track_direction (B, T, 3): perigee point and direction there.
                 track_weight, track_quality_mask (B, T): fit weight, pT / beam-line cut.
             With find_secondary also (NaN / False / 0 where sv_is_valid is False):
@@ -749,11 +847,14 @@ class VertexHead(nn.Module):
                 pv_original: dict, the original PV fit.
                 used_refit (B,): the reported PV is the refit.
         """
+        if self.is_cosmics and self.use_acts:
+            raise NotImplementedError("use_acts is not supported with is_cosmics")
+        acts_failed = None
         if track_parameters is None:
             # track model: hits in cm (padded hits are -100 in every column, which overflows sinh(eta); any
             # finite value will do), hard hit assignment, then each track's circle and z line
             hits, hit_r = _unnormalize_hits(points.masked_fill(~padding_mask.unsqueeze(-1), 0.0), self.normalization)
-            _, total_hit_weight, is_assigned = _track_position_from_hits(hits, hit_r, mask_probs, padding_mask)
+            innermost_hit, total_hit_weight, is_assigned = _track_position_from_hits(hits, hit_r, mask_probs, padding_mask)
             params = _helix_from_hits(hits, hit_r, is_assigned, self.noise_pt_threshold, Bz=self.Bz,
                                       scaling_factor=self.scaling_factor, valid_radius=self.valid_radius,
                                       min_hits=self.min_hits, is_cosmics=self.is_cosmics,
@@ -762,15 +863,35 @@ class VertexHead(nn.Module):
             params.update({k: params[k].to(hits.dtype) for k in ("theta", "circle_centre", "R_s", "zslope", "z0")})
             theta = params["theta"].double()
             q = torch.sign(params["R_s"].double()) * (1.0 if self.Bz >= 0 else -1.0)
-            perigee = _perigee_from_circle(params["circle_centre"].double(), params["R_s"].double(),
-                                           params["zslope"].double(), params["z0"].double(),
-                                           q * torch.sin(theta) / params["pT"], self.beam_position)
-            if self.is_cosmics:      # z line against x: the perigee z is the line at the perigee x
-                pca_x = self.beam_position[0] - perigee[..., 0] * torch.sin(perigee[..., 2])
-                perigee[..., 1] = params["zslope"].double() * pca_x + params["z0"].double()
-                perigee[..., 3] = theta
-            base_weight = class_probs[..., 1] * total_hit_weight
-        else:
+            if self.use_acts:
+                # ACTS builds the perigee: the fitted helix's state nearest the innermost hit (in mm), propagated
+                # back to the beam spot; then used as given track_parameters; tracks ACTS fails on are dropped
+                centre, R_s = params["circle_centre"].double(), params["R_s"].double()
+                n = innermost_hit[..., :2].double() - centre
+                n = n / n.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+                start_xy = centre + R_s.abs().unsqueeze(-1) * n
+                start_z = (_arc_length(start_xy[..., 0], start_xy[..., 1], centre[..., 0], centre[..., 1], R_s,
+                                       self.beam_position) * params["zslope"].double() + params["z0"].double())
+                theta = torch.atan2(torch.ones_like(theta), params["zslope"].double())
+                direction = torch.cat([torch.sin(theta).unsqueeze(-1) * torch.sign(R_s).unsqueeze(-1)
+                                       * torch.stack([n[..., 1], -n[..., 0]], dim=-1), torch.cos(theta).unsqueeze(-1)], dim=-1)
+                acts_params, acts_ok = _acts_worker(self.acts_worker_command(), self.acts_worker_config()).propagate(
+                    (torch.cat([start_xy, start_z.unsqueeze(-1)], dim=-1) / self.track_parameter_length_scale
+                     ).reshape(-1, 3).cpu().numpy(), direction.reshape(-1, 3).cpu().numpy(),
+                    (q * torch.sin(theta) / params["pT"]).reshape(-1).cpu().numpy(), [True] * q.numel())
+                track_parameters = torch.from_numpy(acts_params).reshape(*q.shape, 6).to(hits.device, total_hit_weight.dtype)
+                acts_failed = params["fit_ok"] & ~torch.from_numpy(acts_ok).reshape(q.shape).to(hits.device)
+                track_weight = total_hit_weight
+            else:
+                perigee = _perigee_from_circle(params["circle_centre"].double(), params["R_s"].double(),
+                                               params["zslope"].double(), params["z0"].double(),
+                                               q * torch.sin(theta) / params["pT"], self.beam_position)
+                if self.is_cosmics:      # z line against x: the perigee z is the line at the perigee x
+                    pca_x = self.beam_position[0] - perigee[..., 0] * torch.sin(perigee[..., 2])
+                    perigee[..., 1] = params["zslope"].double() * pca_x + params["z0"].double()
+                    perigee[..., 3] = theta
+                base_weight = class_probs[..., 1] * total_hit_weight
+        if track_parameters is not None:
             if self.is_cosmics:
                 raise NotImplementedError("track_parameters input is not supported with is_cosmics")
             perigee = track_parameters.double().clone()
@@ -829,6 +950,8 @@ class VertexHead(nn.Module):
             "track_weight": track_weight,
             "track_quality_mask": params["usable"],
         }
+        if acts_failed is not None:
+            result["acts_failed"] = acts_failed
         if self.find_secondary:
             secondary = self._find_secondary_vertices(fit, track_position, track_direction, track_weight, params)
             refit = secondary.pop("pv_refit", None)

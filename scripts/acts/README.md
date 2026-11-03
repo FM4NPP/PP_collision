@@ -59,6 +59,49 @@ If the build printed `WARNING: acts import check failed`, the image is still usa
 singularity exec acts-ref-48.2.0.sif bash -c "source /opt/acts-build/python/setup.sh && python3 my_script.py"
 ```
 
+## VertexHead with ACTS
+
+`VertexHead(use_acts=True, acts_image="acts-ref-48.2.0.sif")` has ACTS build each track's perigee
+parameters before its own fit: the fitted helix's state nearest the innermost hit, propagated back to the
+beam spot by ACTS. It starts one persistent worker process (`acts_worker.py` in the container) on first
+use and streams every batch to it, so the container starts once per run (about a second), not per batch.
+Tracks ACTS fails on are dropped (zero weight) and flagged in the output `acts_failed`. VertexHead itself
+never imports ACTS. Options: `acts_command` (instead of the image), `acts_field_map`,
+`acts_field_map_kind`, `acts_max_steps`.
+
+Check it on real events (`--save_csv` output of `eval_vertex_reconstruction.py`) against VertexHead's own
+perigee (temporary script):
+
+```bash
+python scripts/acts/check_vertexhead_acts.py --csv vertex_per_point_data.csv --image acts-ref-48.2.0.sif
+```
+
+## Field maps
+
+ACTS's core Python bindings read plain-text field maps. Convert an sPHENIX map (ROOT ntuple `fieldmap`:
+`x y z bx by bz` in cm and T, as PHField3DCartesian reads it; `--kind rz` for `r z br bz`) in the
+training environment (uses uproot):
+
+```bash
+python scripts/acts/convert_field_map.py sphenix_field_map.root field_xyz.txt --rescale 1.0
+```
+
+then pass `acts_field_map="field_xyz.txt"` to VertexHead, or `--field_map field_xyz.txt` to the scripts.
+The map must be a full regular grid covering the beam line out to the TPC: ACTS has no field outside it,
+and a track whose propagation leaves the map fails (and is dropped). A uniform test map, which must
+reproduce the constant-field results:
+
+```bash
+python scripts/acts/convert_field_map.py --uniform 1.4 uniform_xyz.txt
+```
+
+## Material
+
+Not available with this image: ACTS's core Python propagation has no material effects (no
+MaterialInteractor), and the JSON material maps need the JSON plugin and a tracking geometry that matches
+the map. sPHENIX's map (`sphenix-mm-material.json`, CDB key ACTSMATERIALMAP) is keyed to its TGeo-built
+geometry (`tgeo-sphenix-mms.json`, CDB key ACTSGEOMETRYCONFIG).
+
 ## Reference check: the experimental torch maths against ACTS
 
 Three steps, from the repository root: generate test tracks and MomentumHead fits in the training
