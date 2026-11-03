@@ -232,10 +232,10 @@ def compare(args):
 
     n_fit, n_port, n_acts = int(fit.sum()), int(has_input.sum()), int(out["n_attempted"])
     print("== Time per track")
-    print(f"  MomentumHead hit fit ({states['fit_seconds']:.2f} s / {n_fit}): {states['fit_seconds'] / max(n_fit, 1) * 1e3:.4f} ms "
+    print(f"  MomentumHead hit fit ({states['fit_seconds']:.2f} s / {n_fit}): {states['fit_seconds'] / max(n_fit, 1) * 1e6:.3g} us "
           f"(device of make)")
-    print(f"  torch perigee ({port_seconds:.3f} s / {n_port}): {port_seconds / max(n_port, 1) * 1e3:.4f} ms on {args.device}")
-    print(f"  ACTS perigee ({float(out['seconds']):.2f} s / {n_acts}): {float(out['seconds']) / max(n_acts, 1) * 1e3:.4f} ms (CPU, container)")
+    print(f"  torch perigee ({port_seconds:.3f} s / {n_port}): {port_seconds / max(n_port, 1) * 1e6:.3g} us on {args.device}")
+    print(f"  ACTS perigee ({float(out['seconds']):.2f} s / {n_acts}): {float(out['seconds']) / max(n_acts, 1) * 1e6:.3g} us (CPU, container)")
     print(f"== RESULT: {'AGREE' if agree else 'DIVERGE'} on the exact sets (tolerances: lengths {args.length_tol} mm, "
           f"angles {args.angle_tol}, q/p {args.qop_tol})")
     return 0 if agree else 1
