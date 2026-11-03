@@ -91,6 +91,9 @@ def momentumhead_states(truth, reference, args, gen):
                               dtype=torch.float32)[None].to(args.device)
         mask = torch.zeros(1, len(r), len(tracks), device=args.device)
         mask[0, torch.arange(len(r)), slot] = 0.9
+        if first == 0:              # warm-up, untimed: CUDA start-up and first-call costs are not the fit's
+            with torch.no_grad():
+                head(mask, points, torch.ones(1, len(r), dtype=torch.bool, device=args.device))
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -175,6 +178,9 @@ def compare(args):
     port_seconds = 0.0
     for nav, rows in (("backward", backward & has_input), ("forward", ~backward & has_input)):
         args_ = [torch.from_numpy(states[k][rows]).to(args.device) for k in ("position", "direction", "qop")]
+        # warm-up, untimed: CUDA start-up and first-call costs are not the maths'
+        ap.propagate_to_perigee(*args_, reference=torch.from_numpy(states["reference"]).to(args.device),
+                                field=field, navigation=nav)
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
         t0 = time.perf_counter()
