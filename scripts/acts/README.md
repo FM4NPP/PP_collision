@@ -170,6 +170,24 @@ python scripts/acts/check_vertexhead_acts.py --csv vertex_per_point_data.csv \
 
 Without `--material_map` (geometry only), the result must match the constant-field run without geometry.
 
+### Covariance-weighted vertexing
+
+`VertexHead(vertex_weighting="covariance")` weights each track by the inverse variance of its d0 and z0
+instead of its hit count. The covariance is the hit fit's, from per-hit errors `hit_sigma_rphi` and
+`hit_sigma_z` (no material); with `use_acts` it is set at the innermost hit and ACTS transports it to the
+beam spot, adding multiple scattering where the material map has material. The worker then also exchanges
+covariances (`"covariance": true` in its config). `chi_square` becomes a chi-square, so the PV chi2/ndf
+shows whether the errors are right (about 1).
+
+All variants on the same events (own, ACTS, ACTS through the geometry, with material, with material but no
+energy loss; each with hit-count and covariance weighting), PV only and SV default (temporary script):
+
+```bash
+python scripts/acts/compare_vertexing.py --csv vertex_per_point_data.csv \
+    --image scripts/acts/acts-material-worker-48.2.0.sif --geometry sphenix_ana559_tgeo.root \
+    --geometry_config tgeo-sphenix-mms-actsv45.0.0.json --material_map sphenix-mm-acts-material-actsv45.0.0.json
+```
+
 ## Reference check: the experimental torch maths against ACTS
 
 Three steps, from the repository root: generate test tracks and MomentumHead fits in the training

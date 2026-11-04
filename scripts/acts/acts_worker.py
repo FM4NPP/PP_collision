@@ -22,7 +22,10 @@ inflates a covariance, and none is passed, so it does not change the parameters.
 Protocol on stdin/stdout, after a line "ACTS_WORKER_READY": per batch the parent writes n (uint64), then
 position (n, 3), direction (n, 3), qop (n,) as float64 and backward (n,) as uint8; the worker answers
 params (n, 6) float64 (d0, z0, phi, theta, q/p, t in mm, GeV; NaN where ACTS failed or the input is not
-finite) and ok (n,) uint8. EOF on stdin ends it. Everything else the worker or ACTS prints goes to stderr.
+finite) and ok (n,) uint8. With "covariance": true in the config, the parent also sends each state's ACTS
+curvilinear covariance (n, 6, 6) float64 after backward, and the worker answers the perigee covariance
+(n, 6, 6) float64 between params and ok (multiple scattering added in material mode). EOF on stdin ends it
+(a summary of failures is printed). Everything else the worker or ACTS prints goes to stderr.
 
 A backward state (perigee behind it, e.g. at the innermost hit) is propagated as the reversed,
 charge-conjugated track (the same helix) and the result flipped back: d0, phi + pi, pi - theta, q/p and
@@ -96,34 +99,47 @@ def build_material_propagator(config, field, reference):
     return "material", propagator, (detector, geometry, field)
 
 
-def propagate_to_perigee(setup, position, direction, qop, backward, errors=None):
-    """(n, 6) perigee parameters (NaN where ACTS failed or the input is not finite) and ok (n,)."""
+FLIP = np.diag([-1.0, 1.0, 1.0, -1.0, -1.0, -1.0])  # Jacobian of the reversal (d0, phi + pi, pi - theta, -q/p, -t)
+
+
+def propagate_to_perigee(setup, position, direction, qop, backward, errors=None, covariance=None):
+    """(n, 6) perigee parameters (NaN where ACTS failed or the input is not finite) and ok (n,); with a start
+    covariance (n, 6, 6) (ACTS curvilinear, mm) also the perigee covariance (n, 6, 6) (NaN where none)."""
     if setup[0] == "material":
-        params, ok, failures = setup[1].propagate(np.asarray(position, dtype=np.float64), np.asarray(direction, dtype=np.float64),
-                                                  np.asarray(qop, dtype=np.float64), np.asarray(backward, dtype=bool))
+        params, ok, failures, cov = setup[1].propagate(
+            np.asarray(position, dtype=np.float64), np.asarray(direction, dtype=np.float64),
+            np.asarray(qop, dtype=np.float64), np.asarray(backward, dtype=bool),
+            None if covariance is None else np.asarray(covariance, dtype=np.float64))
         if errors is not None:
             for key, count in failures.items():
                 errors.setdefault(key, [0, key])[0] += count
-        return params, ok.astype(bool)
+        return (params, ok.astype(bool)) if covariance is None else (params, ok.astype(bool), cov)
     propagator, options, surface, hypothesis = setup
     n = len(qop)
     params = np.full((n, 6), np.nan)
+    cov_out = np.full((n, 6, 6), np.nan)
     finite = np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)
+    if covariance is not None:
+        finite &= np.isfinite(covariance).all(axis=(1, 2))
     for i in np.flatnonzero(finite):
         flip = -1.0 if backward[i] else 1.0
         try:
+            start_cov = None if covariance is None else (FLIP @ covariance[i] @ FLIP if backward[i] else covariance[i])
             start = acts.BoundTrackParameters.createCurvilinear(
                 pos4=acts.Vector4(*position[i].tolist(), 0.0), dir=acts.Vector3(*(flip * direction[i]).tolist()),
-                qOverP=float(flip * qop[i]), cov=None, particleHypothesis=hypothesis)
-            d0, z0, phi, theta, q_over_p, t = list(propagator.propagateToSurface(
-                start=start, target=surface, options=options).parameters)
+                qOverP=float(flip * qop[i]), cov=start_cov, particleHypothesis=hypothesis)
+            end = propagator.propagateToSurface(start=start, target=surface, options=options)
+            d0, z0, phi, theta, q_over_p, t = list(end.parameters)
             params[i] = ([-d0, z0, math.remainder(phi + math.pi, 2 * math.pi), math.pi - theta, -q_over_p, -t]
                          if backward[i] else [d0, z0, phi, theta, q_over_p, t])
+            if covariance is not None and end.covariance is not None:
+                cov_out[i] = FLIP @ np.asarray(end.covariance) @ FLIP if backward[i] else np.asarray(end.covariance)
         except Exception:  # noqa: BLE001 - one track failing must not stop the batch
             if errors is not None:
                 key = traceback.format_exc(limit=2).strip().splitlines()[-1]
                 errors.setdefault(key, [0, traceback.format_exc(limit=3)])[0] += 1
-    return params, np.isfinite(params).all(axis=1)
+    ok = np.isfinite(params).all(axis=1)
+    return (params, ok) if covariance is None else (params, ok, cov_out)
 
 
 def read_exact(stream, size):
@@ -147,6 +163,7 @@ def serve(config):
     out.write(b"ACTS_WORKER_READY\n")
     out.flush()
     errors, counts = {}, [0, 0]  # failure reason -> [count, detail]; [states attempted, propagated]
+    with_covariance = bool(config.get("covariance"))
     while True:
         header = read_exact(stdin, 8)
         if header is None:
@@ -157,16 +174,19 @@ def serve(config):
             sys.stdout.flush()
             return 0
         (n,) = struct.unpack("<Q", header)
-        body = read_exact(stdin, n * 8 * 7 + n)
+        body = read_exact(stdin, n * 8 * 7 + n + (n * 288 if with_covariance else 0))
         if body is None:
             return 1
         values = np.frombuffer(body[: n * 56], dtype="<f8")
         position, direction, qop = values[: 3 * n].reshape(n, 3), values[3 * n: 6 * n].reshape(n, 3), values[6 * n:]
-        backward = np.frombuffer(body[n * 56:], dtype=np.uint8).astype(bool)
-        params, ok = propagate_to_perigee(setup, position, direction, qop, backward, errors)
+        backward = np.frombuffer(body[n * 56: n * 57], dtype=np.uint8).astype(bool)
+        covariance = np.frombuffer(body[n * 57:], dtype="<f8").reshape(n, 6, 6) if with_covariance else None
+        result = propagate_to_perigee(setup, position, direction, qop, backward, errors, covariance)
+        params, ok = result[0], result[1]
         counts[0] += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())
         counts[1] += int(ok.sum())
-        out.write(params.astype("<f8").tobytes() + ok.astype(np.uint8).tobytes())
+        out.write(params.astype("<f8").tobytes() + (result[2].astype("<f8").tobytes() if with_covariance else b"")
+                  + ok.astype(np.uint8).tobytes())
         out.flush()
 
 
