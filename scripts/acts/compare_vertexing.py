@@ -11,7 +11,8 @@ CSV), PV only and SV default, against the true vertex:
     ACTS mat-E ... material map, energy loss off (multiple scattering only)
 
 each with vertex_weighting "hits" (weight = hit count x P(real)) and "covariance" (inverse variance of each
-track's d0 / z0: the hit fit's, transported and widened by ACTS). Variants needing an option that is not
+track's d0 / z0: the hit fit's, transported and widened by ACTS), and with covariance weighting also ACTS's
+adaptive (annealed) fit, once per --adaptive_error_scales value (track_error_scale). Variants needing an option that is not
 given are skipped. Reports truth-error quantiles, events within 1 cm, the median PV chi2/ndf (covariance
 weighting: about 1 if the errors are right), tracks ACTS dropped and time per event (after the first, which
 starts the worker).
@@ -48,7 +49,13 @@ def variants(args):
             for weighting in ("hits", "covariance"):
                 if name == "ACTS mat-E" and weighting == "hits":
                     continue        # no covariance: identical to ACTS geo
+                if name == "ACTS" and weighting == "covariance":
+                    continue        # needs the geometry route; ACTS geo / covariance is the constant field
                 yield f"{name} / {weighting}", dict(kw, vertex_weighting=weighting)
+                if weighting == "covariance" and name in args.adaptive_for:
+                    for scale in args.adaptive_error_scales:
+                        yield (f"{name} / adaptive x{scale:g}",
+                               dict(kw, vertex_weighting=weighting, adaptive_fit=True, track_error_scale=scale))
 
 
 def main():
@@ -62,6 +69,10 @@ def main():
     parser.add_argument("--geometry_config", default=None)
     parser.add_argument("--material_map", default=None)
     parser.add_argument("--max_events", type=int, default=500)
+    parser.add_argument("--adaptive_error_scales", type=float, nargs="+", default=[1.0, 2.5],
+                        help="adaptive fit (ACTS annealing) variants, one per track_error_scale")
+    parser.add_argument("--adaptive_for", nargs="+", default=["own", "ACTS mat", "ACTS mat-E"],
+                        help="variants that also run with the adaptive fit")
     args = parser.parse_args()
 
     events = load_events(args.csv, args.max_events)
@@ -79,7 +90,9 @@ def main():
                     times.append(time.perf_counter() - t0)
             err = np.array([np.linalg.norm(o["vertex_estimate"][0].double().numpy() - t) for o, (_, t) in zip(outs, events)])
             err = err[np.isfinite(err)]
-            ndf = [(2 * int((o["track_weight"] > 0).sum()) - 3) for o in outs]
+            # ndf = 2 sum(w) - 3 (ACTS: weighted tracks count by their annealing weight)
+            ndf = [2 * float((o["track_weight"] > 0).to(torch.float64).mul(o.get("track_vertex_weight", torch.ones(1)).double()).sum()) - 3
+                   for o in outs]
             chi2 = np.array([o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()])
             dropped = sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o)
             rows.append((mode, name, len(err), *(np.percentile(err, q) if len(err) else np.nan for q in (50, 68, 90)),
@@ -88,10 +101,10 @@ def main():
                          np.mean(times[1:] if len(times) > 1 else times) * 1e3))
             print(f"  done: {mode} / {name}", flush=True)
 
-    print(f"\n{'mode':10s} {'variant':24s} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} "
+    print(f"\n{'mode':10s} {'variant':28s} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} "
           f"{'chi2/ndf':>8s} {'dropped':>7s} {'ms/evt':>7s}   (truth error, cm)")
     for mode, name, n, m, p68, p90, within, chi2, dropped, ms in rows:
-        print(f"{mode:10s} {name:24s} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} "
+        print(f"{mode:10s} {name:28s} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} "
               f"{'' if np.isnan(chi2) else f'{chi2:8.2f}':>8s} {dropped:7d} {ms:7.1f}")
     return 0
 

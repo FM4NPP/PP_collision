@@ -177,10 +177,21 @@ instead of its hit count. The covariance is the hit fit's, from per-hit errors `
 `hit_sigma_z` (no material); with `use_acts` it is set at the innermost hit and ACTS transports it to the
 beam spot, adding multiple scattering where the material map has material. The worker then also exchanges
 covariances (`"covariance": true` in its config). `chi_square` becomes a chi-square, so the PV chi2/ndf
-shows whether the errors are right (about 1).
+shows whether the errors are right (about 1). With `use_acts` this needs the geometry (`acts_geometry`,
+`acts_geometry_config`, worker image): ACTS 48.2's Python `createCurvilinear` rejects a start covariance, so
+covariances go through the material module; without a material map that is the constant-field result.
+
+`SINGULARITY_BIND` also applies to `singularity build`, where the image has no such directory to mount:
+build with it cleared (`SINGULARITY_BIND= JOBS=8 singularity build ...`).
+
+`adaptive_fit=True` (with covariance weighting) adds ACTS's adaptive vertex fit: tracks are down-weighted by
+their compatibility chi2 with ACTS's annealing (AnnealingUtility: cut-off 9, temperatures 64 to 1) and the
+AdaptiveMultiVertexFitter's stopping rules, all exposed as VertexHead arguments. `track_error_scale`
+inflates the track errors where they are known to be too small (PV chi2/ndf above 1).
 
 All variants on the same events (own, ACTS, ACTS through the geometry, with material, with material but no
-energy loss; each with hit-count and covariance weighting), PV only and SV default (temporary script):
+energy loss; each with hit-count and covariance weighting, and the adaptive fit per `--adaptive_error_scales`
+value), PV only and SV default (temporary script):
 
 ```bash
 python scripts/acts/compare_vertexing.py --csv vertex_per_point_data.csv \
