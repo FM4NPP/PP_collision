@@ -146,9 +146,15 @@ def serve(config):
     stdin = sys.stdin.buffer
     out.write(b"ACTS_WORKER_READY\n")
     out.flush()
+    errors, counts = {}, [0, 0]  # failure reason -> [count, detail]; [states attempted, propagated]
     while True:
         header = read_exact(stdin, 8)
         if header is None:
+            # at the end (VertexHead closes the worker at exit): why ACTS failed, for the dropped tracks
+            print(f"ACTS worker: {counts[1]} of {counts[0]} states propagated" + ("; failures:" if errors else ""))
+            for key, (count, _) in sorted(errors.items(), key=lambda item: -item[1][0]):
+                print(f"  {count:7d}  {key}")
+            sys.stdout.flush()
             return 0
         (n,) = struct.unpack("<Q", header)
         body = read_exact(stdin, n * 8 * 7 + n)
@@ -157,7 +163,9 @@ def serve(config):
         values = np.frombuffer(body[: n * 56], dtype="<f8")
         position, direction, qop = values[: 3 * n].reshape(n, 3), values[3 * n: 6 * n].reshape(n, 3), values[6 * n:]
         backward = np.frombuffer(body[n * 56:], dtype=np.uint8).astype(bool)
-        params, ok = propagate_to_perigee(setup, position, direction, qop, backward)
+        params, ok = propagate_to_perigee(setup, position, direction, qop, backward, errors)
+        counts[0] += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())
+        counts[1] += int(ok.sum())
         out.write(params.astype("<f8").tobytes() + ok.astype(np.uint8).tobytes())
         out.flush()
 

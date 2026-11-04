@@ -100,6 +100,22 @@ def main():
                 f"{n} {v:.2e}" for n, v in zip(("d0 cm", "z0 cm", "phi", "theta", "q/p"), dp.max(0))))
         print(f"  ACTS dropped {dropped} of {fitted} fitted tracks; fit_is_valid differs in "
               f"{sum(int((a['fit_is_valid'] != b['fit_is_valid']).sum()) for a, b in zip(own, acts))} events")
+        # which tracks were dropped: usable ones (they would have weighed in the vertex) and their pT
+        pt = lambda p: (torch.sin(p[..., 3]) / p[..., 4].abs()).double()  # noqa: E731 - GeV
+        dropped_pt = torch.cat([pt(a["track_parameters"])[b["acts_failed"]] for a, b in zip(own, acts)]).numpy()
+        kept = [torch.isfinite(a["track_parameters"][..., 0]) & ~b["acts_failed"] for a, b in zip(own, acts)]
+        kept_pt = torch.cat([pt(a["track_parameters"])[k] for a, k in zip(own, kept)]).numpy()
+        dropped_usable = sum(int((a["track_quality_mask"] & b["acts_failed"]).sum()) for a, b in zip(own, acts))
+        quantiles = lambda x: (", ".join(f"{q}% {np.percentile(x[np.isfinite(x)], q):.3f}" for q in (10, 50, 90))  # noqa: E731
+                               if np.isfinite(x).any() else "none")
+        print(f"  dropped: {dropped_usable} usable by VertexHead's own cuts; pT GeV dropped [{quantiles(dropped_pt)}], "
+              f"kept [{quantiles(kept_pt)}]")
+        # material: signed relative change of |q/p| (energy added back going inward: negative, a few %)
+        rel = np.concatenate([((b["track_parameters"][..., 4].abs() / a["track_parameters"][..., 4].abs()) - 1)[u].double().numpy()
+                              for a, b, u in zip(own, acts, usable) if u.any()])
+        rel = rel[np.isfinite(rel)]
+        if len(rel):
+            print(f"  |q/p| ACTS / own - 1 over usable tracks: {quantiles(rel * 100)} (percent)")
         for name, (outs, times) in results.items():
             err = np.array([np.linalg.norm(o["vertex_estimate"][0].double().numpy() - t) for o, (_, t) in zip(outs, events)])
             err = err[np.isfinite(err)]
