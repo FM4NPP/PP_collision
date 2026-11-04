@@ -58,14 +58,22 @@ def main():
     parser.add_argument("--command", nargs="+", default=None, help="instead of --image: command running Python with ACTS")
     parser.add_argument("--field_map", default=None, help="text field map (convert_field_map.py)")
     parser.add_argument("--field_map_kind", default="xyz", choices=("xyz", "rz"))
+    parser.add_argument("--geometry", default=None, help="material mode: exported TGeo geometry (export_sphenix_geometry.C)")
+    parser.add_argument("--geometry_config", default=None, help="material mode: TGeo JSON configuration")
+    parser.add_argument("--material_map", default=None, help="material mode: JSON material map")
+    parser.add_argument("--no_energy_loss", action="store_true", help="material mode: geometry and material, no energy loss")
     parser.add_argument("--max_events", type=int, default=500)
     args = parser.parse_args()
 
     events = load_events(args.csv, args.max_events)
     print(f"{len(events)} events from {args.csv}; ACTS via {args.command or args.image}"
-          + (f", field map {args.field_map}" if args.field_map else ", constant field"))
+          + (f", field map {args.field_map}" if args.field_map else ", constant field")
+          + (f", geometry {args.geometry}" if args.geometry else "")
+          + (f", material {args.material_map} (energy loss {'off' if args.no_energy_loss else 'on'})" if args.material_map else ""))
     acts_kw = dict(use_acts=True, acts_image=args.image, acts_command=args.command, acts_field_map=args.field_map,
-                   acts_field_map_kind=args.field_map_kind)
+                   acts_field_map_kind=args.field_map_kind, acts_geometry=args.geometry,
+                   acts_geometry_config=args.geometry_config, acts_material_map=args.material_map,
+                   acts_energy_loss=not args.no_energy_loss)
     for label, kw in (("PV only", {"find_secondary": False}), ("SV default", {})):
         results = {}
         for name, head in (("own", vh.VertexHead(**kw).eval()), ("ACTS", vh.VertexHead(**kw, **acts_kw).eval())):

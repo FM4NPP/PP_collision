@@ -137,8 +137,38 @@ singularity exec acts-material-48.2.0.sif acts-python scripts/acts/check_materia
 ```
 
 It reports the surfaces built per ACTS volume, how many carry material, and which material-map entries
-found no surface. Propagation with material (multiple scattering, energy loss) is the next step, through a
-small C++ module linked against ACTS.
+found no surface (ana559 with the ACTS v45 map: all 56 land, on approach surfaces; sensitive surfaces
+432 MVTX, 224 INTT, 13824 TPC, 16 micromegas). TGeoDetector's "Layers are overlapping" errors for the TPC
+come from the configuration's 5 mm layer tolerance against TPC layers 5.6 to 11 mm apart; they do not stop
+the map from landing.
+
+### Propagation with material
+
+ACTS's core Python propagation has no material effects (no MaterialInteractor), so a small module,
+`material_propagator/` (one C++ file, linked against the unmodified ACTS libraries), adds that one call. It
+is built in a third image layered on the material image, so changing it recompiles only the module:
+
+```bash
+JOBS=8 singularity build --fakeroot acts-material-worker-48.2.0.sif acts-material-worker.def
+```
+
+The build ends with `material propagator OK` if the module imports. Then VertexHead runs ACTS through
+sPHENIX's geometry with `acts_image="acts-material-worker-48.2.0.sif"`, `acts_geometry` (exported TGeo file),
+`acts_geometry_config` (TGeo JSON) and `acts_material_map` (material JSON); `acts_energy_loss=False` keeps
+the geometry and material but adds no energy back. Tracks are propagated from the innermost hit in their real
+(backward) direction, so energy lost on the way in is added back to q/p. Multiple scattering only inflates a
+covariance, and none is propagated yet, so it does not change the parameters. Check against VertexHead's
+own perigee (temporary script; paths as the container sees them: for files outside your home directory,
+e.g. on /zfs0, `export SINGULARITY_BIND=/zfs0` first, which every singularity call, the worker's included,
+picks up):
+
+```bash
+python scripts/acts/check_vertexhead_acts.py --csv vertex_per_point_data.csv \
+    --image acts-material-worker-48.2.0.sif --geometry sphenix_ana559_tgeo.root \
+    --geometry_config tgeo-sphenix-mms-actsv45.0.0.json --material_map sphenix-mm-acts-material-actsv45.0.0.json
+```
+
+Without `--material_map` (geometry only), the result must match the constant-field run without geometry.
 
 ## Reference check: the experimental torch maths against ACTS
 

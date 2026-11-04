@@ -1,0 +1,40 @@
+# ACTS material worker image, Singularity recipe: the material image (acts-material.def) plus the small module
+# material_propagator/ (ACTS propagation with MaterialInteractor, which ACTS's core Python bindings lack).
+# Layered so changing the module rebuilds only this (minutes), not ACTS or ROOT. From scripts/acts:
+#   JOBS=8 singularity build --fakeroot acts-material-worker-48.2.0.sif acts-material-worker.def
+Bootstrap: localimage
+From: acts-material-48.2.0.sif
+
+%files
+    material_propagator /opt/material-propagator-src
+
+%post
+    JOBS=${JOBS:-8}
+    export LD_LIBRARY_PATH=/opt/root/lib:/opt/hepmc3/lib:/opt/hepmc3/lib64:$LD_LIBRARY_PATH
+
+    # an installed ACTS (CMake package) to compile against; the acts Python package keeps using the build tree
+    cmake --install /opt/acts-build --prefix /opt/acts > /dev/null
+
+    # the pybind11 ACTS's bindings were built with (same version: one shared type registry)
+    # (<pybind11 source>/tools/pybind11Common.cmake)
+    PYBIND11_SOURCE_DIR=$(dirname "$(find /opt/acts-build /opt/acts-src -path '*pybind11*' -name pybind11Common.cmake -print -quit)")
+    PYBIND11_SOURCE_DIR=$(cd "$PYBIND11_SOURCE_DIR/.." && pwd)
+    echo "pybind11 from: $PYBIND11_SOURCE_DIR"
+
+    cmake -S /opt/material-propagator-src -B /opt/material-propagator-build \
+        -DCMAKE_PREFIX_PATH="/opt/acts;/opt/root" -DPYBIND11_SOURCE_DIR="$PYBIND11_SOURCE_DIR" \
+        -DACTS_LIBRARY_DIR=/opt/acts-build/lib -DCMAKE_INSTALL_PREFIX=/opt/material-propagator
+    cmake --build /opt/material-propagator-build -j ${JOBS} || cmake --build /opt/material-propagator-build -j 1
+    cmake --install /opt/material-propagator-build
+    rm -rf /opt/material-propagator-build
+
+    PYTHONPATH=/opt/material-propagator:$PYTHONPATH acts-python -c \
+        "import acts, acts_material_propagator; print('material propagator OK:', acts_material_propagator.__file__)" \
+        || echo "WARNING: material propagator import check failed"
+
+%environment
+    export ROOT_INCLUDE_PATH=/opt/hepmc3/include:$ROOT_INCLUDE_PATH
+    export PATH=/opt/root/bin:$PATH
+    export LD_LIBRARY_PATH=/opt/root/lib:/opt/hepmc3/lib:/opt/hepmc3/lib64:$LD_LIBRARY_PATH
+    export ROOTSYS=/opt/root
+    export PYTHONPATH=/opt/material-propagator:$PYTHONPATH

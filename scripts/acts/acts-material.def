@@ -42,6 +42,8 @@ From: acts-material-base.sif
     acts-python -c "import acts, acts.examples; print('acts OK:', acts.__file__)" || echo "WARNING: acts import check failed"
 
 %environment
+    # ROOT_INCLUDE_PATH: HepMC3's ROOT dictionaries find their headers (else harmless cling autoload errors)
+    export ROOT_INCLUDE_PATH=/opt/hepmc3/include:$ROOT_INCLUDE_PATH
     export PATH=/opt/root/bin:$PATH
     export LD_LIBRARY_PATH=/opt/root/lib:/opt/hepmc3/lib:/opt/hepmc3/lib64:$LD_LIBRARY_PATH
     export ROOTSYS=/opt/root

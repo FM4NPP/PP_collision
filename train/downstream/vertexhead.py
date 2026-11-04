@@ -553,6 +553,13 @@ class VertexHead(nn.Module):
             container sees it; None = constant Bz. The hit fit itself still uses Bz.
         acts_field_map_kind: "xyz" or "rz" map.
         acts_max_steps: ACTS's propagation step limit (None: ACTS's default).
+        acts_geometry, acts_geometry_config: material mode (image acts-material-worker-48.2.0.sif): the
+            exported TGeo geometry (scripts/acts/export_sphenix_geometry.C) and the TGeo JSON configuration
+            (CDB ACTSGEOMETRYCONFIG), as the container sees them; ACTS then propagates through sPHENIX's
+            tracking geometry. None = no geometry, no material.
+        acts_material_map: the JSON material map (CDB ACTSMATERIALMAP) on that geometry; None = none.
+        acts_energy_loss: with a material map, add back the energy lost between the innermost hit and the
+            perigee (changes q/p; multiple scattering would only change a covariance, none is used).
         find_secondary: find SVs and report the refitted PV; False = original PV-only fit.
         min_track_pv_dca, min_track_beam_dca: cm, SV candidate cuts.
         max_pair_doca, max_track_sv_doca: cm, seeding and attachment cuts.
@@ -582,6 +589,10 @@ class VertexHead(nn.Module):
         acts_field_map: str = None,
         acts_field_map_kind: str = "xyz",
         acts_max_steps: int = None,
+        acts_geometry: str = None,
+        acts_geometry_config: str = None,
+        acts_material_map: str = None,
+        acts_energy_loss: bool = True,
         convergence_tolerance: float = 1e-4,
         minimum_total_weight: float = 1e-6,
         gate_width_pt: float = 0.05,
@@ -609,6 +620,12 @@ class VertexHead(nn.Module):
         self.acts_field_map = acts_field_map
         self.acts_field_map_kind = acts_field_map_kind
         self.acts_max_steps = acts_max_steps
+        self.acts_geometry = acts_geometry
+        self.acts_geometry_config = acts_geometry_config
+        self.acts_material_map = acts_material_map
+        self.acts_energy_loss = acts_energy_loss
+        if (acts_geometry is None) != (acts_geometry_config is None) or (acts_material_map and not acts_geometry):
+            raise ValueError("acts_geometry and acts_geometry_config go together; acts_material_map needs both")
         self.minimum_total_weight = minimum_total_weight
         self.find_secondary = find_secondary
         self.min_track_pv_dca = min_track_pv_dca
@@ -670,7 +687,9 @@ class VertexHead(nn.Module):
         return {"reference": [self.beam_position[0] / self.track_parameter_length_scale,
                               self.beam_position[1] / self.track_parameter_length_scale, 0.0],
                 "bz_tesla": self.Bz, "field_map": self.acts_field_map, "field_map_kind": self.acts_field_map_kind,
-                "max_steps": self.acts_max_steps}
+                "max_steps": self.acts_max_steps, "geometry": self.acts_geometry,
+                "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
+                "energy_loss": self.acts_energy_loss}
 
     def track_fit_config(self):
         """The track-model settings (the keys of an experimental MomentumHead's config())."""

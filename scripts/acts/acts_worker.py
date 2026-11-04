@@ -12,6 +12,13 @@ Config (JSON): reference [x, y, z] mm (perigee surface centre); bz_tesla (consta
 field_map_length_unit / field_map_field_unit (ACTS units per file unit; default mm and T); max_steps
 (ACTS default if absent).
 
+Material mode (worker image acts-material-worker.def): geometry (TGeo ROOT file, export_sphenix_geometry.C),
+geometry_config (TGeo JSON configuration, CDB ACTSGEOMETRYCONFIG) and optionally material_map (JSON, CDB
+ACTSMATERIALMAP) build sPHENIX's tracking geometry as sPHENIX does; tracks are then propagated through it
+with ACTS's MaterialInteractor (module acts_material_propagator) in their real direction, energy_loss (default
+true) adding back the energy lost between the state and the perigee. multiple_scattering (default true) only
+inflates a covariance, and none is passed, so it does not change the parameters.
+
 Protocol on stdin/stdout, after a line "ACTS_WORKER_READY": per batch the parent writes n (uint64), then
 position (n, 3), direction (n, 3), qop (n,) as float64 and backward (n,) as uint8; the worker answers
 params (n, 6) float64 (d0, z0, phi, theta, q/p, t in mm, GeV; NaN where ACTS failed or the input is not
@@ -19,7 +26,8 @@ finite) and ok (n,) uint8. EOF on stdin ends it. Everything else the worker or A
 
 A backward state (perigee behind it, e.g. at the innermost hit) is propagated as the reversed,
 charge-conjugated track (the same helix) and the result flipped back: d0, phi + pi, pi - theta, q/p and
-t change sign, z0 does not. No material effects: ACTS's core Python propagation has none.
+t change sign, z0 does not. No material effects there: ACTS's core Python propagation has none (material
+mode above).
 """
 import json
 import math
@@ -42,16 +50,61 @@ def build_propagator(config):
                        bFieldUnit=config.get("field_map_field_unit", u.T))
     else:
         field = acts.ConstantBField(acts.Vector3(0.0, 0.0, float(config["bz_tesla"]) * u.T))
+    reference = [float(v) for v in config.get("reference", (0.0, 0.0, 0.0))]
+    if config.get("geometry"):
+        return build_material_propagator(config, field, reference)
     propagator = acts.EigenVoidPropagator(acts.EigenStepper(field), acts.VoidNavigator())
     options = acts.PropagatorPlainOptions(acts.GeometryContext.dangerouslyDefaultConstruct(), acts.MagneticFieldContext())
     if config.get("max_steps") is not None:
         options.maxSteps = int(config["max_steps"])
-    surface = acts.Surface.createPerigee(acts.Vector3(*[float(v) for v in config.get("reference", (0.0, 0.0, 0.0))]))
+    surface = acts.Surface.createPerigee(acts.Vector3(*reference))
     return propagator, options, surface, acts.ParticleHypothesis.pion
+
+
+def build_tracking_geometry(geometry, geometry_config, material_map=None):
+    """sPHENIX's ACTS tracking geometry from TGeo (TGeoDetector), with its JSON material map if given. Returns
+    (detector, geometry): the detector owns the detector elements and must be kept alive with the geometry."""
+    import importlib
+
+    def first_module(*names):
+        for name in names:
+            try:
+                return importlib.import_module(name)
+            except ImportError:
+                pass
+        raise ImportError(f"none of {names} (needs the material image, acts-material.def)")
+
+    tgeo = first_module("acts.examples.tgeo", "acts.tgeo")
+    config = tgeo.TGeoDetector.Config()
+    config.readJson(geometry_config)
+    config.fileName = geometry
+    if material_map:
+        json_plugin = first_module("acts.json", "acts.examples.json")
+        config.materialDecorator = json_plugin.JsonMaterialDecorator(
+            rConfig=json_plugin.MaterialMapJsonConverter.Config(), jFileName=material_map, level=acts.logging.WARNING)
+    detector = tgeo.TGeoDetector(config)
+    return detector, detector.trackingGeometry()
+
+
+def build_material_propagator(config, field, reference):
+    """Material mode: ("material", MaterialPropagator, keep-alive objects)."""
+    import acts_material_propagator
+    detector, geometry = build_tracking_geometry(config["geometry"], config["geometry_config"], config.get("material_map"))
+    propagator = acts_material_propagator.MaterialPropagator(
+        geometry=geometry, field=field, reference=reference, energy_loss=bool(config.get("energy_loss", True)),
+        multiple_scattering=bool(config.get("multiple_scattering", True)), max_steps=int(config.get("max_steps") or 0))
+    return "material", propagator, (detector, geometry, field)
 
 
 def propagate_to_perigee(setup, position, direction, qop, backward, errors=None):
     """(n, 6) perigee parameters (NaN where ACTS failed or the input is not finite) and ok (n,)."""
+    if setup[0] == "material":
+        params, ok, failures = setup[1].propagate(np.asarray(position, dtype=np.float64), np.asarray(direction, dtype=np.float64),
+                                                  np.asarray(qop, dtype=np.float64), np.asarray(backward, dtype=bool))
+        if errors is not None:
+            for key, count in failures.items():
+                errors.setdefault(key, [0, key])[0] += count
+        return params, ok.astype(bool)
     propagator, options, surface, hypothesis = setup
     n = len(qop)
     params = np.full((n, 6), np.nan)
@@ -84,11 +137,12 @@ def read_exact(stream, size):
 
 
 def serve(config):
-    setup = build_propagator(config)
-    # the protocol gets the real stdout; anything printed from here on (Python or ACTS's C++) goes to stderr
+    # the protocol gets the real stdout; anything printed from here on (Python or ACTS's C++, e.g. the geometry
+    # build's log) goes to stderr
     out = os.fdopen(os.dup(1), "wb")
     os.dup2(2, 1)
     sys.stdout = sys.stderr
+    setup = build_propagator(config)
     stdin = sys.stdin.buffer
     out.write(b"ACTS_WORKER_READY\n")
     out.flush()
