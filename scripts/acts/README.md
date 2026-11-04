@@ -97,10 +97,43 @@ python scripts/acts/convert_field_map.py --uniform 1.4 uniform_xyz.txt
 
 ## Material
 
-Not available with this image: ACTS's core Python propagation has no material effects (no
-MaterialInteractor), and the JSON material maps need the JSON plugin and a tracking geometry that matches
-the map. sPHENIX's map (`sphenix-mm-material.json`, CDB key ACTSMATERIALMAP) is keyed to its TGeo-built
-geometry (`tgeo-sphenix-mms.json`, CDB key ACTSGEOMETRYCONFIG).
+The sPHENIX material map is keyed to the ACTS surfaces built from sPHENIX's detector geometry
+(conditions database key `Tracking_Geometry`, a PHOOL file only sPHENIX's software can read). Export it
+once, on a machine with the sPHENIX software set up, to plain files the container can read:
+
+```bash
+root -l -b -q 'scripts/acts/export_sphenix_geometry.C("<Tracking_Geometry file>.root", "sphenix_ana559")'
+```
+
+This writes `sphenix_ana559_tgeo.root` (the geometry as a plain ROOT TGeoManager, with the TPC
+measurement boxes sPHENIX's tracking adds before building its ACTS geometry: 48 layers x 12 modules x 12
+phi segments), `sphenix_ana559_tpc_layers.txt` (TPC layer radii, thicknesses and the maximum drift length)
+and `sphenix_ana559_volumes.txt` (the volume tree). Material propagation itself is not available with this image yet: ACTS's core Python
+propagation has no material effects (no MaterialInteractor), and reading the material map (CDB key
+ACTSMATERIALMAP) onto the geometry built with the TGeo configuration (CDB key ACTSGEOMETRYCONFIG) needs
+ACTS's JSON and ROOT/TGeo plugins, which this image does not build.
+
+### Material container (in progress)
+
+A second image, `acts-material.def`, adds what material needs: ROOT (built from source for C++20) and
+ACTS's examples with its ROOT/TGeo and JSON plugins. The bindings-only image above stays as it is. From
+`scripts/acts` (both ROOT and ACTS compile, so this takes a while):
+
+```bash
+JOBS=8 singularity build --fakeroot acts-material-48.2.0.sif acts-material.def
+```
+
+Then check that sPHENIX's material map lands on the geometry built from the export (temporary script):
+
+```bash
+singularity exec acts-material-48.2.0.sif acts-python scripts/acts/check_material_map.py \
+    --geometry sphenix_ana559_tgeo.root --config tgeo-sphenix-mms-actsv45.0.0.json \
+    --material sphenix-mm-acts-material-actsv45.0.0.json
+```
+
+It reports the surfaces built per ACTS volume, how many carry material, and which material-map entries
+found no surface. Propagation with material (multiple scattering, energy loss) is the next step, through a
+small C++ module linked against ACTS.
 
 ## Reference check: the experimental torch maths against ACTS
 

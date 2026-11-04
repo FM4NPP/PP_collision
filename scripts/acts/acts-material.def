@@ -1,0 +1,63 @@
+# ACTS material container, Singularity recipe: ACTS v48.2.0 with its Python bindings AND its examples, ROOT/TGeo
+# and JSON plugins, for building sPHENIX's tracking geometry from TGeo (TGeoDetector) and applying its JSON
+# material map. Separate from acts.def, whose image (bindings only) stays as it is. ROOT is built from source
+# for C++20, as ACTS needs; this takes a while (ROOT and ACTS both). From scripts/acts, see README.md:
+#   JOBS=8 singularity build --fakeroot acts-material-48.2.0.sif acts-material.def
+Bootstrap: docker
+From: ubuntu:24.04
+
+%files
+    acts-python /usr/local/bin/acts-python
+
+%post
+    # versions and parallel compile jobs
+    ACTS_VERSION=v48.2.0
+    ROOT_VERSION=v6-32-08
+    HEPMC3_VERSION=3.2.7
+    JOBS=${JOBS:-8}
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ca-certificates wget \
+        python3 python3-dev python3-numpy \
+        libboost-dev libboost-filesystem-dev libboost-program-options-dev libboost-test-dev \
+        libeigen3-dev libtbb-dev zlib1g-dev liblzma-dev liblz4-dev libzstd-dev libxxhash-dev libssl-dev \
+        libpcre3-dev libgsl-dev
+    rm -rf /var/lib/apt/lists/*
+
+    # ROOT: only what ACTS uses (Core, RIO, Tree, Hist, Geom, Graf, GenVector, TreePlayer), C++20, no graphics
+    git clone --depth 1 --branch ${ROOT_VERSION} https://github.com/root-project/root.git /opt/root-src
+    cmake -S /opt/root-src -B /opt/root-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20 \
+        -DCMAKE_INSTALL_PREFIX=/opt/root \
+        -Dx11=OFF -Dopengl=OFF -Dwebgui=OFF -Droot7=OFF -Dtmva=OFF -Droofit=OFF -Dpyroot=OFF -Dxrootd=OFF \
+        -Dbuiltin_xrootd=OFF -Dfftw3=OFF -Dmathmore=OFF -Dmysql=OFF -Dpgsql=OFF -Dsqlite=OFF -Ddavix=OFF \
+        -Dssl=OFF -Dhttp=OFF -Dspectrum=OFF -Dunuran=OFF -Dimt=ON -Dbuiltin_tbb=OFF -Dtesting=OFF \
+        -Dfail-on-missing=OFF
+    cmake --build /opt/root-build -j ${JOBS} --target install
+    rm -rf /opt/root-src /opt/root-build
+
+    # HepMC3 (the ACTS examples need it), without its optional ROOT and Python parts
+    git clone --depth 1 --branch ${HEPMC3_VERSION} https://gitlab.cern.ch/hepmc/HepMC3.git /opt/hepmc3-src
+    cmake -S /opt/hepmc3-src -B /opt/hepmc3-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/hepmc3 \
+        -DHEPMC3_ENABLE_ROOTIO=OFF -DHEPMC3_ENABLE_PYTHON=OFF -DHEPMC3_BUILD_EXAMPLES=OFF -DHEPMC3_ENABLE_TEST=OFF
+    cmake --build /opt/hepmc3-build -j ${JOBS} --target install
+    rm -rf /opt/hepmc3-src /opt/hepmc3-build
+
+    # ACTS: Python bindings + examples with ROOT (TGeoDetector, ROOT and JSON plugins); build tree kept, as
+    # in acts.def, for python/setup.sh
+    git clone --depth 1 --branch ${ACTS_VERSION} https://github.com/acts-project/acts.git /opt/acts-src
+    cmake -S /opt/acts-src -B /opt/acts-build -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="/opt/root;/opt/hepmc3" \
+        -DACTS_BUILD_PYTHON_BINDINGS=ON -DACTS_BUILD_EXAMPLES=ON -DACTS_BUILD_EXAMPLES_ROOT=ON \
+        -DACTS_BUILD_PLUGIN_ROOT=ON -DACTS_BUILD_PLUGIN_JSON=ON
+    cmake --build /opt/acts-build -j ${JOBS}
+
+    # not fatal: a launcher problem must not throw away the compile (README: run without the launcher)
+    export LD_LIBRARY_PATH=/opt/root/lib:/opt/hepmc3/lib:/opt/hepmc3/lib64:$LD_LIBRARY_PATH
+    chmod 755 /usr/local/bin/acts-python
+    acts-python -c "import acts, acts.examples; print('acts OK:', acts.__file__)" || echo "WARNING: acts import check failed"
+
+%environment
+    export PATH=/opt/root/bin:$PATH
+    export LD_LIBRARY_PATH=/opt/root/lib:/opt/hepmc3/lib:/opt/hepmc3/lib64:$LD_LIBRARY_PATH
+    export ROOTSYS=/opt/root
