@@ -519,6 +519,19 @@ def _fit_vertex_by_closest_approach(
         "vertex_covariance": vertex_covariance,
     }
 
+def _track_compatibility(point, track_position, track_direction, track_sigma):
+    """
+    Compatibility chi2 (B, T) of a point (B, 3) with each straight track (B, T, 3), in the covariance-weighted
+    fit's metric: the distance split along U = z x direction (error track_sigma[..., 0]) and V = direction x U
+    (error track_sigma[..., 1] sin theta).
+    """
+    r = point.unsqueeze(1) - track_position
+    r = r - (r * track_direction).sum(dim=-1, keepdim=True) * track_direction
+    transverse = track_direction[..., :2].norm(dim=-1).clamp(min=1e-12)
+    U = torch.stack([-track_direction[..., 1], track_direction[..., 0], torch.zeros_like(transverse)], dim=-1) / transverse.unsqueeze(-1)
+    V = torch.cross(track_direction, U, dim=-1)
+    return ((r * U).sum(dim=-1) / track_sigma[..., 0]) ** 2 + ((r * V).sum(dim=-1) / (track_sigma[..., 1] * transverse)) ** 2
+
 def _fit_vertex_by_helix_closest_approach(
     circle_centre,
     R_s,
@@ -673,7 +686,17 @@ class VertexHead(nn.Module):
         seed_merge_distance: cm, duplicate-SV radius.
         min_sv_tracks, min_sv_displacement (cm), max_sv_chi2_per_dof: SV cuts; ndf = 2 n_tracks - 3.
         max_sv_per_event: SV slots per event (K).
-        refit_pv: report the PV refitted without SV tracks where valid; False = original fit.
+        refit_pv: report the PV refitted without SV tracks where valid; False = original fit. With
+            adaptive_fit the SV tracks stay in the refit, weighted by ACTS's multi-vertex annealing weight
+            (shared with their SVs) instead of being removed.
+        With vertex_weighting="covariance", SV finding uses significances instead of distances in cm:
+            sv_min_track_pv_chi2: a candidate's compatibility chi2 with the PV must exceed this (replaces
+                min_track_pv_dca); sv_min_track_beam_significance: |d0| / sigma_d0 above this (replaces
+                min_track_beam_dca; default 0 = off: the PV compatibility already excludes beam-line tracks,
+                and on the 100 CSV events a 3 sigma cut kept 11% of the true secondaries instead of 50%); sv_max_track_chi2: candidates are attached to a seed with a compatibility
+                chi2 up to this (replaces max_track_sv_doca); sv_min_displacement_significance: the SV-PV
+                distance in units of both vertex covariances (replaces min_sv_displacement). max_sv_chi2_per_dof
+                is then a true chi2/ndf. Defaults: chi2 9 (= annealing_cut_off, 3 sigma), 3 sigma displacement.
     """
     def __init__(
         self,
@@ -710,6 +733,10 @@ class VertexHead(nn.Module):
         min_track_weight: float = 1e-4,
         adaptive_max_iterations: int = 30,
         max_relative_shift: float = 0.01,
+        sv_min_track_pv_chi2: float = 9.0,
+        sv_min_track_beam_significance: float = 0.0,
+        sv_max_track_chi2: float = 9.0,
+        sv_min_displacement_significance: float = 3.0,
         convergence_tolerance: float = 1e-4,
         minimum_total_weight: float = 1e-6,
         gate_width_pt: float = 0.05,
@@ -762,6 +789,10 @@ class VertexHead(nn.Module):
         self.min_track_weight = min_track_weight
         self.adaptive_max_iterations = adaptive_max_iterations
         self.max_relative_shift = max_relative_shift
+        self.sv_min_track_pv_chi2 = sv_min_track_pv_chi2
+        self.sv_min_track_beam_significance = sv_min_track_beam_significance
+        self.sv_max_track_chi2 = sv_max_track_chi2
+        self.sv_min_displacement_significance = sv_min_displacement_significance
         self.minimum_total_weight = minimum_total_weight
         self.find_secondary = find_secondary
         self.min_track_pv_dca = min_track_pv_dca
@@ -864,9 +895,13 @@ class VertexHead(nn.Module):
             ~params["fit_ok"].unsqueeze(-1), float("nan"))
         return fit
 
-    def _fit_adaptive(self, track_position, track_direction, track_weight, params):
+    def _fit_adaptive(self, track_position, track_direction, track_weight, params, competing_chi2=None):
         """
         ACTS's adaptive (annealed) vertex fit for one vertex, started from the plain fit (see adaptive_fit).
+        competing_chi2: (B, T, K) each track's compatibility chi2 to other vertices it is attached to (inf
+            where not), for ACTS's multi-vertex weight exp(-chi2/2T) / (exp(-cutOff/2T) + sum_vertices
+            exp(-chi2_v/2T)), so a track shared with an SV pulls the PV only as far as it is more compatible
+            with it; None = the single-vertex weight.
         Returns the fit and each track's annealing weight (B, T) (ACTS trackWeight; 0 = left out).
         """
         fit = self._fit(track_position, track_direction, track_weight, params)
@@ -877,7 +912,13 @@ class VertexHead(nn.Module):
         for _ in range(self.adaptive_max_iterations):
             temperature = self.annealing_temperatures[index]
             # compatibility at the current vertex -> AnnealingUtility weight (single vertex)
-            vertex_weight = torch.sigmoid((self.annealing_cut_off - fit["track_chi2"]) / (2.0 * temperature)).nan_to_num(0.0)
+            if competing_chi2 is None:
+                vertex_weight = torch.sigmoid((self.annealing_cut_off - fit["track_chi2"]) / (2.0 * temperature)).nan_to_num(0.0)
+            else:   # 1 / (1 + exp((chi2 - cutOff)/2T) + sum_k exp((chi2 - chi2_k)/2T))
+                chi2 = fit["track_chi2"].unsqueeze(-1)
+                vertex_weight = 1.0 / (1.0 + torch.exp((chi2.squeeze(-1) - self.annealing_cut_off) / (2.0 * temperature))
+                                       + torch.exp((chi2 - competing_chi2) / (2.0 * temperature)).sum(dim=-1))
+                vertex_weight = vertex_weight.nan_to_num(0.0)
             vertex_weight = vertex_weight.masked_fill(vertex_weight <= self.min_track_weight, 0.0).to(track_weight.dtype)
             new = self._fit(track_position, track_direction, track_weight * vertex_weight, params)
             valid = new["fit_is_valid"]
@@ -907,9 +948,18 @@ class VertexHead(nn.Module):
         device, dtype = track_position.device, track_position.dtype
         pv_position = pv_fit["vertex_estimate"].nan_to_num()
 
-        displaced_mask = ((pv_fit["track_dca"].nan_to_num() > self.min_track_pv_dca)
-                          & (params["beam_dca"].nan_to_num() > self.min_track_beam_dca)
-                          & params["usable"])
+        covariance = self.vertex_weighting == "covariance"
+        if covariance:
+            # ACTS-style significances: incompatible with the PV and displaced from the beam line in units of
+            # the track's own errors
+            track_sigma = params["track_sigma"]
+            displaced_mask = ((pv_fit["track_chi2"].nan_to_num() > self.sv_min_track_pv_chi2)
+                              & (params["beam_dca"].nan_to_num() / track_sigma[..., 0] > self.sv_min_track_beam_significance)
+                              & params["usable"])
+        else:
+            displaced_mask = ((pv_fit["track_dca"].nan_to_num() > self.min_track_pv_dca)
+                              & (params["beam_dca"].nan_to_num() > self.min_track_beam_dca)
+                              & params["usable"])
         displaced_weight = track_weight * displaced_mask.to(track_weight.dtype)
 
         # seeds: closest-approach midpoints of candidate pairs (each once, i < j) with straight-line
@@ -945,6 +995,7 @@ class VertexHead(nn.Module):
         sv_displacement = torch.full((n_events, K), float("nan"), device=device, dtype=dtype)
         sv_track_mask = torch.zeros((n_events, K, n_tracks), device=device, dtype=torch.bool)
         sv_track_dca = torch.full((n_events, K, n_tracks), float("nan"), device=device, dtype=dtype)
+        sv_track_chi2 = torch.full((n_events, K, n_tracks), float("nan"), device=device, dtype=dtype)
 
         for k in range(K):
             if not seed_valid[:, k].any():
@@ -952,8 +1003,12 @@ class VertexHead(nn.Module):
             # candidates within max_track_sv_doca (straight line) of this seed; an empty slot's NaN
             # seed becomes the origin
             diff = seeds[:, k].nan_to_num().unsqueeze(1) - track_position
-            in_sv = (((diff - (diff * track_direction).sum(-1, keepdim=True) * track_direction).norm(dim=-1)
-                      < self.max_track_sv_doca) & (displaced_weight > 0))
+            if covariance:     # compatibility chi2 to the seed (the fit's metric)
+                in_sv = ((_track_compatibility(seeds[:, k].nan_to_num(), track_position, track_direction, track_sigma)
+                          <= self.sv_max_track_chi2) & (displaced_weight > 0))
+            else:
+                in_sv = (((diff - (diff * track_direction).sum(-1, keepdim=True) * track_direction).norm(dim=-1)
+                          < self.max_track_sv_doca) & (displaced_weight > 0))
             sv_weight = displaced_weight * in_sv.to(displaced_weight.dtype)
             fit = self._fit(track_position, track_direction, sv_weight, params)
 
@@ -962,8 +1017,15 @@ class VertexHead(nn.Module):
             chi2_per_dof = (fit["chi_square"] / ndf).masked_fill(~fit["fit_is_valid"], float("nan"))
             displacement = (fit["vertex_estimate"] - pv_position).norm(dim=-1)
 
+            if covariance:     # significance of the SV-PV distance, with both vertex covariances
+                d = (fit["vertex_estimate"] - pv_position).nan_to_num().unsqueeze(-1)
+                both = ((fit["vertex_covariance"] + pv_fit["vertex_covariance"]).nan_to_num(nan=0.0)
+                        + (~fit["fit_is_valid"]).view(-1, 1, 1) * torch.eye(3, dtype=dtype, device=device))
+                far_enough = (d * torch.linalg.solve(both, d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
+            else:
+                far_enough = displacement >= self.min_sv_displacement
             is_ok = (seed_valid[:, k] & fit["fit_is_valid"] & (n_used >= self.min_sv_tracks)
-                     & (displacement >= self.min_sv_displacement)
+                     & far_enough
                      & (chi2_per_dof.nan_to_num(nan=float("inf")) <= self.max_sv_chi2_per_dof))
 
             sv_estimate[:, k] = fit["vertex_estimate"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
@@ -974,6 +1036,7 @@ class VertexHead(nn.Module):
             sv_displacement[:, k] = displacement.masked_fill(~is_ok, float("nan"))
             sv_track_mask[:, k] = in_sv & is_ok.unsqueeze(-1)
             sv_track_dca[:, k] = fit["track_dca"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
+            sv_track_chi2[:, k] = fit["track_chi2"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
 
         # drop SVs within seed_merge_distance of a valid SV with a strictly lower chi2/ndf
         dist = (sv_estimate.unsqueeze(2) - sv_estimate.unsqueeze(1)).nan_to_num().norm(dim=-1)
@@ -994,9 +1057,17 @@ class VertexHead(nn.Module):
             "displaced_weight": displaced_weight,
         }
         if self.refit_pv and result["sv_is_valid"].any():     # without an SV the refit is never reported
-            refit_weight = track_weight * (~result["sv_track_mask"].any(dim=1)).to(track_weight.dtype)
-            result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(
-                track_position, track_direction, refit_weight, params)
+            if covariance and self.adaptive_fit:
+                # ACTS's multi-vertex weights: SV tracks stay in the PV fit, weighted down by how much more
+                # compatible they are with their SV(s)
+                competing = torch.where(result["sv_track_mask"], sv_track_chi2.nan_to_num(nan=float("inf")),
+                                        float("inf")).transpose(1, 2)
+                result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(
+                    track_position, track_direction, track_weight, params, competing_chi2=competing)
+            else:
+                refit_weight = track_weight * (~result["sv_track_mask"].any(dim=1)).to(track_weight.dtype)
+                result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(
+                    track_position, track_direction, refit_weight, params)
         return result
 
     def forward(
