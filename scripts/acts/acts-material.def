@@ -36,10 +36,13 @@ From: ubuntu:24.04
     cmake --build /opt/root-build -j ${JOBS} --target install
     rm -rf /opt/root-src /opt/root-build
 
-    # HepMC3 (the ACTS examples need it), without its optional ROOT and Python parts
+    # HepMC3 (the ACTS examples need it, with its ROOT I/O component rootIO; built against the ROOT above, in the
+    # same C++ standard), without its Python part
+    export LD_LIBRARY_PATH=/opt/root/lib:$LD_LIBRARY_PATH
     git clone --depth 1 --branch ${HEPMC3_VERSION} https://gitlab.cern.ch/hepmc/HepMC3.git /opt/hepmc3-src
     cmake -S /opt/hepmc3-src -B /opt/hepmc3-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/hepmc3 \
-        -DHEPMC3_ENABLE_ROOTIO=OFF -DHEPMC3_ENABLE_PYTHON=OFF -DHEPMC3_BUILD_EXAMPLES=OFF -DHEPMC3_ENABLE_TEST=OFF
+        -DCMAKE_PREFIX_PATH=/opt/root -DCMAKE_CXX_STANDARD=20 -DHEPMC3_CXX_STANDARD=20 \
+        -DHEPMC3_ENABLE_ROOTIO=ON -DHEPMC3_ENABLE_PYTHON=OFF -DHEPMC3_BUILD_EXAMPLES=OFF -DHEPMC3_ENABLE_TEST=OFF
     cmake --build /opt/hepmc3-build -j ${JOBS} --target install
     rm -rf /opt/hepmc3-src /opt/hepmc3-build
 
