@@ -115,9 +115,14 @@ ACTS's JSON and ROOT/TGeo plugins, which this image does not build.
 
 ### Material container (in progress)
 
-A second image, `acts-material.def`, adds what material needs: ROOT (built from source for C++20) and
-ACTS's examples with its ROOT/TGeo and JSON plugins. The bindings-only image above stays as it is. From
-`scripts/acts` (both ROOT and ACTS compile, so this takes a while):
+A second image adds what material needs: ROOT (built from source for C++20), HepMC3 with ROOT I/O, and
+ACTS's examples with its ROOT/TGeo and JSON plugins, all in C++20. The bindings-only image above stays as
+it is. It is built in two steps, so a failure in the ACTS step does not recompile ROOT. From `scripts/acts`
+(both compiles take a while):
+
+```bash
+JOBS=8 singularity build --fakeroot acts-material-base.sif acts-material-base.def
+```
 
 ```bash
 JOBS=8 singularity build --fakeroot acts-material-48.2.0.sif acts-material.def
