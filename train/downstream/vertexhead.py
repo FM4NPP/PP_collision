@@ -880,12 +880,15 @@ class VertexHead(nn.Module):
         self.noise_pt_threshold = noise_pt_threshold
 
     def acts_worker_command(self):
-        """The command that runs Python with ACTS for use_acts."""
+        """The command that runs Python with ACTS for use_acts: singularity exec on acts_image, with the directories
+        of the ACTS input files (field map, geometry, configuration, material map) bound into the container."""
         if self.acts_command:
             return list(self.acts_command)
         if not self.acts_image:
             raise ValueError("use_acts needs acts_image (the ACTS container, scripts/acts) or acts_command")
-        return ["singularity", "exec", self.acts_image, "acts-python"]
+        inputs = [self.acts_field_map, self.acts_geometry, self.acts_geometry_config, self.acts_material_map]
+        binds = sorted({os.path.dirname(os.path.abspath(p)) for p in inputs if p})
+        return ["singularity", "exec", *(["--bind", ",".join(binds)] if binds else []), self.acts_image, "acts-python"]
 
     def acts_worker_config(self):
         """The ACTS worker's settings (ACTS units: mm, T)."""

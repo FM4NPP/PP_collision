@@ -46,9 +46,9 @@ head = VertexHead.from_detector("scripts/acts/detectors/sphenix/sphenix.yaml")
 ```
 
 or `eval_vertex_reconstruction.py --detector scripts/acts/detectors/sphenix/sphenix.yaml` (YAML key
-`vertex_detector`). Keyword arguments override the file. ACTS is used when the file's `acts.image` is set; its
-paths must be visible inside the container: for directories outside your home, `export SINGULARITY_BIND=/zfs0`
-(for example) first. Tracks ACTS fails on (mostly very soft curlers that never reach the beam line) are dropped
+`vertex_detector`). Keyword arguments override the file. ACTS is used when the file's `acts.image` is set;
+VertexHead binds the directories of the ACTS input files into the container itself, and the worker names any
+input file it cannot see. Tracks ACTS fails on (mostly very soft curlers that never reach the beam line) are dropped
 and flagged in the output `acts_failed`; the worker prints a summary of failures when it exits.
 
 ## Adding a detector

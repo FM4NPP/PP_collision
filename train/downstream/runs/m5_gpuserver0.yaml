@@ -19,5 +19,5 @@ max_eval_events: 1000         # events evaluated and written to the per-point CS
 data_root_test: null          # null: the model YAML's data_root_test
 root_dir: /home/bmartin
 
-# VertexHead: field, ACTS inputs and fit settings (export SINGULARITY_BIND=/zfs0 for its ACTS paths)
+# VertexHead: field, ACTS inputs and fit settings
 detector: /home/bmartin/sphenix_gpuserver0.yaml

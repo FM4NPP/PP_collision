@@ -66,6 +66,12 @@ def build_tracking_geometry(geometry, geometry_config, material_map=None):
 
 def build_propagator(config):
     """(PerigeePropagator, objects to keep alive) from a config dict (see the module docstring)."""
+    # ACTS reads a missing file as empty input ("parse error ... empty input"): name it instead
+    missing = [f"{k}={config[k]}" for k in ("field_map", "geometry", "geometry_config", "material_map")
+               if config.get(k) and not os.path.isfile(config[k])]
+    if missing:
+        raise FileNotFoundError(f"not visible inside the container: {', '.join(missing)} (a wrong path, or its "
+                                "directory not bound: --bind / SINGULARITY_BIND)")
     u = acts.UnitConstants
     if config.get("field_map"):
         loader = {"xyz": acts.MagneticFieldMapXyz, "rz": acts.MagneticFieldMapRz}[config.get("field_map_kind", "xyz")]

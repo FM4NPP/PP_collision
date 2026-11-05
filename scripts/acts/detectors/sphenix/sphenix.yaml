@@ -1,6 +1,6 @@
 # sPHENIX TPC detector description for VertexHead.from_detector (train/downstream/vertexhead.py) and its ACTS
-# worker. Relative paths are relative to this file; ACTS paths must be visible inside the container (export
-# SINGULARITY_BIND for directories outside your home). A copy with your own paths is the way to configure a
+# worker. Relative paths are relative to this file; VertexHead binds the ACTS input directories into the
+# container. A copy with your own paths is the way to configure a
 # site; for another detector, copy this folder and fill in the same keys (README: Adding a detector).
 name: sphenix
 
