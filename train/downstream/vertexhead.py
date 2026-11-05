@@ -121,13 +121,17 @@ def _circle_fit(x, y, track, assigned, n_tracks, min_hits=3, newton_iters=20, ep
 
     xk, yk = torch.zeros_like(Mz), A0.clone()
     improving_any = torch.ones_like(Mz, dtype=torch.bool)
-    for _ in range(newton_iters):
+    for iteration in range(newton_iters):
         Dy = A1 + xk * (2 * A2 + 3 * A3 * xk)
         xnew = xk - yk / torch.where(Dy.abs() < eps, eps, Dy)
         ynew = A0 + xnew * (A1 + xnew * (A2 + xnew * A3))
         better = (ynew.abs() < yk.abs()) & torch.isfinite(xnew) & improving_any
         xk, yk = torch.where(better, xnew, xk), torch.where(better, ynew, yk)
         improving_any = improving_any & better
+        # a track that stops improving never changes again: once none improves, the rest are no-ops (same
+        # result; tested every 4 iterations, as each test waits for a GPU)
+        if iteration % 4 == 3 and not improving_any.any():
+            break
 
     DET = xk * xk - xk * Mz + Cov_xy
     DET = torch.where(DET.abs() < eps, eps, DET)
@@ -438,6 +442,23 @@ def _acts_worker(command, config):
 
 atexit.register(lambda: [worker.close() for worker in _ACTS_WORKERS.values()])
 
+def _inverse_3x3(M):
+    """Inverse of 3x3 matrices (..., 3, 3) without the error check that makes torch.linalg.inv wait for a GPU
+    (a singular matrix gives inf / NaN instead of raising)."""
+    return torch.linalg.inv_ex(M)[0]
+
+def _symmetric_eigenvalue_range_3x3(M):
+    """Smallest and largest eigenvalue (...) of symmetric 3x3 matrices, in float64: the trigonometric solution of
+    the characteristic polynomial (from the trace, the sum of squares and one determinant), no iterative solver."""
+    M = M.double()
+    q = M.diagonal(dim1=-2, dim2=-1).sum(-1) / 3
+    p = torch.sqrt(((M * M).sum((-2, -1)) - 3 * q * q).clamp(min=0.0) / 6)       # tr((M - qI)^2) / 6
+    shifted = M - q[..., None, None] * torch.eye(3, dtype=M.dtype, device=M.device)
+    angle = torch.acos((torch.linalg.det(shifted) / (2 * p ** 3).clamp(min=1e-300)).clamp(-1.0, 1.0)) / 3
+    equal = p == 0                                                   # a multiple of the identity
+    return (torch.where(equal, q, q + 2 * p * torch.cos(angle + 2 * torch.pi / 3)),
+            torch.where(equal, q, q + 2 * p * torch.cos(angle)))
+
 def _fit_vertex_by_closest_approach(
     track_position,
     track_direction,
@@ -470,6 +491,9 @@ def _fit_vertex_by_closest_approach(
                 normalised residual r^T W r, ACTS's vertex compatibility).
             vertex_covariance (B, 3, 3): inverse of the normal matrix (the vertex covariance with track_sigma).
             NaN where not valid (except chi_square).
+
+    No call here waits for a GPU: on one the eigenvalue check is closed form, and the solve and inverse skip their
+    error checks (_ex; an invalid event solves against the identity anyway).
     """
     weight = track_weight.clamp(min=0.0)
 
@@ -489,17 +513,19 @@ def _fit_vertex_by_closest_approach(
                              torch.matmul(P, track_position.unsqueeze(-1)).squeeze(-1)).sum(dim=1)
 
     # degeneracy check before solving: smallest/largest eigenvalue ratio (0 tracks: all ~0;
-    # 1 track or parallel tracks: one ~0). A rank-deficient matrix can make the solve raise.
-    normal_matrix_eigenvalues = torch.linalg.eigvalsh(normal_matrix)
-    eigenvalue_ratio = normal_matrix_eigenvalues[:, 0] / normal_matrix_eigenvalues[:, -1].clamp(min=regularization)
-    fit_is_valid = ((eigenvalue_ratio > minimum_eigenvalue_ratio) &
-                     (weight.sum(dim=-1) > minimum_total_weight))
+    # 1 track or parallel tracks: one ~0)
+    # (on a GPU closed form, as eigvalsh waits for the device; on the CPU eigvalsh is the cheaper)
+    if normal_matrix.is_cuda:
+        smallest, largest = _symmetric_eigenvalue_range_3x3(normal_matrix)
+    else:
+        eigenvalues = torch.linalg.eigvalsh(normal_matrix)
+        smallest, largest = eigenvalues[:, 0], eigenvalues[:, -1]
+    fit_is_valid = ((smallest / largest.clamp(min=regularization) > minimum_eigenvalue_ratio)
+                    & (weight.sum(dim=-1) > minimum_total_weight))
 
     # invalid events solve against the identity instead; their results are set to NaN below
-    regularized_normal_matrix = torch.where(fit_is_valid.view(-1, 1, 1),
-                                            normal_matrix + regularization * I3,
-                                            I3.expand_as(normal_matrix))
-    PV = torch.linalg.solve(regularized_normal_matrix, weighted_position_sum)
+    regularized_normal_matrix = torch.where(fit_is_valid.view(-1, 1, 1), normal_matrix + regularization * I3, I3)
+    PV = torch.linalg.solve_ex(regularized_normal_matrix, weighted_position_sum)[0]
 
     dca_vector = torch.matmul(projector, (track_position - PV.unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
     track_dca = dca_vector.norm(dim=-1)
@@ -508,23 +534,17 @@ def _fit_vertex_by_closest_approach(
                   (dca_vector * torch.matmul(P, dca_vector.unsqueeze(-1)).squeeze(-1)).sum(dim=-1))
     chi_square = (weight * track_chi2).sum(dim=-1)
     # the vertex covariance (meaningful with track_sigma): the inverse of the normal matrix
-    vertex_covariance = torch.linalg.inv(regularized_normal_matrix).masked_fill(~fit_is_valid.view(-1, 1, 1), float("nan"))
-    track_chi2 = track_chi2.masked_fill(~fit_is_valid.unsqueeze(-1), float("nan"))
+    vertex_covariance = torch.linalg.inv_ex(regularized_normal_matrix)[0]
 
-    track_closest_approach_point = PV.unsqueeze(1) + dca_vector
-
-    PV = PV.masked_fill(~fit_is_valid.unsqueeze(-1), float("nan"))
-    track_closest_approach_point = track_closest_approach_point.masked_fill(~fit_is_valid[:, None, None], float("nan"))
-    track_dca = track_dca.masked_fill(~fit_is_valid.unsqueeze(-1), float("nan"))
-
+    invalid = ~fit_is_valid
     return {
-        "vertex_estimate": PV,
+        "vertex_estimate": PV.masked_fill(invalid.unsqueeze(-1), float("nan")),
         "chi_square": chi_square,
         "fit_is_valid": fit_is_valid,
-        "track_closest_approach_point": track_closest_approach_point,
-        "track_dca": track_dca,
-        "track_chi2": track_chi2,
-        "vertex_covariance": vertex_covariance,
+        "track_closest_approach_point": (PV.unsqueeze(1) + dca_vector).masked_fill(invalid[:, None, None], float("nan")),
+        "track_dca": track_dca.masked_fill(invalid.unsqueeze(-1), float("nan")),
+        "track_chi2": track_chi2.masked_fill(invalid.unsqueeze(-1), float("nan")),
+        "vertex_covariance": vertex_covariance.masked_fill(invalid.view(-1, 1, 1), float("nan")),
     }
 
 def _track_compatibility(point, track_position, track_direction, track_sigma):
@@ -551,6 +571,7 @@ def _fit_vertex_by_helix_closest_approach(
     is_cosmics=False,
     tolerance=1e-4,
     beam_position=(0.0, 0.0),
+    inputs_finite=False,
     **linear_fit_kwargs,
 ):
     """
@@ -566,6 +587,8 @@ def _fit_vertex_by_helix_closest_approach(
         linear_fit: straight-line fit result whose vertex is the start (origin if None or NaN).
         tolerance: cm; convergence threshold on the vertex step.
         beam_position: (x, y) of the beam line, cm, as in the track model (the origin of s).
+        inputs_finite: the caller has already replaced unfitted tracks by finite stand-ins with zero weight and
+            masks their outputs itself (VertexHead does so once per forward instead of once per fit).
         **linear_fit_kwargs: passed to _fit_vertex_by_closest_approach.
 
     Returns:
@@ -582,10 +605,11 @@ def _fit_vertex_by_helix_closest_approach(
 
     # tracks without a fitted circle or z line get finite stand-ins, so they can't put NaN into the
     # solve, and zero weight, so they don't pull; their outputs are set to NaN after the loop
-    failed = ~(torch.isfinite(circle_centre).all(dim=-1) & torch.isfinite(R_s) & torch.isfinite(zslope) & torch.isfinite(z0))
-    circle_centre = circle_centre.masked_fill(failed.unsqueeze(-1), 0.0)
-    R_s, zslope, z0 = R_s.masked_fill(failed, 1.0), zslope.masked_fill(failed, 0.0), z0.masked_fill(failed, 0.0)
-    track_weight = track_weight.masked_fill(failed, 0.0)
+    if not inputs_finite:
+        failed = ~(torch.isfinite(circle_centre).all(dim=-1) & torch.isfinite(R_s) & torch.isfinite(zslope) & torch.isfinite(z0))
+        circle_centre = circle_centre.masked_fill(failed.unsqueeze(-1), 0.0)
+        R_s, zslope, z0 = R_s.masked_fill(failed, 1.0), zslope.masked_fill(failed, 0.0), z0.masked_fill(failed, 0.0)
+        track_weight = track_weight.masked_fill(failed, 0.0)
 
     radius = R_s.abs()
     x0, y0 = circle_centre.unbind(-1)
@@ -618,9 +642,10 @@ def _fit_vertex_by_helix_closest_approach(
         if not still_moving.any():
             break
 
-    result["track_dca"] = result["track_dca"].masked_fill(failed, float("nan"))
-    result["track_chi2"] = result["track_chi2"].masked_fill(failed, float("nan"))
-    result["track_closest_approach_point"] = result["track_closest_approach_point"].masked_fill(failed.unsqueeze(-1), float("nan"))
+    if not inputs_finite:
+        result["track_dca"] = result["track_dca"].masked_fill(failed, float("nan"))
+        result["track_chi2"] = result["track_chi2"].masked_fill(failed, float("nan"))
+        result["track_closest_approach_point"] = result["track_closest_approach_point"].masked_fill(failed.unsqueeze(-1), float("nan"))
     return result
 
 class VertexHead(nn.Module):
@@ -917,10 +942,7 @@ class VertexHead(nn.Module):
                                               track_sigma=params.get("track_sigma"))
         if self.Bz != 0.0:
             linear, fit = fit, _fit_vertex_by_helix_closest_approach(
-                params["circle_centre"],
-                params["R_s"],
-                params["zslope"],
-                params["z0"],
+                *params["helix"],            # finite stand-ins for unfitted tracks (forward)
                 track_weight,               # already zeroed for bad tracks
                 n_iterations=self.helix_iterations,
                 linear_fit=fit if start is None or self.helix_iterations < 1 else
@@ -930,6 +952,7 @@ class VertexHead(nn.Module):
                 beam_position=self.beam_position,
                 minimum_total_weight=self.minimum_total_weight,
                 track_sigma=params.get("track_sigma"),
+                inputs_finite=True,
             )
             keep_linear = ~fit["fit_is_valid"]
             fit = {k: torch.where(keep_linear.view(-1, *[1] * (v.dim() - 1)), linear[k], v) for k, v in fit.items()}
@@ -948,10 +971,10 @@ class VertexHead(nn.Module):
         if self.Bz == 0.0 or self.helix_iterations < 1:
             return self._fit(track_position, track_direction, track_weight, params)
         fit = _fit_vertex_by_helix_closest_approach(
-            params["circle_centre"], params["R_s"], params["zslope"], params["z0"], track_weight, n_iterations=1,
+            *params["helix"], track_weight, n_iterations=1,
             linear_fit={"vertex_estimate": start}, is_cosmics=self.is_cosmics, tolerance=self.convergence_tolerance,
             beam_position=self.beam_position, minimum_total_weight=self.minimum_total_weight,
-            track_sigma=params.get("track_sigma"))
+            track_sigma=params.get("track_sigma"), inputs_finite=True)
         for key in ("track_dca", "track_chi2"):
             fit[key] = fit[key].masked_fill(~params["fit_ok"], float("nan"))
         fit["track_closest_approach_point"] = fit["track_closest_approach_point"].masked_fill(
@@ -990,8 +1013,8 @@ class VertexHead(nn.Module):
                                  fit["vertex_estimate"])
             valid = new["fit_is_valid"]
             dx = (new["vertex_estimate"] - fit["vertex_estimate"]).nan_to_num().unsqueeze(-1)
-            relative_shift = (dx * torch.linalg.solve(new["vertex_covariance"].nan_to_num(nan=0.0)
-                                                      + (~valid).view(-1, 1, 1) * torch.eye(3, dtype=dx.dtype, device=dx.device), dx)
+            relative_shift = (dx * _inverse_3x3(new["vertex_covariance"].nan_to_num(nan=0.0)
+                                                + (~valid).view(-1, 1, 1) * torch.eye(3, dtype=dx.dtype, device=dx.device)) @ dx
                               ).sum(dim=(-2, -1))
             fit = {k: torch.where(valid.view(-1, *[1] * (v.dim() - 1)), v, fit[k]) for k, v in new.items()}
             small_shift = bool(((relative_shift <= self.max_relative_shift) | ~valid).all())
@@ -1088,7 +1111,7 @@ class VertexHead(nn.Module):
                 d = (fit["vertex_estimate"] - pv_position).nan_to_num().unsqueeze(-1)
                 both = ((fit["vertex_covariance"] + pv_fit["vertex_covariance"]).nan_to_num(nan=0.0)
                         + (~fit["fit_is_valid"]).view(-1, 1, 1) * torch.eye(3, dtype=dtype, device=device))
-                far_enough = (d * torch.linalg.solve(both, d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
+                far_enough = (d * (_inverse_3x3(both) @ d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
             else:
                 far_enough = displacement >= self.min_sv_displacement
             is_ok = (seed_valid[:, k] & fit["fit_is_valid"] & (n_used >= self.min_sv_tracks)
@@ -1321,6 +1344,11 @@ class VertexHead(nn.Module):
             usable = hard + soft - soft.detach()
         track_weight = track_weight * usable
 
+        # the helix fits' inputs with finite stand-ins for unfitted tracks (their weight is 0 and their per-track
+        # outputs are masked by fit_ok), made once here instead of in every fit
+        bad = ~params["fit_ok"]
+        params["helix"] = (params["circle_centre"].masked_fill(bad.unsqueeze(-1), 0.0), params["R_s"].masked_fill(bad, 1.0),
+                           params["zslope"].masked_fill(bad, 0.0), params["z0"].masked_fill(bad, 0.0))
         fit, vertex_weight = self._fit_adaptive(track_position, track_direction, track_weight, params)
 
         result = {

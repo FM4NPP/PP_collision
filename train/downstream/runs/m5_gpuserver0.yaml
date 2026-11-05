@@ -21,3 +21,4 @@ root_dir: /home/bmartin
 
 # VertexHead: field, ACTS inputs and fit settings
 detector: /home/bmartin/sphenix_gpuserver0.yaml
+vertex_device: cpu            # VertexHead on the CPU: 36 against 54 ms/event on the GPU, same results (2026-11-05)
