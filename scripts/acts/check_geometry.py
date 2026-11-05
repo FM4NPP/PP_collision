@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""
+check_geometry.py: a detector's ACTS inputs, checked before use. Builds the tracking geometry as the worker does
+(TGeoDetector from the TGeo file and its JSON configuration, with the JSON material map if given) and reports
+the surfaces built per ACTS volume (sensitive / approach / layer), how many carry material, and which
+material-map entries found no surface. Runs INSIDE the worker image:
+
+    singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/check_geometry.py \\
+        --geometry <tgeo.root> --geometry_config <tgeo config.json> [--material_map <material.json>]
+
+Expect every sensitive detector volume with its module count and every material-map entry landed. sPHENIX
+(ana559 geometry, ACTS v45 map): 432 MVTX, 224 INTT, 13824 TPC and 16 micromegas sensitive surfaces; all 56
+map entries land, on approach surfaces. TGeoDetector's "Layers are overlapping" errors for the TPC (layers
+closer than the configuration's 5 mm tolerance) do not stop that.
+"""
+import argparse
+import collections
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from acts_worker import build_tracking_geometry  # noqa: E402
+
+
+def geometry_id(surface):
+    """(volume, layer, approach, sensitive) of a surface's geometry identifier."""
+    gid = surface.geometryId
+    gid = gid() if callable(gid) else gid
+    return tuple((lambda v: v() if callable(v) else v)(getattr(gid, k)) for k in ("volume", "layer", "approach", "sensitive"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--geometry", required=True, help="TGeo ROOT file")
+    parser.add_argument("--geometry_config", required=True, help="ACTS TGeo JSON configuration")
+    parser.add_argument("--material_map", default=None, help="ACTS JSON material map; none = geometry only")
+    args = parser.parse_args()
+
+    t0 = time.perf_counter()
+    _, geometry = build_tracking_geometry(args.geometry, args.geometry_config, args.material_map)
+    print(f"geometry built in {time.perf_counter() - t0:.1f} s from {args.geometry}")
+
+    surfaces = []
+    try:
+        geometry.visitSurfaces(lambda s: surfaces.append(s), False)
+    except TypeError:
+        geometry.visitSurfaces(lambda s: surfaces.append(s))
+    by_volume, with_material, ids_with_material = collections.Counter(), collections.Counter(), set()
+    for surface in surfaces:
+        vol, lay, app, sen = geometry_id(surface)
+        kind = "sensitive" if sen else ("approach" if app else "layer/other")
+        by_volume[(vol, kind)] += 1
+        if surface.surfaceMaterial is not None:
+            with_material[(vol, kind)] += 1
+            ids_with_material.add((vol, lay, app, sen))
+    print(f"{len(surfaces)} surfaces visited (sensitive and passive)")
+    print(f"  {'volume':>6} {'kind':12} {'surfaces':>9} {'with material':>14}")
+    for key in sorted(by_volume):
+        print(f"  {key[0]:6d} {key[1]:12} {by_volume[key]:9d} {with_material[key]:14d}")
+
+    if args.material_map:
+        with open(args.material_map) as f:
+            entries = json.load(f)["Surfaces"]["entries"]
+        unmatched = [e for e in entries if (e.get("volume", 0), e.get("layer", 0), e.get("approach", 0),
+                                            e.get("sensitive", 0)) not in ids_with_material]
+        print(f"material map: {len(entries)} surface entries, {len(entries) - len(unmatched)} landed on a surface, "
+              f"{len(unmatched)} found none")
+        for e in unmatched[:20]:
+            print("  no surface for", {k: e.get(k) for k in ("volume", "layer", "approach", "sensitive")})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

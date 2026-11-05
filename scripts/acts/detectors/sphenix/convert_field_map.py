@@ -3,9 +3,9 @@ convert_field_map.py: an sPHENIX field map (ROOT ntuple "fieldmap", as PHField3D
 it) to the plain-text map ACTS's core Python bindings load (acts.MagneticFieldMapXyz / MagneticFieldMapRz).
 Runs in the training environment (needs uproot and numpy, not ACTS or ROOT).
 
-    python scripts/acts/convert_field_map.py sphenix3dtrackingmapxyz.root field_xyz.txt
-    python scripts/acts/convert_field_map.py map2d.root field_rz.txt --kind rz
-    python scripts/acts/convert_field_map.py --uniform 1.4 uniform_xyz.txt     (a test map: constant Bz)
+    python scripts/acts/detectors/sphenix/convert_field_map.py sphenix3dtrackingmapxyz.root field_xyz.txt
+    python scripts/acts/detectors/sphenix/convert_field_map.py map2d.root field_rz.txt --kind rz
+    python scripts/acts/detectors/sphenix/convert_field_map.py --uniform 1.4 uniform_xyz.txt     (a test map: constant Bz)
 
 Input: cartesian ntuple branches x, y, z (cm), bx, by, bz (T); or r-z ntuple branches r, z (cm), br, bz
 (T; an old "map" ntuple is in Gauss: --field_unit 1e-4). --rescale multiplies the field, as sPHENIX's

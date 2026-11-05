@@ -1,0 +1,37 @@
+# ACTS worker image, Singularity recipe (stage 2 of 2; build_images.sh builds both): the base image
+# (acts-base.def) plus the small module perigee_propagator/ (propagation to the perigee with a direction,
+# covariance and, through a tracking geometry, material effects, which ACTS's core Python bindings lack).
+# Minutes to build; the image VertexHead(use_acts=True) runs.
+Bootstrap: localimage
+From: acts-base-48.2.0.sif
+
+%files
+    perigee_propagator /opt/perigee-propagator-src
+
+%post
+    JOBS=${JOBS:-8}
+    export LD_LIBRARY_PATH=/opt/root/lib:/opt/hepmc3/lib:/opt/hepmc3/lib64:$LD_LIBRARY_PATH
+
+    # the pybind11 ACTS's bindings were built with (same version: one shared type registry);
+    # <pybind11 source>/tools/pybind11Common.cmake
+    PYBIND11_SOURCE_DIR=$(dirname "$(find /opt/acts-build /opt/acts-src -path '*pybind11*' -name pybind11Common.cmake -print -quit)")
+    PYBIND11_SOURCE_DIR=$(cd "$PYBIND11_SOURCE_DIR/.." && pwd)
+    echo "pybind11 from: $PYBIND11_SOURCE_DIR"
+
+    cmake -S /opt/perigee-propagator-src -B /opt/perigee-propagator-build \
+        -DCMAKE_PREFIX_PATH="/opt/acts;/opt/root" -DPYBIND11_SOURCE_DIR="$PYBIND11_SOURCE_DIR" \
+        -DACTS_LIBRARY_DIR=/opt/acts-build/lib -DCMAKE_INSTALL_PREFIX=/opt/perigee-propagator
+    cmake --build /opt/perigee-propagator-build -j ${JOBS} || cmake --build /opt/perigee-propagator-build -j 1
+    cmake --install /opt/perigee-propagator-build
+    rm -rf /opt/perigee-propagator-build
+
+    PYTHONPATH=/opt/perigee-propagator:$PYTHONPATH acts-python -c \
+        "import acts, acts_perigee_propagator; print('perigee propagator OK:', acts_perigee_propagator.__file__)" \
+        || echo "WARNING: perigee propagator import check failed"
+
+%environment
+    export ROOT_INCLUDE_PATH=/opt/hepmc3/include:$ROOT_INCLUDE_PATH
+    export PATH=/opt/root/bin:$PATH
+    export LD_LIBRARY_PATH=/opt/root/lib:/opt/hepmc3/lib:/opt/hepmc3/lib64:$LD_LIBRARY_PATH
+    export ROOTSYS=/opt/root
+    export PYTHONPATH=/opt/perigee-propagator:$PYTHONPATH

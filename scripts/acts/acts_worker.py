@@ -1,82 +1,57 @@
 """
-acts_worker.py: ACTS (unmodified, through its Python bindings) computing bound perigee parameters for
-track states. Runs INSIDE the ACTS container (Python 3.12, NumPy, ACTS; no torch). Two uses:
+acts_worker.py: ACTS (unmodified, an external library) computing bound perigee parameters for track states.
+Runs INSIDE the worker image (acts-worker.def: Python 3.12, NumPy, ACTS, the acts_perigee_propagator module;
+no torch). Two uses:
 
 - as a module: build_propagator() and propagate_to_perigee(), shared with acts_reference.py;
 - as a persistent worker for VertexHead(use_acts=True), which starts it once and streams batches:
 
-    singularity exec acts-ref-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
+    singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
 
-Config (JSON): reference [x, y, z] mm (perigee surface centre); bz_tesla (constant field) or field_map
-(a text map in the container's view, see convert_field_map.py) with field_map_kind "xyz" or "rz",
-field_map_length_unit / field_map_field_unit (ACTS units per file unit; default mm and T); max_steps
-(ACTS default if absent).
+Config (JSON, ACTS units; VertexHead.acts_worker_config() writes it):
+    reference [x, y, z] mm: the perigee surface centre;
+    bz_tesla (constant field) or field_map (a text map as the container sees it) with field_map_kind "xyz" or
+        "rz", field_map_length_unit / field_map_field_unit (ACTS units per file unit; default mm and T);
+    geometry (TGeo ROOT file), geometry_config (ACTS TGeo JSON configuration) and optionally material_map (ACTS
+        JSON material map): propagate through that tracking geometry with material effects; energy_loss and
+        multiple_scattering (default true; scattering only widens a given covariance); without a geometry,
+        through the field alone;
+    max_steps (ACTS's default if absent); covariance: exchange covariances (protocol below).
 
-Material mode (worker image acts-material-worker.def): geometry (TGeo ROOT file, export_sphenix_geometry.C),
-geometry_config (TGeo JSON configuration, CDB ACTSGEOMETRYCONFIG) and optionally material_map (JSON, CDB
-ACTSMATERIALMAP) build sPHENIX's tracking geometry as sPHENIX does; tracks are then propagated through it
-with ACTS's MaterialInteractor (module acts_material_propagator) in their real direction, energy_loss (default
-true) adding back the energy lost between the state and the perigee. multiple_scattering (default true) only
-inflates a covariance, and none is passed, so it does not change the parameters.
+Tracks are propagated in their real direction; a backward state (perigee behind it, e.g. at the innermost hit)
+is propagated backward, so energy lost on the way out is added back.
 
 Protocol on stdin/stdout, after a line "ACTS_WORKER_READY": per batch the parent writes n (uint64), then
-position (n, 3), direction (n, 3), qop (n,) as float64 and backward (n,) as uint8; the worker answers
-params (n, 6) float64 (d0, z0, phi, theta, q/p, t in mm, GeV; NaN where ACTS failed or the input is not
-finite) and ok (n,) uint8. With "covariance": true in the config, the parent also sends each state's ACTS
-curvilinear covariance (n, 6, 6) float64 after backward, and the worker answers the perigee covariance
-(n, 6, 6) float64 between params and ok (multiple scattering added in material mode). EOF on stdin ends it
-(a summary of failures is printed). Everything else the worker or ACTS prints goes to stderr.
-
-A backward state (perigee behind it, e.g. at the innermost hit) is propagated as the reversed,
-charge-conjugated track (the same helix) and the result flipped back: d0, phi + pi, pi - theta, q/p and
-t change sign, z0 does not. No material effects there: ACTS's core Python propagation has none (material
-mode above).
+position (n, 3), direction (n, 3), qop (n,) as float64 and backward (n,) as uint8, and with "covariance": true
+each state's ACTS curvilinear covariance (n, 6, 6) float64; the worker answers params (n, 6) float64 (d0, z0,
+phi, theta, q/p, t in mm, GeV; NaN where ACTS failed or the input is not finite), with covariance the perigee
+covariance (n, 6, 6) float64, then ok (n,) uint8. EOF on stdin ends it, printing a summary of failures.
+Everything else the worker or ACTS prints goes to stderr.
 """
+import importlib
 import json
-import math
 import os
 import struct
 import sys
-import traceback
 
 import numpy as np
 
 import acts
+import acts_perigee_propagator
 
 
-def build_propagator(config):
-    """ACTS propagator, options, perigee surface and particle hypothesis from a config dict."""
-    u = acts.UnitConstants
-    if config.get("field_map"):
-        loader = {"xyz": acts.MagneticFieldMapXyz, "rz": acts.MagneticFieldMapRz}[config.get("field_map_kind", "xyz")]
-        field = loader(config["field_map"], lengthUnit=config.get("field_map_length_unit", u.mm),
-                       bFieldUnit=config.get("field_map_field_unit", u.T))
-    else:
-        field = acts.ConstantBField(acts.Vector3(0.0, 0.0, float(config["bz_tesla"]) * u.T))
-    reference = [float(v) for v in config.get("reference", (0.0, 0.0, 0.0))]
-    if config.get("geometry"):
-        return build_material_propagator(config, field, reference)
-    propagator = acts.EigenVoidPropagator(acts.EigenStepper(field), acts.VoidNavigator())
-    options = acts.PropagatorPlainOptions(acts.GeometryContext.dangerouslyDefaultConstruct(), acts.MagneticFieldContext())
-    if config.get("max_steps") is not None:
-        options.maxSteps = int(config["max_steps"])
-    surface = acts.Surface.createPerigee(acts.Vector3(*reference))
-    return propagator, options, surface, acts.ParticleHypothesis.pion
+def first_module(*names):
+    for name in names:
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            pass
+    raise ImportError(f"none of {names} in this ACTS build")
 
 
 def build_tracking_geometry(geometry, geometry_config, material_map=None):
-    """sPHENIX's ACTS tracking geometry from TGeo (TGeoDetector), with its JSON material map if given. Returns
-    (detector, geometry): the detector owns the detector elements and must be kept alive with the geometry."""
-    import importlib
-
-    def first_module(*names):
-        for name in names:
-            try:
-                return importlib.import_module(name)
-            except ImportError:
-                pass
-        raise ImportError(f"none of {names} (needs the material image, acts-material.def)")
-
+    """ACTS tracking geometry from TGeo (TGeoDetector with its JSON configuration), with a JSON material map if
+    given. Returns (detector, geometry): the detector owns the detector elements and must be kept alive."""
     tgeo = first_module("acts.examples.tgeo", "acts.tgeo")
     config = tgeo.TGeoDetector.Config()
     config.readJson(geometry_config)
@@ -89,57 +64,37 @@ def build_tracking_geometry(geometry, geometry_config, material_map=None):
     return detector, detector.trackingGeometry()
 
 
-def build_material_propagator(config, field, reference):
-    """Material mode: ("material", MaterialPropagator, keep-alive objects)."""
-    import acts_material_propagator
-    detector, geometry = build_tracking_geometry(config["geometry"], config["geometry_config"], config.get("material_map"))
-    propagator = acts_material_propagator.MaterialPropagator(
-        geometry=geometry, field=field, reference=reference, energy_loss=bool(config.get("energy_loss", True)),
-        multiple_scattering=bool(config.get("multiple_scattering", True)), max_steps=int(config.get("max_steps") or 0))
-    return "material", propagator, (detector, geometry, field)
-
-
-FLIP = np.diag([-1.0, 1.0, 1.0, -1.0, -1.0, -1.0])  # Jacobian of the reversal (d0, phi + pi, pi - theta, -q/p, -t)
+def build_propagator(config):
+    """(PerigeePropagator, objects to keep alive) from a config dict (see the module docstring)."""
+    u = acts.UnitConstants
+    if config.get("field_map"):
+        loader = {"xyz": acts.MagneticFieldMapXyz, "rz": acts.MagneticFieldMapRz}[config.get("field_map_kind", "xyz")]
+        field = loader(config["field_map"], lengthUnit=config.get("field_map_length_unit", u.mm),
+                       bFieldUnit=config.get("field_map_field_unit", u.T))
+    else:
+        field = acts.ConstantBField(acts.Vector3(0.0, 0.0, float(config["bz_tesla"]) * u.T))
+    detector = geometry = None
+    if config.get("geometry"):
+        detector, geometry = build_tracking_geometry(config["geometry"], config["geometry_config"], config.get("material_map"))
+    propagator = acts_perigee_propagator.PerigeePropagator(
+        field=field, reference=[float(v) for v in config.get("reference", (0.0, 0.0, 0.0))], geometry=geometry,
+        energy_loss=bool(config.get("energy_loss", True)), multiple_scattering=bool(config.get("multiple_scattering", True)),
+        max_steps=int(config.get("max_steps") or 0))
+    return propagator, (field, detector, geometry)
 
 
 def propagate_to_perigee(setup, position, direction, qop, backward, errors=None, covariance=None):
     """(n, 6) perigee parameters (NaN where ACTS failed or the input is not finite) and ok (n,); with a start
-    covariance (n, 6, 6) (ACTS curvilinear, mm) also the perigee covariance (n, 6, 6) (NaN where none)."""
-    if setup[0] == "material":
-        params, ok, failures, cov = setup[1].propagate(
-            np.asarray(position, dtype=np.float64), np.asarray(direction, dtype=np.float64),
-            np.asarray(qop, dtype=np.float64), np.asarray(backward, dtype=bool),
-            None if covariance is None else np.asarray(covariance, dtype=np.float64))
-        if errors is not None:
-            for key, count in failures.items():
-                errors.setdefault(key, [0, key])[0] += count
-        return (params, ok.astype(bool)) if covariance is None else (params, ok.astype(bool), cov)
-    propagator, options, surface, hypothesis = setup
-    n = len(qop)
-    params = np.full((n, 6), np.nan)
-    cov_out = np.full((n, 6, 6), np.nan)
-    finite = np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)
-    if covariance is not None:
-        finite &= np.isfinite(covariance).all(axis=(1, 2))
-    for i in np.flatnonzero(finite):
-        flip = -1.0 if backward[i] else 1.0
-        try:
-            start_cov = None if covariance is None else (FLIP @ covariance[i] @ FLIP if backward[i] else covariance[i])
-            start = acts.BoundTrackParameters.createCurvilinear(
-                pos4=acts.Vector4(*position[i].tolist(), 0.0), dir=acts.Vector3(*(flip * direction[i]).tolist()),
-                qOverP=float(flip * qop[i]), cov=start_cov, particleHypothesis=hypothesis)
-            end = propagator.propagateToSurface(start=start, target=surface, options=options)
-            d0, z0, phi, theta, q_over_p, t = list(end.parameters)
-            params[i] = ([-d0, z0, math.remainder(phi + math.pi, 2 * math.pi), math.pi - theta, -q_over_p, -t]
-                         if backward[i] else [d0, z0, phi, theta, q_over_p, t])
-            if covariance is not None and end.covariance is not None:
-                cov_out[i] = FLIP @ np.asarray(end.covariance) @ FLIP if backward[i] else np.asarray(end.covariance)
-        except Exception:  # noqa: BLE001 - one track failing must not stop the batch
-            if errors is not None:
-                key = traceback.format_exc(limit=2).strip().splitlines()[-1]
-                errors.setdefault(key, [0, traceback.format_exc(limit=3)])[0] += 1
-    ok = np.isfinite(params).all(axis=1)
-    return (params, ok) if covariance is None else (params, ok, cov_out)
+    covariance (n, 6, 6) (ACTS curvilinear, mm) also the perigee covariance (n, 6, 6). errors: a dict that
+    collects {failure: [count, detail]}."""
+    params, ok, failures, cov = setup[0].propagate(
+        np.asarray(position, dtype=np.float64), np.asarray(direction, dtype=np.float64),
+        np.asarray(qop, dtype=np.float64), np.asarray(backward, dtype=bool),
+        None if covariance is None else np.asarray(covariance, dtype=np.float64))
+    if errors is not None:
+        for key, count in failures.items():
+            errors.setdefault(key, [0, key])[0] += count
+    return (params, ok.astype(bool)) if covariance is None else (params, ok.astype(bool), cov)
 
 
 def read_exact(stream, size):
@@ -182,11 +137,10 @@ def serve(config):
         backward = np.frombuffer(body[n * 56: n * 57], dtype=np.uint8).astype(bool)
         covariance = np.frombuffer(body[n * 57:], dtype="<f8").reshape(n, 6, 6) if with_covariance else None
         result = propagate_to_perigee(setup, position, direction, qop, backward, errors, covariance)
-        params, ok = result[0], result[1]
         counts[0] += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())
-        counts[1] += int(ok.sum())
-        out.write(params.astype("<f8").tobytes() + (result[2].astype("<f8").tobytes() if with_covariance else b"")
-                  + ok.astype(np.uint8).tobytes())
+        counts[1] += int(result[1].sum())
+        out.write(result[0].astype("<f8").tobytes() + (result[2].astype("<f8").tobytes() if with_covariance else b"")
+                  + result[1].astype(np.uint8).tobytes())
         out.flush()
 
 

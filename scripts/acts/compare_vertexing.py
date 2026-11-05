@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""TEMPORARY TEST SCRIPT (2026-11-04): delete once the vertexing variants are decided.
+"""
+compare_vertexing.py: VertexHead variants for one detector on the same real events (the per-point CSV of
+eval_vertex_reconstruction.py --save_csv), PV only and with SV finding, against the true vertex. The detector
+file (scripts/acts/detectors/<name>/<name>.yaml) gives the configured setup; the variants switch one thing
+each, so the table shows what every ingredient is worth:
 
-Every VertexHead implementation on the same real events (eval_vertex_reconstruction.py --save_csv per-point
-CSV), PV only and SV default, against the true vertex:
+    hit-count weighting       the plain fit (vertex_weighting="hits", no adaptive fit, own track fit)
+    own track fit             the detector's settings without ACTS
+    detector settings         the detector file as it is
+    no material map           ... ACTS without the material map (if one is set)
+    energy loss on / off      ... with the detector's energy-loss setting flipped (if a material map is set)
+    error scale x<s>          ... with track_error_scale = s (per --error_scales)
 
-    own        VertexHead's own perigee (hit fit, constant Bz)
-    ACTS       ACTS propagates the hit fit to the beam spot (constant field, or --field_map)
-    ACTS geo   ... through sPHENIX's tracking geometry, no material (must equal ACTS)
-    ACTS mat   ... with the material map: energy loss, and multiple scattering in the covariance
-    ACTS mat-E ... material map, energy loss off (multiple scattering only)
-
-each with vertex_weighting "hits" (weight = hit count x P(real)) and "covariance" (inverse variance of each
-track's d0 / z0: the hit fit's, transported and widened by ACTS), and with covariance weighting also ACTS's
-adaptive (annealed) fit, once per --adaptive_error_scales value (track_error_scale). Variants needing an option that is not
-given are skipped. Reports truth-error quantiles, events within 1 cm, the median PV chi2/ndf (covariance
-weighting: about 1 if the errors are right), tracks ACTS dropped and time per event (after the first, which
-starts the worker).
+Reports truth-error quantiles (cm), events within 1 cm, the median PV chi2/ndf (covariance weighting: about 1
+if the track errors are right), tracks ACTS dropped and time per event (after the first, which starts the ACTS
+worker).
 
     python scripts/acts/compare_vertexing.py --csv vertex_per_point_data.csv \\
-        --image scripts/acts/acts-material-worker-48.2.0.sif --geometry sphenix_ana559_tgeo.root \\
-        --geometry_config tgeo-sphenix-mms-actsv45.0.0.json --material_map sphenix-mm-acts-material-actsv45.0.0.json
+        --detector scripts/acts/detectors/sphenix/sphenix.yaml [--error_scales 1 2.5] [--max_events 500]
 """
 import argparse
+import csv
 import os
 import sys
 import time
@@ -29,59 +28,70 @@ import time
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                                 "train", "downstream"))
 import vertexhead as vh  # noqa: E402
-from check_vertexhead_acts import load_events  # noqa: E402
 
 
-def variants(args):
-    acts = dict(use_acts=True, acts_image=args.image, acts_command=args.command, acts_field_map=args.field_map,
-                acts_field_map_kind=args.field_map_kind)
-    geo = dict(acts, acts_geometry=args.geometry, acts_geometry_config=args.geometry_config)
-    mat = dict(geo, acts_material_map=args.material_map)
-    have_acts, have_geo, have_mat = bool(args.image or args.command), bool(args.geometry and args.geometry_config), bool(args.material_map)
-    for name, kw, ok in (("own", {}, True), ("ACTS", acts, have_acts), ("ACTS geo", geo, have_acts and have_geo),
-                         ("ACTS mat", mat, have_acts and have_geo and have_mat),
-                         ("ACTS mat-E", dict(mat, acts_energy_loss=False), have_acts and have_geo and have_mat)):
-        if ok:
-            for weighting in ("hits", "covariance"):
-                if name == "ACTS mat-E" and weighting == "hits":
-                    continue        # no covariance: identical to ACTS geo
-                if name == "ACTS" and weighting == "covariance":
-                    continue        # needs the geometry route; ACTS geo / covariance is the constant field
-                yield f"{name} / {weighting}", dict(kw, vertex_weighting=weighting)
-                if weighting == "covariance" and name in args.adaptive_for:
-                    for scale in args.adaptive_error_scales:
-                        yield (f"{name} / adaptive x{scale:g}",
-                               dict(kw, vertex_weighting=weighting, adaptive_fit=True, track_error_scale=scale))
+def load_events(path, max_events):
+    """Per event: (class_probs, mask_probs, points, padding_mask) as VertexHead takes them, and the true vertex."""
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f))
+    header, rows = rows[0], rows[1:]
+    ix = {h: i for i, h in enumerate(header)}
+    by_event = {}
+    for row in rows:
+        by_event.setdefault(int(row[ix["batch_idx"]]), []).append(row)
+    events = []
+    for e in sorted(by_event)[:max_events]:
+        R = by_event[e]
+        truth = np.array([float(R[0][ix[f"test_truth_vtx_{a}"]] or "nan") for a in "xyz"]) \
+            if "test_truth_vtx_x" in ix else np.full(3, np.nan)
+        label = np.array([int(r[ix["pred_assignment"]]) for r in R])
+        keep = label != -1
+        if not keep.any():
+            continue
+        _, slot = np.unique(label[keep], return_inverse=True)
+        mask = torch.zeros(1, len(R), slot.max() + 1)
+        mask[0, torch.tensor(np.flatnonzero(keep)), torch.tensor(slot)] = 0.9
+        class_probs = torch.zeros(1, slot.max() + 1, 2)
+        class_probs[..., 1] = 0.8
+        points = torch.tensor([[float(r[ix[k]]) for k in ("E_norm", "eta_norm", "phi_norm", "r_norm")] for r in R])[None]
+        events.append(((class_probs, mask, points, torch.ones(1, len(R), dtype=torch.bool)), truth))
+    return events
+
+
+def variants(detector, error_scales):
+    """(name, VertexHead overrides) for this detector."""
+    base = vh.VertexHead.from_detector(detector)
+    yield "hit-count weighting", dict(use_acts=False, vertex_weighting="hits", adaptive_fit=False)
+    if base.use_acts:
+        yield "own track fit", dict(use_acts=False)
+    yield "detector settings", {}
+    if base.use_acts and base.acts_material_map:
+        yield "no material map", dict(acts_material_map=None)
+        yield f"energy loss {'off' if base.acts_energy_loss else 'on'}", dict(acts_energy_loss=not base.acts_energy_loss)
+    if base.vertex_weighting == "covariance":
+        for scale in error_scales:
+            if scale != base.track_error_scale:
+                yield f"error scale x{scale:g}", dict(track_error_scale=scale)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", required=True)
-    parser.add_argument("--image", default=None, help="ACTS image (the material worker image runs every ACTS variant)")
-    parser.add_argument("--command", nargs="+", default=None, help="instead of --image: command running Python with ACTS")
-    parser.add_argument("--field_map", default=None)
-    parser.add_argument("--field_map_kind", default="xyz", choices=("xyz", "rz"))
-    parser.add_argument("--geometry", default=None)
-    parser.add_argument("--geometry_config", default=None)
-    parser.add_argument("--material_map", default=None)
+    parser.add_argument("--detector", required=True, help="detector file (scripts/acts/detectors/<name>/<name>.yaml)")
+    parser.add_argument("--error_scales", type=float, nargs="*", default=[1.0, 2.5])
     parser.add_argument("--max_events", type=int, default=500)
-    parser.add_argument("--adaptive_error_scales", type=float, nargs="+", default=[1.0, 2.5],
-                        help="adaptive fit (ACTS annealing) variants, one per track_error_scale")
-    parser.add_argument("--adaptive_for", nargs="+", default=["own", "ACTS mat", "ACTS mat-E"],
-                        help="variants that also run with the adaptive fit")
     args = parser.parse_args()
 
     events = load_events(args.csv, args.max_events)
     n_truth = sum(bool(np.isfinite(t).all()) for _, t in events)
-    print(f"{len(events)} events ({n_truth} with a true vertex) from {args.csv}")
+    print(f"{len(events)} events ({n_truth} with a true vertex) from {args.csv}; detector {args.detector}")
     rows = []
-    for mode, mode_kw in (("PV only", {"find_secondary": False}), ("SV default", {})):
-        for name, kw in variants(args):
-            head = vh.VertexHead(**mode_kw, **kw).eval()
+    for mode, mode_kw in (("PV only", {"find_secondary": False}), ("with SVs", {"find_secondary": True})):
+        for name, kw in variants(args.detector, args.error_scales):
+            head = vh.VertexHead.from_detector(args.detector, **mode_kw, **kw).eval()
             outs, times = [], []
             with torch.no_grad():
                 for inputs, _ in events:
@@ -90,21 +100,21 @@ def main():
                     times.append(time.perf_counter() - t0)
             err = np.array([np.linalg.norm(o["vertex_estimate"][0].double().numpy() - t) for o, (_, t) in zip(outs, events)])
             err = err[np.isfinite(err)]
-            # ndf = 2 sum(w) - 3 (ACTS: weighted tracks count by their annealing weight)
-            ndf = [2 * float((o["track_weight"] > 0).to(torch.float64).mul(o.get("track_vertex_weight", torch.ones(1)).double()).sum()) - 3
+            # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
+            ndf = [2 * float((o["track_weight"] > 0).double().mul(o.get("track_vertex_weight", torch.ones(1)).double()).sum()) - 3
                    for o in outs]
             chi2 = np.array([o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()])
-            dropped = sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o)
             rows.append((mode, name, len(err), *(np.percentile(err, q) if len(err) else np.nan for q in (50, 68, 90)),
                          (err < 1.0).mean() if len(err) else np.nan,
-                         np.median(chi2) if len(chi2) and kw["vertex_weighting"] == "covariance" else np.nan, dropped,
+                         np.median(chi2) if len(chi2) and head.vertex_weighting == "covariance" else np.nan,
+                         sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o),
                          np.mean(times[1:] if len(times) > 1 else times) * 1e3))
             print(f"  done: {mode} / {name}", flush=True)
 
-    print(f"\n{'mode':10s} {'variant':28s} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} "
+    print(f"\n{'mode':9s} {'variant':22s} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} "
           f"{'chi2/ndf':>8s} {'dropped':>7s} {'ms/evt':>7s}   (truth error, cm)")
     for mode, name, n, m, p68, p90, within, chi2, dropped, ms in rows:
-        print(f"{mode:10s} {name:28s} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} "
+        print(f"{mode:9s} {name:22s} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} "
               f"{'' if np.isnan(chi2) else f'{chi2:8.2f}':>8s} {dropped:7d} {ms:7.1f}")
     return 0
 

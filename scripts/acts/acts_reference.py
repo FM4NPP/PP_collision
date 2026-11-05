@@ -3,7 +3,7 @@ acts_reference.py: ACTS's bound perigee parameters for a file of track states, f
 INSIDE the ACTS container (Python 3.12, NumPy, ACTS bindings; no torch): ACTS is run, not copied. Uses
 the same ACTS calls as the VertexHead worker (acts_worker.py).
 
-    singularity exec acts-ref-48.2.0.sif acts-python scripts/acts/acts_reference.py states.npz acts_out.npz
+    singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/acts_reference.py states.npz acts_out.npz
     ... --field_map field.txt [--field_map_kind rz]      (a converted field map instead of the constant field)
 
 Input (.npz, ACTS units: mm, GeV, e, T for the field), from compare_acts.py make:
@@ -26,7 +26,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("states")
     parser.add_argument("out")
-    parser.add_argument("--field_map", default=None, help="text field map (convert_field_map.py), mm and T")
+    parser.add_argument("--field_map", default=None, help="text field map (detectors/<name>/convert_field_map.py), mm and T")
     parser.add_argument("--field_map_kind", default="xyz", choices=("xyz", "rz"))
     parser.add_argument("--max_steps", type=int, default=None, help="ACTS propagation step limit (ACTS default if unset)")
     args = parser.parse_args()

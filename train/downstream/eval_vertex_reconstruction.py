@@ -8,7 +8,8 @@ eval_track_finding.py evaluates that head. Run from train/downstream:
 Backbone: --pretrained_ckpt, else pretrained_ckpt in --config. Track head: --checkpoint, else
 {track_config}_nerf_tracking_head_d{eventnumber}_{run_num}_seed{seed}[_nopretrain]_checkpoint.pth
 in --checkpoint_dir (default: the config's checkpoint_dir). Momentum: --momentum_ckpt, else built
-from --bz (else YAML vertex_bz, else 1.4).
+from --bz (else YAML vertex_bz, else 1.4). VertexHead: --detector (else YAML vertex_detector) gives a
+detector file (scripts/acts/detectors/<name>/<name>.yaml) with the field, ACTS inputs and fit settings.
 
 Outputs in --root_dir, named after {track_config}_eval_vertex_head_d...log: the .log metrics,
 _per_point_data.csv (unless --no-csv), _metrics.json and _results.npz (per-event vertices).
@@ -178,6 +179,13 @@ def main():
         default=None,
         help="Solenoid field, Tesla (default: YAML vertex_bz, else 1.4); ignored with --momentum_ckpt",
     )
+    parser.add_argument(
+        "--detector",
+        type=str,
+        default=None,
+        help="Detector file for VertexHead.from_detector (scripts/acts/detectors/<name>/<name>.yaml): field, "
+             "ACTS inputs and fit settings (default: YAML vertex_detector, else the built-in sPHENIX defaults)",
+    )
     args = parser.parse_args()
 
     # Prepare hyperparameters
@@ -213,6 +221,8 @@ def main():
     params.return_dict = False           # the trainer unpacks tuples, like track_finding_trainer
     if args.bz is not None:
         params.vertex_bz = args.bz
+    if args.detector is not None:
+        params.vertex_detector = os.path.abspath(args.detector)
 
     # Ensure output directory exists
     log_dir = args.root_dir

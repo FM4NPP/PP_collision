@@ -773,8 +773,7 @@ class DownstreamTrainer():
         def _p(name, default):
             return type(default)(getattr(self.params, name, default))
 
-        self.vertex_head = VertexHead(
-            Bz=bz,
+        settings = dict(
             momentum_head=momentum_head,
             min_track_pv_dca    = _p("sv_min_track_pv_dca",    0.05),
             min_track_beam_dca  = _p("sv_min_track_beam_dca",  0.05),
@@ -785,7 +784,16 @@ class DownstreamTrainer():
             min_sv_displacement = _p("sv_min_sv_displacement",  0.02),
             max_sv_chi2_per_dof = _p("sv_max_sv_chi2_per_dof", 10.0),
             max_sv_per_event    = _p("sv_max_sv_per_event",     6),
-        ).to(self.device).eval()
+        )
+        detector = getattr(self.params, "vertex_detector", None)
+        if detector:
+            # the detector file (scripts/acts/detectors/<name>/<name>.yaml) sets field, ACTS and fit settings;
+            # an explicit vertex_bz (YAML or --bz) still overrides its field
+            if getattr(self.params, "vertex_bz", None) is not None:
+                settings["Bz"] = bz
+            self.vertex_head = VertexHead.from_detector(detector, **settings).to(self.device).eval()
+        else:
+            self.vertex_head = VertexHead(Bz=bz, **settings).to(self.device).eval()
 
     def inference(self, checkpoint_path, pretrain=True, logfile=None, save_csv=False, csv_output_path=None,
                   momentum_ckpt=None):

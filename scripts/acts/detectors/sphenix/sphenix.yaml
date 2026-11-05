@@ -1,0 +1,40 @@
+# sPHENIX TPC detector description for VertexHead.from_detector (train/downstream/vertexhead.py) and its ACTS
+# worker. Relative paths are relative to this file; ACTS paths must be visible inside the container (export
+# SINGULARITY_BIND for directories outside your home). A copy with your own paths is the way to configure a
+# site; for another detector, copy this folder and fill in the same keys (README: Adding a detector).
+name: sphenix
+
+field:
+  bz_tesla: 1.4                # uniform solenoid field: the hit fit, and ACTS when no map is given
+  map: null                    # ACTS text field map (convert_field_map.py from the CDB field map), mm and T
+  map_kind: xyz                # xyz or rz
+
+beam_position_cm: [0.0, 0.0]   # beam line in x-y; the perigee reference
+
+# the dataset's hit normalization (TPCBatchDataset, fm4npp/datasets/dataset.py)
+normalization:
+  eta_lim: [-2.0, 2.0]
+  phi_lim: [-3.141592653589793, 3.141592653589793]
+  r_lim: [31.371997833251953, 75.38493347167969]   # cm
+  E_mean: 253.0982
+  E_std: 268.7093
+
+hit_errors_cm:                 # per-hit errors for the hit fit's covariance (core residuals measured on the data)
+  rphi: 0.034
+  z: 0.1
+
+acts:                          # use_acts is on when image (or command) is set
+  image: null                  # acts-worker-48.2.0.sif (scripts/acts/build_images.sh)
+  command: null                # instead of image: the command that runs Python with ACTS, a list
+  geometry: null               # TGeo file from export_sphenix_geometry.C, e.g. sphenix_ana559_tgeo.root
+  geometry_config: null        # ACTS TGeo JSON configuration, CDB key ACTSGEOMETRYCONFIG
+  material_map: null           # ACTS JSON material map, CDB key ACTSMATERIALMAP
+  energy_loss: false           # neutral to slightly worse on the 100 test events (2026-11-04)
+  max_steps: null              # ACTS's propagation step limit (null: ACTS's default)
+
+# any other VertexHead argument; the best variant on the 100 test events (2026-11-04): with ACTS and the material
+# map PV median 0.292 cm (own fit 0.328 cm) against 0.400 cm for hit-count weighting
+vertex_head:
+  vertex_weighting: covariance
+  adaptive_fit: true
+  track_error_scale: 2.5

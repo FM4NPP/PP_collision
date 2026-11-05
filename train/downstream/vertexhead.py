@@ -645,17 +645,17 @@ class VertexHead(nn.Module):
         use_acts: ACTS builds the perigee parameters from the hit fit: the fitted helix's state nearest the
             innermost hit, propagated to the beam spot by ACTS (scripts/acts/acts_worker.py, one persistent
             process); tracks ACTS fails on are dropped. Not with is_cosmics.
-        acts_image: the ACTS container image (scripts/acts: acts-ref-48.2.0.sif) for use_acts.
+        acts_image: the ACTS worker image (scripts/acts/build_images.sh: acts-worker-48.2.0.sif) for use_acts.
         acts_command: instead of acts_image, the command that runs Python with ACTS (a list).
-        acts_field_map: a text field map for ACTS (scripts/acts/convert_field_map.py, mm and T), as the
-            container sees it; None = constant Bz. The hit fit itself still uses Bz.
+        acts_field_map: a text field map for ACTS (mm, T; sPHENIX: scripts/acts/detectors/sphenix/
+            convert_field_map.py), as the container sees it; None = constant Bz. The hit fit still uses Bz.
         acts_field_map_kind: "xyz" or "rz" map.
         acts_max_steps: ACTS's propagation step limit (None: ACTS's default).
-        acts_geometry, acts_geometry_config: material mode (image acts-material-worker-48.2.0.sif): the
-            exported TGeo geometry (scripts/acts/export_sphenix_geometry.C) and the TGeo JSON configuration
-            (CDB ACTSGEOMETRYCONFIG), as the container sees them; ACTS then propagates through sPHENIX's
-            tracking geometry. None = no geometry, no material.
-        acts_material_map: the JSON material map (CDB ACTSMATERIALMAP) on that geometry; None = none.
+        acts_geometry, acts_geometry_config: a TGeo geometry file and its ACTS TGeo JSON configuration, as the
+            container sees them (sPHENIX: export_sphenix_geometry.C and CDB ACTSGEOMETRYCONFIG); ACTS then
+            propagates through that tracking geometry. None = through the field alone, no material.
+        acts_material_map: an ACTS JSON material map on that geometry (sPHENIX: CDB ACTSMATERIALMAP); None = none.
+        (VertexHead.from_detector sets all of these, and the settings above, from one detector file.)
         acts_energy_loss: with a material map, add back the energy lost between the innermost hit and the
             perigee (changes q/p; with vertex_weighting="covariance", multiple scattering also widens each
             track's covariance).
@@ -772,11 +772,6 @@ class VertexHead(nn.Module):
             raise ValueError("acts_geometry and acts_geometry_config go together; acts_material_map needs both")
         if vertex_weighting not in ("hits", "covariance"):
             raise ValueError(f"vertex_weighting must be 'hits' or 'covariance', not {vertex_weighting!r}")
-        if vertex_weighting == "covariance" and use_acts and not acts_geometry:
-            # ACTS 48.2's Python createCurvilinear rejects a start covariance (TypeError); the geometry route
-            # goes through acts_material_propagator instead, and without a material map equals the constant field
-            raise ValueError("vertex_weighting='covariance' with use_acts needs acts_geometry and acts_geometry_config "
-                             "(without acts_material_map it equals the constant-field propagation)")
         self.vertex_weighting = vertex_weighting
         self.hit_sigma_rphi = hit_sigma_rphi
         self.hit_sigma_z = hit_sigma_z
@@ -831,6 +826,40 @@ class VertexHead(nn.Module):
             self.beam_radius = nn.Parameter(torch.tensor(float(self.valid_radius)))
             self.log_gate_width_pt = nn.Parameter(torch.tensor(math.log(gate_width_pt)))
             self.log_gate_width_r = nn.Parameter(torch.tensor(math.log(gate_width_r)))
+
+    @classmethod
+    def from_detector(cls, path, **overrides):
+        """
+        A VertexHead from a detector description (YAML, e.g. scripts/acts/detectors/sphenix/sphenix.yaml): field,
+        beam position, hit normalization, hit errors, ACTS inputs (use_acts when acts.image or acts.command is
+        set) and a vertex_head block of further arguments. Relative paths are relative to the file. Keyword
+        arguments override the file.
+        """
+        import yaml
+        with open(path) as f:
+            d = yaml.safe_load(f)
+        base = os.path.dirname(os.path.abspath(path))
+        resolve = lambda p: p if p is None else os.path.join(base, os.path.expanduser(p))  # noqa: E731 - absolute stays
+        field, acts, hit_errors = d.get("field", {}), d.get("acts", {}) or {}, d.get("hit_errors_cm", {})
+        kwargs = {
+            "Bz": field.get("bz_tesla", 1.4),
+            "beam_position": tuple(d.get("beam_position_cm", (0.0, 0.0))),
+            "normalization": d.get("normalization"),
+            "hit_sigma_rphi": hit_errors.get("rphi", 0.034),
+            "hit_sigma_z": hit_errors.get("z", 0.1),
+            "use_acts": bool(acts.get("image") or acts.get("command")),
+            "acts_image": resolve(acts.get("image")),
+            "acts_command": acts.get("command"),
+            "acts_field_map": resolve(field.get("map")),
+            "acts_field_map_kind": field.get("map_kind", "xyz"),
+            "acts_geometry": resolve(acts.get("geometry")),
+            "acts_geometry_config": resolve(acts.get("geometry_config")),
+            "acts_material_map": resolve(acts.get("material_map")),
+            "acts_energy_loss": acts.get("energy_loss", True),
+            "acts_max_steps": acts.get("max_steps"),
+            **(d.get("vertex_head") or {}),
+        }
+        return cls(**{**kwargs, **overrides})
 
     def isCosmics(self, is_cosmics: bool = True):
         self.is_cosmics = is_cosmics

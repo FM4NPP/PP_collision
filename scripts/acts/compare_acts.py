@@ -4,7 +4,7 @@ method's performance.
 Runs in the training environment (torch); ACTS itself runs in its container (acts_reference.py).
 
     python scripts/acts/compare_acts.py make states.npz
-    singularity exec acts-ref-48.2.0.sif acts-python scripts/acts/acts_reference.py states.npz acts_out.npz
+    singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/acts_reference.py states.npz acts_out.npz
     python scripts/acts/compare_acts.py compare states.npz acts_out.npz
 
 make: exact helices from random perigee parameters (pT 0.1-20 GeV, uniform field), as three sets of
