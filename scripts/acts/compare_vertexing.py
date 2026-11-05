@@ -15,8 +15,10 @@ the tables show what every ingredient is worth:
 Tracks (--tracks): the track finder's (pred_assignment), and/or truth tracks (hits grouped by their truth
 particle, seg_target), which separates vertexing errors from track-finding errors.
 
-PV table: truth-error quantiles (cm), events within 1 cm, the median PV chi2/ndf (about 1 if the track errors are
-right), tracks ACTS dropped, time per event (after the first, which starts the ACTS worker).
+PV table: quantiles of the PV residual |reconstructed - true| (3D, cm), events within 1 cm, the median PV
+chi2/ndf (about 1 if the track errors are right), tracks ACTS dropped, time per event (after the first, which
+starts the ACTS worker). PV residual table: the residual split into transverse (xy) and z, and per axis its bias
+(median) and robust width (1.4826 x median absolute deviation, a Gaussian sigma).
 
 SV table (runs with SV finding), against the truth IDs (a track is a Geant secondary if the majority truth ID of
 its hits is < 0): SV candidates, the share of the usable secondaries among them and their purity; SVs found, the
@@ -139,7 +141,7 @@ def main():
     parser.add_argument("--max_events", type=int, default=500)
     args = parser.parse_args()
 
-    pv_rows, sv_rows = [], []
+    pv_rows, res_rows, sv_rows = [], [], []
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
         events = load_events(args.csv, args.max_events, tracks)
         n_truth = sum(bool(np.isfinite(e[1]).all()) for e in events)
@@ -156,8 +158,14 @@ def main():
                         t0 = time.perf_counter()
                         outs.append(head(*inputs))
                         times.append(time.perf_counter() - t0)
-                err = np.array([np.linalg.norm(o["vertex_estimate"][0].double().numpy() - e[1]) for o, e in zip(outs, events)])
-                err = err[np.isfinite(err)]
+                residual = np.array([o["vertex_estimate"][0].double().numpy() - e[1] for o, e in zip(outs, events)])
+                residual = residual[np.isfinite(residual).all(axis=1)]          # (events, 3): reconstructed - true, cm
+                err = np.linalg.norm(residual, axis=1)
+                transverse = np.linalg.norm(residual[:, :2], axis=1)
+                res_rows.append((tracks, mode, name, np.median(transverse), np.percentile(transverse, 68),
+                                 np.median(np.abs(residual[:, 2])), np.percentile(np.abs(residual[:, 2]), 68),
+                                 *np.median(residual, axis=0), *(1.4826 * np.median(np.abs(residual - np.median(residual, axis=0)), axis=0)))
+                       if len(residual) else (tracks, mode, name, *[np.nan] * 10))
                 # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
                 ndf = [2 * float((o["track_weight"] > 0).double().mul(o["track_vertex_weight"].double()).sum()) - 3
                        for o in outs]
@@ -176,6 +184,11 @@ def main():
     for tracks, mode, name, n, m, p68, p90, within, chi2, dropped, ms in pv_rows:
         print(f"{tracks:7s} {mode:9s} {name:22s} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} "
               f"{'' if np.isnan(chi2) else f'{chi2:8.2f}':>8s} {dropped:7d} {ms:7.1f}")
+    print(f"\n{'tracks':7s} {'mode':9s} {'variant':22s} {'xy med':>7s} {'xy 68%':>7s} {'|z| med':>7s} {'|z| 68%':>7s} "
+          f"{'bias x':>7s} {'bias y':>7s} {'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}"
+          f"   (PV residual reco - true, cm; bias = median, sig = 1.4826 MAD)")
+    for tracks, mode, name, *v in res_rows:
+        print(f"{tracks:7s} {mode:9s} {name:22s} " + " ".join(f"{x:7.4f}" for x in v))
     print(f"\n{'tracks':7s} {'variant':22s} {'cands':>6s} {'sec. found':>11s} {'eff':>5s} {'pure':>5s} {'SVs':>5s} "
           f"{'sec. tracks':>12s} {'all-sec':>7s} {'true SVs':>8s} {'residual':>8s}   (SVs against truth; residual cm)")
     for tracks, name, s in sv_rows:
