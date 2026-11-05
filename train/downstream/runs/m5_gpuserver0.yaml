@@ -9,7 +9,7 @@ pretrained_ckpt: /zfs0/fm4npp/pretrained/pp_nerf_m5_k30.ckpt
 # track head d9_m5_k30_p20_nerf_tracking_head_d70000_2_seed42_checkpoint.pth, found by its name parts in
 # checkpoint_dir (or set checkpoint: to the full path instead)
 track_config: d9_m5_k30_p20
-checkpoint_dir: /zfs0/fm4npp/downstream/d9_m5_k30_p20_nerf_tracking_head_d70000_2_seed42_checkpoint.pth       # FILL IN: the directory holding the track-head checkpoint
+checkpoint_dir: /zfs0/fm4npp/downstream/      # FILL IN: the directory holding the track-head checkpoint
 eventnumber: 70000            # the head's training size (part of its name)
 run_num: 2
 seed: 42
