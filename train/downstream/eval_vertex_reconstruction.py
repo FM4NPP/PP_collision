@@ -210,6 +210,9 @@ def main():
         base = os.path.dirname(os.path.abspath(run_config))
         path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir", "momentum_ckpt",
                      "csv_output_path", "data_root_test", "root_dir", "detector", "global_log_dir"}
+        # each value converted as the command line would be (e.g. run_num: 2 -> "2")
+        types = {a.dest: a.type for a in parser._actions if a.type is not None}
+        run = {k: types[k](v) if k in types and v is not None else v for k, v in run.items()}
         parser.set_defaults(**{k: os.path.join(base, os.path.expanduser(v)) if k in path_keys and isinstance(v, str) else v
                                for k, v in run.items()})
     args = parser.parse_args()
