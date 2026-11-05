@@ -3,7 +3,7 @@ acts_worker.py: ACTS (unmodified, an external library) computing bound perigee p
 Runs INSIDE the worker image (acts-worker.def: Python 3.12, NumPy, ACTS, the acts_perigee_propagator module;
 no torch). Two uses:
 
-- as a module: build_propagator() and propagate_to_perigee(), shared with acts_reference.py;
+- as a module: build_propagator() and propagate_to_perigee();
 - as a persistent worker for VertexHead(use_acts=True), which starts it once and streams batches:
 
     singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'

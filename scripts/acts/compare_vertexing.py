@@ -5,14 +5,13 @@ eval_vertex_reconstruction.py --save_csv), PV only and with SV finding, against 
 file (scripts/acts/detectors/<name>/<name>.yaml) gives the configured setup; the variants switch one thing
 each, so the table shows what every ingredient is worth:
 
-    hit-count weighting       the plain fit (vertex_weighting="hits", no adaptive fit, own track fit)
     own track fit             the detector's settings without ACTS
     detector settings         the detector file as it is
     no material map           ... ACTS without the material map (if one is set)
     energy loss on / off      ... with the detector's energy-loss setting flipped (if a material map is set)
     error scale x<s>          ... with track_error_scale = s (per --error_scales)
 
-Reports truth-error quantiles (cm), events within 1 cm, the median PV chi2/ndf (covariance weighting: about 1
+Reports truth-error quantiles (cm), events within 1 cm, the median PV chi2/ndf (about 1
 if the track errors are right), tracks ACTS dropped and time per event (after the first, which starts the ACTS
 worker).
 
@@ -64,17 +63,15 @@ def load_events(path, max_events):
 def variants(detector, error_scales):
     """(name, VertexHead overrides) for this detector."""
     base = vh.VertexHead.from_detector(detector)
-    yield "hit-count weighting", dict(use_acts=False, vertex_weighting="hits", adaptive_fit=False)
     if base.use_acts:
         yield "own track fit", dict(use_acts=False)
     yield "detector settings", {}
     if base.use_acts and base.acts_material_map:
         yield "no material map", dict(acts_material_map=None)
         yield f"energy loss {'off' if base.acts_energy_loss else 'on'}", dict(acts_energy_loss=not base.acts_energy_loss)
-    if base.vertex_weighting == "covariance":
-        for scale in error_scales:
-            if scale != base.track_error_scale:
-                yield f"error scale x{scale:g}", dict(track_error_scale=scale)
+    for scale in error_scales:
+        if scale != base.track_error_scale:
+            yield f"error scale x{scale:g}", dict(track_error_scale=scale)
 
 
 def main():
@@ -106,7 +103,7 @@ def main():
             chi2 = np.array([o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()])
             rows.append((mode, name, len(err), *(np.percentile(err, q) if len(err) else np.nan for q in (50, 68, 90)),
                          (err < 1.0).mean() if len(err) else np.nan,
-                         np.median(chi2) if len(chi2) and head.vertex_weighting == "covariance" else np.nan,
+                         np.median(chi2) if len(chi2) else np.nan,
                          sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o),
                          np.mean(times[1:] if len(times) > 1 else times) * 1e3))
             print(f"  done: {mode} / {name}", flush=True)

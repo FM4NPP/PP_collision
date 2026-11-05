@@ -18,6 +18,7 @@ import numpy as np
 from sklearn.metrics import adjusted_rand_score
 import os, sys, time, shutil, random
 import argparse
+import inspect
 import torch
 
 import torch.nn as nn
@@ -741,19 +742,16 @@ class DownstreamTrainer():
     # VertexHead evaluation
     # ------------------------------------------------------------------------------------------
 
-    def setup_vertexing(self, track_ckpt, momentum_ckpt=None):
+    def setup_vertexing(self, track_ckpt):
         """
         Build and strictly load the track head, then build VertexHead. Call after launch().
 
-        VertexHead settings from params (defaults; cm unless noted): vertex_bz (1.4 T),
-        sv_min_track_pv_dca (0.05), sv_min_track_beam_dca (0.05), sv_max_pair_doca (1.0),
-        sv_max_track_sv_doca (0.5), sv_seed_merge_distance (0.1), sv_min_sv_tracks (2),
-        sv_min_sv_displacement (0.02), sv_max_sv_chi2_per_dof (10), sv_max_sv_per_event (6).
+        VertexHead from params: vertex_detector (a detector file, VertexHead.from_detector), vertex_bz (T;
+        overrides the detector file's field; 1.4 without either), vertex_device, and any VertexHead argument
+        as vertex_<argument> (e.g. vertex_track_error_scale, vertex_max_sv_chi2_per_dof), each only where set.
 
         Args:
             track_ckpt: train_track_finding.py checkpoint.
-            momentum_ckpt: optional MomentumHead checkpoint to use instead of vertex_bz (experimental, as
-                the momentum task: ACTS computes momentum).
         """
         n_feat = 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone
         self.down_model = MambaAttentionHead(
@@ -770,41 +768,18 @@ class DownstreamTrainer():
         self.down_model.load_state_dict(sd)
         self.down_model.eval()
 
-        bz = float(getattr(self.params, "vertex_bz", 1.4))
-
-        momentum_head = None
-        if momentum_ckpt:            # experimental momentum task: imported only when its checkpoint is used
-            from momentumhead import MomentumHead
-            momentum_head = MomentumHead.from_checkpoint(momentum_ckpt)
-
-        # PV + SV head (secondary vertexing is VertexHead's default); SV cuts can be tuned via params
-        def _p(name, default):
-            return type(default)(getattr(self.params, name, default))
-
-        settings = dict(
-            momentum_head=momentum_head,
-            min_track_pv_dca    = _p("sv_min_track_pv_dca",    0.05),
-            min_track_beam_dca  = _p("sv_min_track_beam_dca",  0.05),
-            max_pair_doca       = _p("sv_max_pair_doca",        1.0),
-            max_track_sv_doca   = _p("sv_max_track_sv_doca",   0.5),
-            seed_merge_distance = _p("sv_seed_merge_distance",  0.1),
-            min_sv_tracks       = _p("sv_min_sv_tracks",        2),
-            min_sv_displacement = _p("sv_min_sv_displacement",  0.02),
-            max_sv_chi2_per_dof = _p("sv_max_sv_chi2_per_dof", 10.0),
-            max_sv_per_event    = _p("sv_max_sv_per_event",     6),
-        )
-        # VertexHead's device (YAML vertex_device, e.g. "cpu"): its many small per-iteration operations can run
+        # VertexHead arguments set in params as vertex_<argument>; vertex_bz is the field (Bz)
+        names = set(inspect.signature(VertexHead.__init__).parameters) - {"self"}
+        settings = {name: getattr(self.params, "vertex_" + name) for name in names
+                    if getattr(self.params, "vertex_" + name, None) is not None}
+        if getattr(self.params, "vertex_bz", None) is not None:
+            settings["Bz"] = float(self.params.vertex_bz)
+        # VertexHead's device (YAML vertex_device, e.g. "cpu"): its many small per-iteration operations run
         # faster on the CPU than on the GPU, where each convergence test waits for the device
         self.vertex_device = torch.device(getattr(self.params, "vertex_device", None) or self.device)
         detector = getattr(self.params, "vertex_detector", None)
-        if detector:
-            # the detector file (scripts/acts/detectors/<name>/<name>.yaml) sets field, ACTS and fit settings;
-            # an explicit vertex_bz (YAML or --bz) still overrides its field
-            if getattr(self.params, "vertex_bz", None) is not None:
-                settings["Bz"] = bz
-            self.vertex_head = VertexHead.from_detector(detector, **settings).to(self.vertex_device).eval()
-        else:
-            self.vertex_head = VertexHead(Bz=bz, **settings).to(self.vertex_device).eval()
+        head = VertexHead.from_detector(detector, **settings) if detector else VertexHead(**settings)
+        self.vertex_head = head.to(self.vertex_device).eval()
 
     def _vertex_head(self, class_probs, mask_probs, points, padding_mask):
         """VertexHead on its device (vertex_device); its tensor outputs back on the trainer's device."""
@@ -834,8 +809,7 @@ class DownstreamTrainer():
         sizes = [r["mask"].shape[0] for r in records]
         return list(zip(result["vertex_estimate"].split(sizes), result["fit_is_valid"].split(sizes)))
 
-    def inference(self, checkpoint_path, pretrain=True, logfile=None, save_csv=False, csv_output_path=None,
-                  momentum_ckpt=None):
+    def inference(self, checkpoint_path, pretrain=True, logfile=None, save_csv=False, csv_output_path=None):
         """
         Entry point, as in track_finding_trainer: setup_vertexing, then run_vertexing over at most
         self.max_eval_events (default 20000); writes the metrics log and, with save_csv, the CSV.
@@ -845,12 +819,11 @@ class DownstreamTrainer():
             pretrain: True = frozen-backbone features (as trained); False = head on raw points.
             logfile: metrics log path; None = not written.
             save_csv, csv_output_path: per-point CSV switch and path (default derived from logfile).
-            momentum_ckpt: optional MomentumHead checkpoint.
 
         Returns:
             run_vertexing's dict, plus csv_output_path when the CSV was written.
         """
-        self.setup_vertexing(checkpoint_path, momentum_ckpt=momentum_ckpt)
+        self.setup_vertexing(checkpoint_path)
         result = self.run_vertexing(pretrain=pretrain, max_events=getattr(self, "max_eval_events", 20000),
                                     save_csv=save_csv)
         if self.world_rank == 0:

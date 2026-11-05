@@ -11,8 +11,8 @@ site setup is one file; options on the command line override it.
 
 Backbone: --pretrained_ckpt, else pretrained_ckpt in --config. Track head: --checkpoint, else
 {track_config}_nerf_tracking_head_d{eventnumber}_{run_num}_seed{seed}[_nopretrain]_checkpoint.pth
-in --checkpoint_dir (default: the config's checkpoint_dir). Momentum: --momentum_ckpt, else built
-from --bz (else YAML vertex_bz, else 1.4). VertexHead: --detector (else YAML vertex_detector) gives a
+in --checkpoint_dir (default: the config's checkpoint_dir). Field: --bz, else YAML vertex_bz, else the
+detector file's, else 1.4. VertexHead: --detector (else YAML vertex_detector) gives a
 detector file (scripts/acts/detectors/<name>/<name>.yaml) with the field, ACTS inputs and fit settings.
 
 Outputs in --root_dir, named after {track_config}_eval_vertex_head_d...log: the .log metrics,
@@ -80,13 +80,6 @@ def main():
         default=None,
         help="Where track-head checkpoints live (default: checkpoint_dir from the config, "
              "where train_track_finding.py writes them)",
-    )
-    parser.add_argument(
-        "--momentum_ckpt",
-        type=str,
-        default=None,
-        help="MomentumHead checkpoint for the PV fit's track parameters (default: one built from --bz); "
-             "experimental, as the momentum task (ACTS computes momentum)",
     )
     parser.add_argument(
         "--run_num",
@@ -182,7 +175,7 @@ def main():
         "--bz",
         type=float,
         default=None,
-        help="Solenoid field, Tesla (default: YAML vertex_bz, else 1.4); ignored with --momentum_ckpt",
+        help="Solenoid field, Tesla (default: YAML vertex_bz, else the detector file's, else 1.4)",
     )
     parser.add_argument(
         "--detector",
@@ -228,7 +221,7 @@ def main():
         if unknown:
             sys.exit(f"{run_config}: unknown option(s) {unknown}; valid: {sorted(known - {'help', 'run_config'})}")
         base = os.path.dirname(os.path.abspath(run_config))
-        path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir", "momentum_ckpt",
+        path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir",
                      "csv_output_path", "data_root_test", "root_dir", "detector", "global_log_dir"}
         # each value converted as the command line would be (e.g. run_num: 2 -> "2")
         types = {a.dest: a.type for a in parser._actions if a.type is not None}
@@ -267,8 +260,6 @@ def main():
         sys.exit(f"track-head checkpoint not found: {checkpoint_path}\n"
                  f"(pass --checkpoint, or check --track_config/--run_num/--seed/--eventnumber "
                  f"against the training run)")
-    if args.momentum_ckpt and not os.path.isfile(args.momentum_ckpt):
-        sys.exit(f"momentum checkpoint not found: {args.momentum_ckpt}")
 
     params.num_embedder_layers = 0
     params.return_reg_test = True        # val loader then yields reg as a 4th element
@@ -312,7 +303,6 @@ def main():
         logfile=logfile,
         save_csv=args.save_csv,
         csv_output_path=args.csv_output_path,
-        momentum_ckpt=args.momentum_ckpt,
     )
     if trainer.world_rank == 0 and not args.no_output:
         save_results(result, trainer, params, args, checkpoint_path, logfile)
@@ -339,7 +329,6 @@ def save_results(result, trainer, params, args, checkpoint_path, logfile):
         "yaml_config": os.path.abspath(args.yaml_config),
         "pretrained_ckpt": params.pretrained_ckpt,
         "track_ckpt": os.path.abspath(checkpoint_path),
-        "momentum_ckpt": os.path.abspath(args.momentum_ckpt) if args.momentum_ckpt else None,
         "track_fit_config": trainer.vertex_head.track_fit_config(),
         "max_eval_events": args.max_eval_events,
         "metrics": result["metrics"],

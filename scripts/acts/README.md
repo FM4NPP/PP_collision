@@ -4,16 +4,19 @@
 `fm4npp-env`. It is run as a separate program, not copied, so its licence places no conditions on this
 repository's code. `VertexHead(use_acts=True)` hands each fitted track to ACTS, which propagates it from the
 innermost hit to the beam line (through the field, or through the detector's tracking geometry with its material)
-and returns ACTS bound perigee parameters and their covariance. The package's own pure-torch alternative is kept,
-experimental, in `train/downstream/momentumhead.py`.
+and returns ACTS bound perigee parameters and their covariance. The experimental pure-torch alternative
+(MomentumHead) and its check against ACTS live on the branch `experimental-momentum`.
 
-What ACTS adds, measured on 100 sPHENIX events (truth PV error, median / 68% / 90%, cm):
+What ACTS adds, measured on 1000 sPHENIX events (truth PV error, median / 68% / 90%, cm), VertexHead's
+covariance-weighted adaptive fit with each track model:
 
-| setup | median | 68% | 90% |
+| track model | median | 68% | 90% |
 |---|---|---|---|
-| hit-count weighting (VertexHead's default) | 0.400 | 0.699 | 5.82 |
-| covariance weighting + ACTS adaptive fit, own track fit | 0.328 | 0.417 | 6.20 |
-| ... with ACTS and the material map (multiple scattering in the errors) | 0.292 | 0.412 | 5.69 |
+| VertexHead's own hit fit | 0.247 | 0.380 | 1.49 |
+| ACTS, through the geometry, no material map | 0.246 | 0.377 | 1.41 |
+| ACTS with the material map (multiple scattering in the errors) | 0.234 | 0.351 | 1.37 |
+
+(The old hit-count-weighted fit, since removed, gave 0.339 / 0.595 / 6.20.)
 
 ## Pieces
 
@@ -25,7 +28,6 @@ What ACTS adds, measured on 100 sPHENIX events (truth PV error, median / 68% / 9
 | `detectors/<name>/` | everything detector-specific: the detector file `<name>.yaml` and the tools that make its inputs |
 | `check_geometry.py` | checks a detector's geometry and material map in ACTS |
 | `compare_vertexing.py` | VertexHead variants for one detector against the true vertex |
-| `compare_acts.py`, `acts_reference.py` | the experimental torch perigee maths against ACTS |
 
 ## Build (once)
 
@@ -88,20 +90,6 @@ and flagged in the output `acts_failed`; the worker prints a summary of failures
 - Field map: the CDB field map (ROOT ntuple `fieldmap`, cm and T):
   `python scripts/acts/detectors/sphenix/convert_field_map.py <map>.root field_xyz.txt` (`--uniform 1.4` writes a
   test map that must reproduce the constant field).
-
-## Reference check: the experimental torch maths against ACTS
-
-```bash
-python scripts/acts/compare_acts.py make states.npz
-```
-
-```bash
-singularity exec scripts/acts/acts-worker-48.2.0.sif acts-python scripts/acts/acts_reference.py states.npz acts_out.npz
-```
-
-```bash
-python scripts/acts/compare_acts.py compare states.npz acts_out.npz
-```
 
 The container has Python 3.12 and NumPy only (no torch): data goes between the environments through files, or
 through the worker's pipe.

@@ -32,9 +32,6 @@ acts:                          # use_acts is on when image (or command) is set
   energy_loss: false           # neutral to slightly worse on the 100 test events (2026-11-04)
   max_steps: null              # ACTS's propagation step limit (null: ACTS's default)
 
-# any other VertexHead argument; the best variant on the 100 test events (2026-11-04): with ACTS and the material
-# map PV median 0.292 cm (own fit 0.328 cm) against 0.400 cm for hit-count weighting
-vertex_head:
-  vertex_weighting: covariance
-  adaptive_fit: true
-  track_error_scale: 2.5
+# any other VertexHead argument (VertexHead's defaults otherwise; with ACTS and the material map the PV median was
+# 0.234 cm on 1000 test events, 0.247 cm with the own hit fit)
+vertex_head: {}

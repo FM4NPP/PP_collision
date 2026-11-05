@@ -5,18 +5,22 @@ Tracks are ACTS bound perigee parameters (d0, z0, phi, theta, q/p, t) w.r.t. the
 fitted from each track's assigned hits by the track model below (a Taubin circle in x-y and z against
 signed arc length along it; with use_acts, ACTS propagates that fitted helix to the beam spot), or given
 directly (track_parameters, e.g. from ACTS, in mm). The PV is the
-weighted least-squares point of closest approach to the usable tracks' straight lines at their perigee
-(weight = soft hit count x P(real)), refined by an iterative helix fit; an event where the helix fit
-gives no valid vertex (or Bz = 0) keeps the straight-line result.
+point of closest approach to the usable tracks, each weighted by the inverse variance of its d0 and z0
+(the hit fit's covariance, or ACTS's with use_acts) and by P(real), found with ACTS's adaptive vertex fit:
+annealed track weights from each track's compatibility chi2, and one helix-tangent update per iteration.
 
 Secondary vertices (find_secondary=True, the default):
-    1. candidates: DCA to the PV > min_track_pv_dca and to the beam line > min_track_beam_dca
+    1. candidates: compatibility chi2 to the PV > sv_min_track_pv_chi2 (and |d0| / sigma_d0 above
+       sv_min_track_beam_significance)
     2. seeds: midpoints of closest approach of candidate pairs with DOCA < max_pair_doca
-    3. each seed is fitted (same fit as the PV) from the candidates within max_track_sv_doca of it
-    4. kept if valid, >= min_sv_tracks, >= min_sv_displacement from the PV, chi2/ndf <= max
+    3. each seed is fitted (same fit as the PV) from the candidates with a compatibility chi2 to it up to
+       sv_max_track_chi2
+    4. kept if valid, >= min_sv_tracks, its distance to the PV >= sv_min_displacement_significance (both
+       vertex covariances), chi2/ndf <= max_sv_chi2_per_dof
     5. SVs within seed_merge_distance of a lower chi2/ndf SV are dropped
-    6. the PV is refitted without SV tracks and reported where the event has an SV and the refit
-       is valid; elsewhere the original fit (pv_original) is reported
+    6. the PV is refitted with the SV tracks shared with their SVs (ACTS's multi-vertex weights) and
+       reported where the event has an SV and the refit is valid; elsewhere the original fit
+       (pv_original) is reported
 
 Inputs (MambaAttentionHead.forward, TPCBatchDataset): class_probs (B, T, 2), mask_probs (B, N, T),
 normalized points (B, N, 4), padding_mask (B, N). B events, N hits, T track slots,
@@ -36,8 +40,6 @@ import torch.nn as nn
 
 # ------------------------------------------------------------------------------------------------
 # Track model: hit normalization, hard hit-to-track assignment, and each track's circle and z line
-# (moved here from momentumhead.py, which is experimental and imports these; its momentum-only outputs,
-# track_reg_result and radius, stay there)
 # ------------------------------------------------------------------------------------------------
 
 # TPCBatchDataset's hit normalization (fm4npp/datasets/dataset.py, TPCBatchDataset.__init__): eta, phi and
@@ -213,7 +215,7 @@ def _track_position_from_hits(points, hit_r, mask_probs, padding_mask):
     return track_position, total_hit_weight, is_assigned
 
 def _helix_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4, scaling_factor=100.0,
-                     valid_radius=1.0, min_hits=3, is_cosmics=False, beam_position=(0.0, 0.0)):
+                     valid_radius=1.0, min_hits=3, beam_position=(0.0, 0.0)):
     """
     Each track's helix (circle and z line) and quality labels from its assigned hits.
 
@@ -225,7 +227,7 @@ def _helix_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4, sca
         noise_pt_threshold: GeV; lower fitted pT -> not usable.
         Bz: Tesla; scaling_factor: converts metres to the units of points.
         valid_radius: cm; the circle must pass within this of the beam line to be usable.
-        min_hits: fewer assigned hits -> not fitted; is_cosmics: fit z against x instead of s.
+        min_hits: fewer assigned hits -> not fitted.
         beam_position: (x, y) of the beam line, cm; arc length and beam_dca are measured from it.
 
     Returns:
@@ -255,16 +257,15 @@ def _helix_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4, sca
 
     # a helix is linear in arc length, not in r: fit z against the signed arc length along the circle
     # from its closest approach to the beam line (positive in the direction of travel)
-    s = x if is_cosmics else _arc_length(x, y, xc.gather(1, track), yc.gather(1, track),
+    s = _arc_length(x, y, xc.gather(1, track), yc.gather(1, track),
                                          (sign_Rs * radius).gather(1, track), beam_position)
     zslope, z0 = _line_fit(s, z, track, assigned, n_tracks, min_hits=min_hits)
     ux, uy = (xc - xin) / radius, (yc - yin) / radius
     sin_phi, cos_phi = sign_Rs * ux, -sign_Rs * uy
     q = sign_Rs * (1.0 if Bz >= 0 else -1.0)
     pT = 0.299792458 * abs(Bz) * radius / scaling_factor     # pT [GeV] = c [1e9 m/s] * B [T] * R [m]
-    # cot(theta) = dz/ds: the arc-length slope, or dz/dx * dx/ds = zslope cos(phi) for cosmics
-    cot_theta = zslope * cos_phi if is_cosmics else zslope
-    theta = torch.atan2(torch.ones_like(cot_theta), cot_theta)
+    # cot(theta) = dz/ds, the arc-length slope
+    theta = torch.atan2(torch.ones_like(zslope), zslope)
     dx, dy = xc - beam_position[0], yc - beam_position[1]
     beam_dca = (torch.sqrt(dx * dx + dy * dy) - radius).abs()
 
@@ -452,41 +453,38 @@ def _fit_vertex_by_closest_approach(
     track_sigma=None,
 ):
     """
-    Weighted least-squares point of closest approach to straight tracks, per event.
+    Covariance-weighted least-squares point of closest approach to straight tracks, per event.
 
     Args:
         track_position, track_direction: (B, T, 3) a point on each line and its unit direction.
         track_weight: (B, T) non-negative; 0 = ignored.
         minimum_total_weight, minimum_eigenvalue_ratio: limits below which an event is not valid.
         regularization: added to the normal matrix's diagonal.
-        track_sigma: (B, T, 2) finite > 0, or None. Given: covariance weighting, each track's distance is
-            split into its transverse part (along U = z x direction, the d0 axis) with error sigma[..., 0] and
-            the part perpendicular to that and the track, with error sigma[..., 1] sin(theta) (sigma[..., 1]
-            the z0 error); the d0-z0 correlation is ignored. track_weight then scales these weights.
+        track_sigma: (B, T, 2) finite > 0: each track's distance is split into its transverse part (along
+            U = z x direction, the d0 axis) with error sigma[..., 0] and the part perpendicular to that and the
+            track, with error sigma[..., 1] sin(theta) (sigma[..., 1] the z0 error); the d0-z0 correlation is
+            ignored. track_weight scales these inverse-variance weights.
 
     Returns:
         dict:
-            vertex_estimate (B, 3); chi_square (B,), the weighted sum of squared DCAs (with track_sigma: of
-                the DCA's normalised residuals, a chi-square).
+            vertex_estimate (B, 3); chi_square (B,), the weighted sum of the DCAs' normalised residuals.
             fit_is_valid (B,): False without 2 non-parallel weighted tracks.
             track_closest_approach_point (B, T, 3), track_dca (B, T).
-            track_chi2 (B, T): each track's unweighted chi2 to the vertex, track_dca^2 (with track_sigma: the
-                normalised residual r^T W r, ACTS's vertex compatibility).
-            vertex_covariance (B, 3, 3): inverse of the normal matrix (the vertex covariance with track_sigma).
+            track_chi2 (B, T): each track's unweighted chi2 to the vertex, r^T W r (ACTS's vertex compatibility).
+            vertex_covariance (B, 3, 3): the inverse of the normal matrix.
             NaN where not valid (except chi_square).
     """
     weight = track_weight.clamp(min=0.0)
 
     I3 = torch.eye(3, device=track_position.device, dtype=track_position.dtype)
-    P = projector = I3 - track_direction.unsqueeze(-1) * track_direction.unsqueeze(-2)
-    if track_sigma is not None:
-        # W = U U^T / sigma_d0^2 + V V^T / (sigma_z0 sin theta)^2, V = direction x U; W P = W
-        transverse = track_direction[..., :2].norm(dim=-1).clamp(min=1e-12)
-        U = torch.stack([-track_direction[..., 1], track_direction[..., 0], torch.zeros_like(transverse)], dim=-1) \
-            / transverse.unsqueeze(-1)
-        V = torch.cross(track_direction, U, dim=-1)
-        P = (U.unsqueeze(-1) * U.unsqueeze(-2) / track_sigma[..., 0, None, None] ** 2
-             + V.unsqueeze(-1) * V.unsqueeze(-2) / (track_sigma[..., 1] * transverse)[..., None, None] ** 2)
+    projector = I3 - track_direction.unsqueeze(-1) * track_direction.unsqueeze(-2)
+    # W = U U^T / sigma_d0^2 + V V^T / (sigma_z0 sin theta)^2, V = direction x U; W projector = W
+    transverse = track_direction[..., :2].norm(dim=-1).clamp(min=1e-12)
+    U = torch.stack([-track_direction[..., 1], track_direction[..., 0], torch.zeros_like(transverse)], dim=-1) \
+        / transverse.unsqueeze(-1)
+    V = torch.cross(track_direction, U, dim=-1)
+    P = (U.unsqueeze(-1) * U.unsqueeze(-2) / track_sigma[..., 0, None, None] ** 2
+         + V.unsqueeze(-1) * V.unsqueeze(-2) / (track_sigma[..., 1] * transverse)[..., None, None] ** 2)
 
     normal_matrix = (weight[..., None, None] * P).sum(dim=1)
     weighted_position_sum = (weight[..., None] *
@@ -504,11 +502,10 @@ def _fit_vertex_by_closest_approach(
 
     dca_vector = torch.matmul(projector, (track_position - PV.unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
     track_dca = dca_vector.norm(dim=-1)
-    # each track's unweighted chi2 to the vertex (with track_sigma: ACTS's vertex compatibility r^T W r)
-    track_chi2 = (track_dca ** 2 if track_sigma is None else
-                  (dca_vector * torch.matmul(P, dca_vector.unsqueeze(-1)).squeeze(-1)).sum(dim=-1))
+    # each track's unweighted chi2 to the vertex: ACTS's vertex compatibility r^T W r
+    track_chi2 = (dca_vector * torch.matmul(P, dca_vector.unsqueeze(-1)).squeeze(-1)).sum(dim=-1)
     chi_square = (weight * track_chi2).sum(dim=-1)
-    # the vertex covariance (meaningful with track_sigma): the inverse of the normal matrix
+    # the vertex covariance: the inverse of the normal matrix
     vertex_covariance = torch.linalg.inv(regularized_normal_matrix)
 
     invalid = ~fit_is_valid
@@ -543,7 +540,6 @@ def _fit_vertex_by_helix_closest_approach(
     track_weight,
     n_iterations=100,
     linear_fit=None,
-    is_cosmics=False,
     tolerance=1e-4,
     beam_position=(0.0, 0.0),
     inputs_finite=False,
@@ -556,7 +552,7 @@ def _fit_vertex_by_helix_closest_approach(
     Args:
         circle_centre (B, T, 2), R_s (B, T): the track model's circle; sign(R_s) = sign(q Bz).
         zslope, z0: (B, T) z line z = zslope * s + z0, s the signed arc length from the circle's
-            closest approach to the beam line (_arc_length; s -> x if is_cosmics).
+            closest approach to the beam line (_arc_length).
         track_weight: (B, T); tracks with NaN parameters are excluded.
         n_iterations: maximum; stops once every vertex moves < tolerance; below 1 returns linear_fit.
         linear_fit: straight-line fit result whose vertex is the start (origin if None or NaN).
@@ -592,16 +588,13 @@ def _fit_vertex_by_helix_closest_approach(
     result = None
     for _ in range(n_iterations):
         # nearest point on each circle to the vertex in x-y, and the exact tangent there along the
-        # direction of travel (anticlockwise <=> R_s < 0); dz/ds = zslope (dz/dx * dx/ds for cosmics)
+        # direction of travel (anticlockwise <=> R_s < 0); dz/ds = zslope
         n = PV[:, None, :2] - circle_centre
         n = n / n.norm(dim=-1, keepdim=True).clamp(min=1e-12)
         pca_circle = circle_centre + radius.unsqueeze(-1) * n
         t_xy = torch.sign(R_s).unsqueeze(-1) * torch.stack([n[..., 1], -n[..., 0]], dim=-1)
 
-        if is_cosmics:
-            pca_z, dz = pca_circle[..., 0] * zslope + z0, zslope * t_xy[..., 0]
-        else:
-            pca_z, dz = _arc_length(pca_circle[..., 0], pca_circle[..., 1], x0, y0, R_s, beam_position) * zslope + z0, zslope
+        pca_z, dz = _arc_length(pca_circle[..., 0], pca_circle[..., 1], x0, y0, R_s, beam_position) * zslope + z0, zslope
         pca = torch.cat([pca_circle, pca_z.unsqueeze(-1)], dim=-1)
         tangent = torch.cat([t_xy, dz.unsqueeze(-1)], dim=-1)
         # clamped: a stand-in track (centre at the origin) with the vertex at the origin has no direction
@@ -644,18 +637,17 @@ class VertexHead(nn.Module):
         convergence_tolerance: cm; the helix fit stops once every vertex moves less than this.
         minimum_total_weight: an event needs more total track weight than this for a valid fit.
         Bz: solenoid field along z, Tesla (uniform).
-        is_cosmics: fit z against x instead of arc length.
         scaling_factor: converts the radius pT / (0.2998 Bz), in metres, to the units of points (100: cm).
         noise_pt_threshold: GeV; tracks with lower fitted pT are labelled noise (not usable).
         valid_radius: cm; a track is usable only if its circle passes within this of the beam line.
         min_hits: assigned hits needed for the circle and z-line fits.
         beam_position: (x, y) of the beam line, cm.
         normalization: the dataset's hit normalization (see _unnormalize_hits); TPC_NORMALIZATION if None.
-        momentum_head: an (experimental) MomentumHead whose config() supplies the eight settings above.
         track_parameter_length_scale: cm per length unit of forward's track_parameters (ACTS mm: 0.1).
         use_acts: ACTS builds the perigee parameters from the hit fit: the fitted helix's state nearest the
             innermost hit, propagated to the beam spot by ACTS (scripts/acts/acts_worker.py, one persistent
-            process); tracks ACTS fails on are dropped. Not with is_cosmics.
+            process), with the hit fit's covariance, which ACTS transports (adding multiple scattering where the
+            material map has material); tracks ACTS fails on are dropped.
         acts_image: the ACTS worker image (scripts/acts/build_images.sh: acts-worker-48.2.0.sif) for use_acts.
         acts_command: instead of acts_image, the command that runs Python with ACTS (a list).
         acts_field_map: a text field map for ACTS (mm, T; sPHENIX: scripts/acts/detectors/sphenix/
@@ -668,20 +660,18 @@ class VertexHead(nn.Module):
         acts_material_map: an ACTS JSON material map on that geometry (sPHENIX: CDB ACTSMATERIALMAP); None = none.
         (VertexHead.from_detector sets all of these, and the settings above, from one detector file.)
         acts_energy_loss: with a material map, add back the energy lost between the innermost hit and the
-            perigee (changes q/p; with vertex_weighting="covariance", multiple scattering also widens each
-            track's covariance).
-        vertex_weighting: "hits": track weight = soft hit count x P(real) (default, as before); "covariance":
-            each track weighted by its perigee d0 and z0 errors (inverse variance; weight = P(real)), so
-            chi_square and the SV chi2/ndf cut become chi-squares. The covariance is the hit fit's (from
-            hit_sigma_rphi / hit_sigma_z, no material), ACTS's propagation of it with use_acts (adding
-            multiple scattering with a material map), or forward's track_covariance. Not with is_cosmics.
+            perigee (changes q/p).
+        Each track is weighted by the inverse variance of its perigee d0 and z0 (and by P(real)), so
+            chi_square and the SV chi2/ndf cut are chi-squares. The covariance is the hit fit's (from
+            hit_sigma_rphi / hit_sigma_z, no material), ACTS's propagation of it with use_acts, or forward's
+            track_covariance.
         hit_sigma_rphi, hit_sigma_z: cm, per-hit errors for the hit fit's covariance: transverse to the
             circle and in z (defaults: the core residuals measured on the TPC data, 340 um and 1 mm).
-        track_error_scale: multiplies every track's d0 / z0 error (covariance weighting). The vertex does not
-            change; the chi2s, and so adaptive_fit's down-weighting and the SV chi2/ndf cut, do.
-        adaptive_fit: ACTS's adaptive vertex fit (AdaptiveMultiVertexFitter with AnnealingUtility, single
-            vertex) for the PV and its refit; needs vertex_weighting="covariance". Each iteration takes every
-            track's compatibility chi2 to the current vertex (ACTS getVertexCompatibility: r^T W r with the
+        track_error_scale: multiplies every track's d0 / z0 error (default 2.5: the PV chi2/ndf is about 1 and
+            the error is smallest on the test events; the errors are known to be too small). The vertex does
+            not change; the chi2s, and so the down-weighting and the SV chi2/ndf cut, do.
+        The fit is ACTS's adaptive vertex fit (AdaptiveMultiVertexFitter with AnnealingUtility, single vertex),
+            for the PV and its refit. Each iteration takes every track's compatibility chi2 to the current vertex (ACTS getVertexCompatibility: r^T W r with the
             track's impact-parameter errors), weights it w = 1 / (1 + exp(-(annealing_cut_off - chi2) / (2 T)))
             (tracks with w <= min_track_weight are left out), updates the vertex once (each helix's tangent at
             the current vertex, one solve: one linearised update per iteration, as in ACTS), and steps T through
@@ -693,22 +683,18 @@ class VertexHead(nn.Module):
             weights shared between vertices, the d0-z0 correlation is ignored, and the update is this module's
             helix-tangent least squares, not ACTS's Kalman update.
         find_secondary: find SVs and report the refitted PV; False = original PV-only fit.
-        min_track_pv_dca, min_track_beam_dca: cm, SV candidate cuts.
-        max_pair_doca, max_track_sv_doca: cm, seeding and attachment cuts.
-        seed_merge_distance: cm, duplicate-SV radius.
-        min_sv_tracks, min_sv_displacement (cm), max_sv_chi2_per_dof: SV cuts; ndf = 2 n_tracks - 3.
-        max_sv_per_event: SV slots per event (K).
-        refit_pv: report the PV refitted without SV tracks where valid; False = original fit. With
-            adaptive_fit the SV tracks stay in the refit, weighted by ACTS's multi-vertex annealing weight
-            (shared with their SVs) instead of being removed.
-        With vertex_weighting="covariance", SV finding uses significances instead of distances in cm:
-            sv_min_track_pv_chi2: a candidate's compatibility chi2 with the PV must exceed this (replaces
-                min_track_pv_dca); sv_min_track_beam_significance: |d0| / sigma_d0 above this (replaces
-                min_track_beam_dca; default 0 = off: the PV compatibility already excludes beam-line tracks,
-                and on the 100 CSV events a 3 sigma cut kept 11% of the true secondaries instead of 50%); sv_max_track_chi2: candidates are attached to a seed with a compatibility
-                chi2 up to this (replaces max_track_sv_doca); sv_min_displacement_significance: the SV-PV
-                distance in units of both vertex covariances (replaces min_sv_displacement). max_sv_chi2_per_dof
-                is then a true chi2/ndf. Defaults: chi2 9 (= annealing_cut_off, 3 sigma), 3 sigma displacement.
+        SV finding, in units of the tracks' and vertices' errors:
+            sv_min_track_pv_chi2: a candidate's compatibility chi2 with the PV must exceed this (default 9 =
+                annealing_cut_off, 3 sigma); sv_min_track_beam_significance: and |d0| / sigma_d0 this (default 0 =
+                off: the PV compatibility already excludes beam-line tracks, and on the 100 CSV events a 3 sigma
+                cut kept 11% of the true secondaries instead of 50%).
+            max_pair_doca: cm, seeds are candidate pairs closer than this.
+            sv_max_track_chi2: candidates are attached to a seed with a compatibility chi2 up to this (9).
+            min_sv_tracks, max_sv_chi2_per_dof (ndf = 2 n_tracks - 3), sv_min_displacement_significance (the
+                SV-PV distance in units of both vertex covariances, 3): SV cuts.
+            seed_merge_distance: cm, duplicate-SV radius. max_sv_per_event: SV slots per event (K).
+        refit_pv: report the PV refitted with the SV tracks shared with their SVs (ACTS's multi-vertex annealing
+            weights) where an SV was found and the refit is valid; False = the original fit.
     """
     def __init__(
         self,
@@ -716,14 +702,12 @@ class VertexHead(nn.Module):
         weight_hidden_dim: int = 32,
         helix_iterations: int = 100,
         Bz: float = 1.4,
-        is_cosmics: bool = False,
         scaling_factor: float = 100.0,
         noise_pt_threshold: float = 0.25,
         valid_radius: float = 1.0,
         min_hits: int = 3,
         beam_position: tuple = (0.0, 0.0),
         normalization: dict = None,
-        momentum_head=None,
         track_parameter_length_scale: float = 0.1,
         use_acts: bool = False,
         acts_image: str = None,
@@ -735,11 +719,9 @@ class VertexHead(nn.Module):
         acts_geometry_config: str = None,
         acts_material_map: str = None,
         acts_energy_loss: bool = True,
-        vertex_weighting: str = "hits",
         hit_sigma_rphi: float = 0.034,
         hit_sigma_z: float = 0.1,
-        track_error_scale: float = 1.0,
-        adaptive_fit: bool = False,
+        track_error_scale: float = 2.5,
         annealing_temperatures: tuple = (64.0, 16.0, 4.0, 2.0, 1.5, 1.0),
         annealing_cut_off: float = 9.0,
         min_track_weight: float = 1e-4,
@@ -754,13 +736,9 @@ class VertexHead(nn.Module):
         gate_width_pt: float = 0.05,
         gate_width_r: float = 0.2,
         find_secondary: bool = True,
-        min_track_pv_dca: float = 0.05,
-        min_track_beam_dca: float = 0.05,
         max_pair_doca: float = 1.0,
-        max_track_sv_doca: float = 0.5,
         seed_merge_distance: float = 0.1,
         min_sv_tracks: int = 2,
-        min_sv_displacement: float = 0.02,
         max_sv_chi2_per_dof: float = 10.0,
         max_sv_per_event: int = 6,
         refit_pv: bool = True,
@@ -782,15 +760,9 @@ class VertexHead(nn.Module):
         self.acts_energy_loss = acts_energy_loss
         if (acts_geometry is None) != (acts_geometry_config is None) or (acts_material_map and not acts_geometry):
             raise ValueError("acts_geometry and acts_geometry_config go together; acts_material_map needs both")
-        if vertex_weighting not in ("hits", "covariance"):
-            raise ValueError(f"vertex_weighting must be 'hits' or 'covariance', not {vertex_weighting!r}")
-        self.vertex_weighting = vertex_weighting
         self.hit_sigma_rphi = hit_sigma_rphi
         self.hit_sigma_z = hit_sigma_z
-        if adaptive_fit and vertex_weighting != "covariance":
-            raise ValueError("adaptive_fit needs vertex_weighting='covariance' (ACTS: no compatibility without a covariance)")
         self.track_error_scale = track_error_scale
-        self.adaptive_fit = adaptive_fit
         self.annealing_temperatures = tuple(float(t) for t in annealing_temperatures)
         self.annealing_cut_off = annealing_cut_off
         self.min_track_weight = min_track_weight
@@ -802,26 +774,20 @@ class VertexHead(nn.Module):
         self.sv_min_displacement_significance = sv_min_displacement_significance
         self.minimum_total_weight = minimum_total_weight
         self.find_secondary = find_secondary
-        self.min_track_pv_dca = min_track_pv_dca
-        self.min_track_beam_dca = min_track_beam_dca
         self.max_pair_doca = max_pair_doca
-        self.max_track_sv_doca = max_track_sv_doca
         self.seed_merge_distance = seed_merge_distance
         self.min_sv_tracks = min_sv_tracks
-        self.min_sv_displacement = min_sv_displacement
         self.max_sv_chi2_per_dof = max_sv_chi2_per_dof
         self.max_sv_per_event = max_sv_per_event
         self.refit_pv = refit_pv
-        # track-model settings (an experimental MomentumHead's config() overrides them)
-        settings = dict(Bz=Bz, is_cosmics=is_cosmics, scaling_factor=scaling_factor,
-                        noise_pt_threshold=noise_pt_threshold, valid_radius=valid_radius, min_hits=min_hits,
-                        beam_position=beam_position, normalization=normalization)
-        if momentum_head is not None:
-            settings.update(momentum_head.config())
-        for name, value in settings.items():
-            setattr(self, name, value)
-        self.beam_position = tuple(self.beam_position)
-        self.normalization = dict(TPC_NORMALIZATION if self.normalization is None else self.normalization)
+        # track-model settings
+        self.Bz = Bz
+        self.scaling_factor = scaling_factor
+        self.noise_pt_threshold = noise_pt_threshold
+        self.valid_radius = valid_radius
+        self.min_hits = min_hits
+        self.beam_position = tuple(beam_position)
+        self.normalization = dict(TPC_NORMALIZATION if normalization is None else normalization)
         if learn_weights:
             # 6 inputs: class_probs (2) + (q/(pT+1), theta, sin phi, cos phi) at the perigee; position excluded
             self.track_weight_network = nn.Sequential(
@@ -873,9 +839,6 @@ class VertexHead(nn.Module):
         }
         return cls(**{**kwargs, **overrides})
 
-    def isCosmics(self, is_cosmics: bool = True):
-        self.is_cosmics = is_cosmics
-
     def setScalingFactor(self, scaling_factor: float = 100.0):
         self.scaling_factor = scaling_factor
 
@@ -900,11 +863,11 @@ class VertexHead(nn.Module):
                 "bz_tesla": self.Bz, "field_map": self.acts_field_map, "field_map_kind": self.acts_field_map_kind,
                 "max_steps": self.acts_max_steps, "geometry": self.acts_geometry,
                 "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
-                "energy_loss": self.acts_energy_loss, "covariance": self.vertex_weighting == "covariance"}
+                "energy_loss": self.acts_energy_loss, "covariance": True}
 
     def track_fit_config(self):
-        """The track-model settings (the keys of an experimental MomentumHead's config())."""
-        return {k: getattr(self, k) for k in ("Bz", "is_cosmics", "scaling_factor", "noise_pt_threshold",
+        """The track-model settings."""
+        return {k: getattr(self, k) for k in ("Bz", "scaling_factor", "noise_pt_threshold",
                                               "valid_radius", "min_hits", "beam_position", "normalization")}
 
     def _fit(self, track_position, track_direction, track_weight, params, start=None):
@@ -917,7 +880,7 @@ class VertexHead(nn.Module):
         """
         fit = _fit_vertex_by_closest_approach(track_position, track_direction, track_weight,
                                               minimum_total_weight=self.minimum_total_weight,
-                                              track_sigma=params.get("track_sigma"))
+                                              track_sigma=params["track_sigma"])
         if self.Bz != 0.0:
             linear, fit = fit, _fit_vertex_by_helix_closest_approach(
                 *params["helix"],            # finite stand-ins for unfitted tracks (forward)
@@ -925,11 +888,10 @@ class VertexHead(nn.Module):
                 n_iterations=self.helix_iterations,
                 linear_fit=fit if start is None or self.helix_iterations < 1 else
                 {"vertex_estimate": torch.where(torch.isfinite(start), start, fit["vertex_estimate"])},
-                is_cosmics=self.is_cosmics,
                 tolerance=self.convergence_tolerance,
                 beam_position=self.beam_position,
                 minimum_total_weight=self.minimum_total_weight,
-                track_sigma=params.get("track_sigma"),
+                track_sigma=params["track_sigma"],
                 inputs_finite=True,
             )
             keep_linear = ~fit["fit_is_valid"]
@@ -950,9 +912,9 @@ class VertexHead(nn.Module):
             return self._fit(track_position, track_direction, track_weight, params)
         fit = _fit_vertex_by_helix_closest_approach(
             *params["helix"], track_weight, n_iterations=1,
-            linear_fit={"vertex_estimate": start}, is_cosmics=self.is_cosmics, tolerance=self.convergence_tolerance,
+            linear_fit={"vertex_estimate": start}, tolerance=self.convergence_tolerance,
             beam_position=self.beam_position, minimum_total_weight=self.minimum_total_weight,
-            track_sigma=params.get("track_sigma"), inputs_finite=True)
+            track_sigma=params["track_sigma"], inputs_finite=True)
         for key in ("track_dca", "track_chi2"):
             fit[key] = fit[key].masked_fill(~params["fit_ok"], float("nan"))
         fit["track_closest_approach_point"] = fit["track_closest_approach_point"].masked_fill(
@@ -961,7 +923,7 @@ class VertexHead(nn.Module):
 
     def _fit_adaptive(self, track_position, track_direction, track_weight, params, competing_chi2=None, start=None):
         """
-        ACTS's adaptive (annealed) vertex fit for one vertex, started from the plain fit (see adaptive_fit).
+        ACTS's adaptive (annealed) vertex fit for one vertex, started from the plain fit (see the class docstring).
         competing_chi2: (B, T, K) each track's compatibility chi2 to other vertices it is attached to (inf
             where not), for ACTS's multi-vertex weight exp(-chi2/2T) / (exp(-cutOff/2T) + sum_vertices
             exp(-chi2_v/2T)), so a track shared with an SV pulls the PV only as far as it is more compatible
@@ -970,11 +932,7 @@ class VertexHead(nn.Module):
             previous vertex.
         Returns the fit and each track's annealing weight (B, T) (ACTS trackWeight; 0 = left out).
         """
-        fit = self._fit(track_position, track_direction, track_weight, params,
-                        start=start if self.adaptive_fit else None)
-        vertex_weight = torch.ones_like(track_weight)
-        if not self.adaptive_fit:
-            return fit, vertex_weight
+        fit = self._fit(track_position, track_direction, track_weight, params, start=start)
         index, equilibrium = 0, False
         done, previous_weight = torch.zeros_like(fit["fit_is_valid"]), None    # finished events keep their fit
         for _ in range(self.adaptive_max_iterations):
@@ -1023,18 +981,12 @@ class VertexHead(nn.Module):
         device, dtype = track_position.device, track_position.dtype
         pv_position = pv_fit["vertex_estimate"].nan_to_num()
 
-        covariance = self.vertex_weighting == "covariance"
-        if covariance:
-            # ACTS-style significances: incompatible with the PV and displaced from the beam line in units of
-            # the track's own errors
-            track_sigma = params["track_sigma"]
-            displaced_mask = ((pv_fit["track_chi2"].nan_to_num() > self.sv_min_track_pv_chi2)
-                              & (params["beam_dca"].nan_to_num() / track_sigma[..., 0] > self.sv_min_track_beam_significance)
-                              & params["usable"])
-        else:
-            displaced_mask = ((pv_fit["track_dca"].nan_to_num() > self.min_track_pv_dca)
-                              & (params["beam_dca"].nan_to_num() > self.min_track_beam_dca)
-                              & params["usable"])
+        # ACTS-style significances: incompatible with the PV and displaced from the beam line in units of the
+        # track's own errors
+        track_sigma = params["track_sigma"]
+        displaced_mask = ((pv_fit["track_chi2"].nan_to_num() > self.sv_min_track_pv_chi2)
+                          & (params["beam_dca"].nan_to_num() / track_sigma[..., 0] > self.sv_min_track_beam_significance)
+                          & params["usable"])
         displaced_weight = track_weight * displaced_mask.to(track_weight.dtype)
 
         # seeds: closest-approach midpoints of candidate pairs (each once, i < j) with straight-line
@@ -1075,15 +1027,9 @@ class VertexHead(nn.Module):
         for k in range(K):
             if not seed_valid[:, k].any():
                 continue                 # no event has a seed in this slot: its outputs stay empty
-            # candidates within max_track_sv_doca (straight line) of this seed; an empty slot's NaN
-            # seed becomes the origin
-            diff = seeds[:, k].nan_to_num().unsqueeze(1) - track_position
-            if covariance:     # compatibility chi2 to the seed (the fit's metric)
-                in_sv = ((_track_compatibility(seeds[:, k].nan_to_num(), track_position, track_direction, track_sigma)
-                          <= self.sv_max_track_chi2) & (displaced_weight > 0))
-            else:
-                in_sv = (((diff - (diff * track_direction).sum(-1, keepdim=True) * track_direction).norm(dim=-1)
-                          < self.max_track_sv_doca) & (displaced_weight > 0))
+            # candidates compatible with this seed (chi2, the fit's metric); an empty slot's NaN seed becomes the origin
+            in_sv = ((_track_compatibility(seeds[:, k].nan_to_num(), track_position, track_direction, track_sigma)
+                      <= self.sv_max_track_chi2) & (displaced_weight > 0))
             sv_weight = displaced_weight * in_sv.to(displaced_weight.dtype)
             fit = self._fit(track_position, track_direction, sv_weight, params)
 
@@ -1092,13 +1038,11 @@ class VertexHead(nn.Module):
             chi2_per_dof = (fit["chi_square"] / ndf).masked_fill(~fit["fit_is_valid"], float("nan"))
             displacement = (fit["vertex_estimate"] - pv_position).norm(dim=-1)
 
-            if covariance:     # significance of the SV-PV distance, with both vertex covariances
-                d = (fit["vertex_estimate"] - pv_position).nan_to_num().unsqueeze(-1)
-                both = ((fit["vertex_covariance"] + pv_fit["vertex_covariance"]).nan_to_num(nan=0.0)
-                        + (~fit["fit_is_valid"]).view(-1, 1, 1) * torch.eye(3, dtype=dtype, device=device))
-                far_enough = (d * torch.linalg.solve(both, d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
-            else:
-                far_enough = displacement >= self.min_sv_displacement
+            # significance of the SV-PV distance, with both vertex covariances
+            d = (fit["vertex_estimate"] - pv_position).nan_to_num().unsqueeze(-1)
+            both = ((fit["vertex_covariance"] + pv_fit["vertex_covariance"]).nan_to_num(nan=0.0)
+                    + (~fit["fit_is_valid"]).view(-1, 1, 1) * torch.eye(3, dtype=dtype, device=device))
+            far_enough = (d * torch.linalg.solve(both, d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
             is_ok = (seed_valid[:, k] & fit["fit_is_valid"] & (n_used >= self.min_sv_tracks)
                      & far_enough
                      & (chi2_per_dof.nan_to_num(nan=float("inf")) <= self.max_sv_chi2_per_dof))
@@ -1132,18 +1076,13 @@ class VertexHead(nn.Module):
             "displaced_weight": displaced_weight,
         }
         if self.refit_pv and result["sv_is_valid"].any():     # without an SV the refit is never reported
-            if covariance and self.adaptive_fit:
-                # ACTS's multi-vertex weights: SV tracks stay in the PV fit, weighted down by how much more
-                # compatible they are with their SV(s)
-                competing = torch.where(result["sv_track_mask"], sv_track_chi2.nan_to_num(nan=float("inf")),
-                                        float("inf")).transpose(1, 2)
-                result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(
-                    track_position, track_direction, track_weight, params, competing_chi2=competing,
-                    start=pv_fit["vertex_estimate"])
-            else:
-                refit_weight = track_weight * (~result["sv_track_mask"].any(dim=1)).to(track_weight.dtype)
-                result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(
-                    track_position, track_direction, refit_weight, params)
+            # ACTS's multi-vertex weights: SV tracks stay in the PV fit, weighted down by how much more compatible
+            # they are with their SV(s)
+            competing = torch.where(result["sv_track_mask"], sv_track_chi2.nan_to_num(nan=float("inf")),
+                                    float("inf")).transpose(1, 2)
+            result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(
+                track_position, track_direction, track_weight, params, competing_chi2=competing,
+                start=pv_fit["vertex_estimate"])
         return result
 
     def forward(
@@ -1168,10 +1107,10 @@ class VertexHead(nn.Module):
             padding_mask: (B, N) True = real hit.
             track_parameters: (B, T, 6) ACTS bound perigee parameters (d0, z0, phi, theta, q/p, t) w.r.t. the
                 beam spot, lengths in the units given by track_parameter_length_scale (ACTS: mm); NaN rows =
-                no track. Not with is_cosmics.
+                no track.
             track_weight: (B, T) weight of each given track (default 1); only with track_parameters.
             track_covariance: (B, T, 6, 6) ACTS bound covariance of the given track_parameters (lengths in the
-                same units); needed with track_parameters and vertex_weighting="covariance".
+                same units); needed with track_parameters.
 
         Returns:
             dict, the PV (with find_secondary: the refit where used_refit, else the original fit):
@@ -1182,10 +1121,10 @@ class VertexHead(nn.Module):
                 acts_failed (B, T), with use_acts: fitted tracks ACTS failed on (dropped).
                 track_position, track_direction (B, T, 3): perigee point and direction there.
                 track_weight, track_quality_mask (B, T): fit weight, pT / beam-line cut.
-                track_sigma (B, T, 2), with vertex_weighting="covariance": the d0 and z0 errors used, cm (1 where
-                    a track has none; its weight is 0).
-                With adaptive_fit: track_vertex_weight (B, T), each track's annealing weight in the reported PV
-                    (0 = left out); track_chi2 (B, T), its compatibility chi2 to it; vertex_covariance (B, 3, 3).
+                track_sigma (B, T, 2): the d0 and z0 errors used, cm, track_error_scale included (1 where a track
+                    has none; its weight is 0).
+                track_vertex_weight (B, T): each track's annealing weight in the reported PV (0 = left out);
+                    track_chi2 (B, T), its compatibility chi2 to it; vertex_covariance (B, 3, 3).
             With find_secondary also (NaN / False / 0 where sv_is_valid is False):
                 sv_estimate (B, K, 3); sv_is_valid, sv_chi2, sv_chi2_per_dof, sv_displacement,
                     sv_n_tracks (B, K); sv_track_mask, sv_track_dca (B, K, T).
@@ -1193,11 +1132,6 @@ class VertexHead(nn.Module):
                 pv_original: dict, the original PV fit.
                 used_refit (B,): the reported PV is the refit.
         """
-        if self.is_cosmics and self.use_acts:
-            raise NotImplementedError("use_acts is not supported with is_cosmics")
-        covariance_weighting = self.vertex_weighting == "covariance"
-        if self.is_cosmics and covariance_weighting:
-            raise NotImplementedError("vertex_weighting='covariance' is not supported with is_cosmics")
         acts_failed = track_sigma = None
         if track_parameters is None:
             # track model: hits in cm (padded hits are -100 in every column, which overflows sinh(eta); any
@@ -1206,23 +1140,21 @@ class VertexHead(nn.Module):
             innermost_hit, total_hit_weight, is_assigned = _track_position_from_hits(hits, hit_r, mask_probs, padding_mask)
             params = _helix_from_hits(hits, hit_r, is_assigned, self.noise_pt_threshold, Bz=self.Bz,
                                       scaling_factor=self.scaling_factor, valid_radius=self.valid_radius,
-                                      min_hits=self.min_hits, is_cosmics=self.is_cosmics,
-                                      beam_position=self.beam_position)
+                                      min_hits=self.min_hits, beam_position=self.beam_position)
             # the helix fit runs in the dtype of the hits
             params.update({k: params[k].to(hits.dtype) for k in ("theta", "circle_centre", "R_s", "zslope", "z0")})
             theta = params["theta"].double()
             q = torch.sign(params["R_s"].double()) * (1.0 if self.Bz >= 0 else -1.0)
-            if covariance_weighting:
-                # the hit fit's covariance at a point s_reference along each helix (cm, from the hit errors)
-                hit_track, hit_assigned = is_assigned.to(torch.uint8).argmax(dim=-1), is_assigned.any(dim=-1)
-                centre, R_s = params["circle_centre"].double(), params["R_s"].double()
-                hit_s = _arc_length(hits[..., 1].double(), hits[..., 2].double(), centre[..., 0].gather(1, hit_track),
-                                    centre[..., 1].gather(1, hit_track), R_s.gather(1, hit_track), self.beam_position)
-                fit_theta = torch.atan2(torch.ones_like(theta), params["zslope"].double())
-                hit_covariance = lambda s_reference, curvilinear: _track_covariance(  # noqa: E731
-                    hit_s, hit_track, hit_assigned, R_s.shape[-1], fit_theta, q * torch.sin(fit_theta) / params["pT"],
-                    s_reference, self.hit_sigma_rphi, self.hit_sigma_z, self.Bz, self.scaling_factor, curvilinear,
-                    self.min_hits)
+            # the hit fit's covariance at a point s_reference along each helix (cm, from the hit errors)
+            hit_track, hit_assigned = is_assigned.to(torch.uint8).argmax(dim=-1), is_assigned.any(dim=-1)
+            centre, R_s = params["circle_centre"].double(), params["R_s"].double()
+            hit_s = _arc_length(hits[..., 1].double(), hits[..., 2].double(), centre[..., 0].gather(1, hit_track),
+                                centre[..., 1].gather(1, hit_track), R_s.gather(1, hit_track), self.beam_position)
+            fit_theta = torch.atan2(torch.ones_like(theta), params["zslope"].double())
+            hit_covariance = lambda s_reference, curvilinear: _track_covariance(  # noqa: E731
+                hit_s, hit_track, hit_assigned, R_s.shape[-1], fit_theta, q * torch.sin(fit_theta) / params["pT"],
+                s_reference, self.hit_sigma_rphi, self.hit_sigma_z, self.Bz, self.scaling_factor, curvilinear,
+                self.min_hits)
             if self.use_acts:
                 # ACTS builds the perigee: the fitted helix's state nearest the innermost hit (in mm), propagated
                 # back to the beam spot; then used as given track_parameters; tracks ACTS fails on are dropped
@@ -1236,16 +1168,14 @@ class VertexHead(nn.Module):
                 theta = torch.atan2(torch.ones_like(theta), params["zslope"].double())
                 direction = torch.cat([torch.sin(theta).unsqueeze(-1) * torch.sign(R_s).unsqueeze(-1)
                                        * torch.stack([n[..., 1], -n[..., 0]], dim=-1), torch.cos(theta).unsqueeze(-1)], dim=-1)
-                start_covariance = None
-                if covariance_weighting:
-                    # ACTS's curvilinear covariance at the start (mm; t uncorrelated, variance 1 mm^2): ACTS
-                    # transports it to the perigee, adding multiple scattering where there is material
-                    to_mm = q.new_tensor([1.0, 1.0, self.track_parameter_length_scale, self.track_parameter_length_scale,
-                                          self.track_parameter_length_scale]) / self.track_parameter_length_scale
-                    start_covariance = q.new_zeros(*q.shape, 6, 6)
-                    start_covariance[..., 5, 5] = 1.0
-                    start_covariance[..., :5, :5] = hit_covariance(start_s, True) * to_mm[:, None] * to_mm[None, :]
-                    start_covariance = start_covariance.reshape(-1, 6, 6).cpu().numpy()
+                # ACTS's curvilinear covariance at the start (mm; t uncorrelated, variance 1 mm^2): ACTS transports
+                # it to the perigee, adding multiple scattering where there is material
+                to_mm = q.new_tensor([1.0, 1.0, self.track_parameter_length_scale, self.track_parameter_length_scale,
+                                      self.track_parameter_length_scale]) / self.track_parameter_length_scale
+                start_covariance = q.new_zeros(*q.shape, 6, 6)
+                start_covariance[..., 5, 5] = 1.0
+                start_covariance[..., :5, :5] = hit_covariance(start_s, True) * to_mm[:, None] * to_mm[None, :]
+                start_covariance = start_covariance.reshape(-1, 6, 6).cpu().numpy()
                 acts_out = _acts_worker(self.acts_worker_command(), self.acts_worker_config()).propagate(
                     (torch.cat([start_xy, start_z.unsqueeze(-1)], dim=-1) / self.track_parameter_length_scale
                      ).reshape(-1, 3).cpu().numpy(), direction.reshape(-1, 3).cpu().numpy(),
@@ -1253,25 +1183,16 @@ class VertexHead(nn.Module):
                     start_covariance)
                 track_parameters = torch.from_numpy(acts_out[0]).reshape(*q.shape, 6).to(hits.device, total_hit_weight.dtype)
                 acts_failed = params["fit_ok"] & ~torch.from_numpy(acts_out[1]).reshape(q.shape).to(hits.device)
-                if covariance_weighting:
-                    track_covariance = torch.from_numpy(acts_out[2]).reshape(*q.shape, 6, 6).to(hits.device)
-                track_weight = torch.ones_like(total_hit_weight) if covariance_weighting else total_hit_weight
+                track_covariance = torch.from_numpy(acts_out[2]).reshape(*q.shape, 6, 6).to(hits.device)
+                track_weight = torch.ones_like(total_hit_weight)
             else:
                 perigee = _perigee_from_circle(params["circle_centre"].double(), params["R_s"].double(),
                                                params["zslope"].double(), params["z0"].double(),
                                                q * torch.sin(theta) / params["pT"], self.beam_position)
-                if self.is_cosmics:      # z line against x: the perigee z is the line at the perigee x
-                    pca_x = self.beam_position[0] - perigee[..., 0] * torch.sin(perigee[..., 2])
-                    perigee[..., 1] = params["zslope"].double() * pca_x + params["z0"].double()
-                    perigee[..., 3] = theta
-                base_weight = class_probs[..., 1] * total_hit_weight
-                if covariance_weighting:
-                    covariance = hit_covariance(torch.zeros_like(theta), False)
-                    track_sigma = torch.stack([covariance[..., 0, 0], covariance[..., 1, 1]], dim=-1).sqrt()
-                    base_weight = class_probs[..., 1].clone()
+                covariance = hit_covariance(torch.zeros_like(theta), False)
+                track_sigma = torch.stack([covariance[..., 0, 0], covariance[..., 1, 1]], dim=-1).sqrt()
+                base_weight = class_probs[..., 1].clone()
         if track_parameters is not None:
-            if self.is_cosmics:
-                raise NotImplementedError("track_parameters input is not supported with is_cosmics")
             perigee = track_parameters.double().clone()
             perigee[..., [0, 1, 5]] = perigee[..., [0, 1, 5]] * self.track_parameter_length_scale
             fit_ok = torch.isfinite(perigee[..., :5]).all(dim=-1)
@@ -1284,17 +1205,15 @@ class VertexHead(nn.Module):
             if class_probs is None:
                 class_probs = torch.stack([torch.zeros_like(pT), torch.ones_like(pT)], dim=-1).to(dtype)
             base_weight = class_probs[..., 1] * (torch.ones_like(pT).to(dtype) if track_weight is None else track_weight)
-            if covariance_weighting:
-                if track_covariance is None:
-                    raise ValueError("vertex_weighting='covariance' with track_parameters needs track_covariance")
-                track_sigma = torch.stack([track_covariance[..., 0, 0], track_covariance[..., 1, 1]], dim=-1
-                                          ).double().sqrt() * self.track_parameter_length_scale
+            if track_covariance is None:
+                raise ValueError("track_parameters need their track_covariance")
+            track_sigma = torch.stack([track_covariance[..., 0, 0], track_covariance[..., 1, 1]], dim=-1
+                                      ).double().sqrt() * self.track_parameter_length_scale
         dtype = base_weight.dtype
-        if covariance_weighting:
-            # tracks without a usable covariance get no weight (and a finite stand-in error)
-            has_sigma = torch.isfinite(track_sigma).all(dim=-1) & (track_sigma > 0).all(dim=-1)
-            base_weight = base_weight * has_sigma.to(dtype)
-            params["track_sigma"] = torch.where(has_sigma.unsqueeze(-1), track_sigma * self.track_error_scale, 1.0).to(dtype)
+        # tracks without a usable covariance get no weight (and a finite stand-in error)
+        has_sigma = torch.isfinite(track_sigma).all(dim=-1) & (track_sigma > 0).all(dim=-1)
+        base_weight = base_weight * has_sigma.to(dtype)
+        params["track_sigma"] = torch.where(has_sigma.unsqueeze(-1), track_sigma * self.track_error_scale, 1.0).to(dtype)
         perigee = perigee.masked_fill(~params["fit_ok"].unsqueeze(-1), float("nan"))
 
         # straight line of each track at its perigee; tracks without a fit get a finite stand-in (weight 0)
@@ -1345,8 +1264,7 @@ class VertexHead(nn.Module):
         }
         if acts_failed is not None:
             result["acts_failed"] = acts_failed
-        if covariance_weighting:
-            result["track_sigma"] = params["track_sigma"]
+        result["track_sigma"] = params["track_sigma"]
         if self.find_secondary:
             secondary = self._find_secondary_vertices(fit, track_position, track_direction, track_weight, params)
             refit = secondary.pop("pv_refit", None)
@@ -1368,8 +1286,8 @@ class VertexHead(nn.Module):
             "fit_is_valid": fit["fit_is_valid"],
             "track_closest_approach_point": fit["track_closest_approach_point"],
             "track_dca": fit["track_dca"],
+            "track_vertex_weight": vertex_weight,
+            "track_chi2": fit["track_chi2"],
+            "vertex_covariance": fit["vertex_covariance"],
         })
-        if self.adaptive_fit:
-            result.update({"track_vertex_weight": vertex_weight, "track_chi2": fit["track_chi2"],
-                           "vertex_covariance": fit["vertex_covariance"]})
         return result
