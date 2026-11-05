@@ -442,23 +442,6 @@ def _acts_worker(command, config):
 
 atexit.register(lambda: [worker.close() for worker in _ACTS_WORKERS.values()])
 
-def _inverse_3x3(M):
-    """Inverse of 3x3 matrices (..., 3, 3) without the error check that makes torch.linalg.inv wait for a GPU
-    (a singular matrix gives inf / NaN instead of raising)."""
-    return torch.linalg.inv_ex(M)[0]
-
-def _symmetric_eigenvalue_range_3x3(M):
-    """Smallest and largest eigenvalue (...) of symmetric 3x3 matrices, in float64: the trigonometric solution of
-    the characteristic polynomial (from the trace, the sum of squares and one determinant), no iterative solver."""
-    M = M.double()
-    q = M.diagonal(dim1=-2, dim2=-1).sum(-1) / 3
-    p = torch.sqrt(((M * M).sum((-2, -1)) - 3 * q * q).clamp(min=0.0) / 6)       # tr((M - qI)^2) / 6
-    shifted = M - q[..., None, None] * torch.eye(3, dtype=M.dtype, device=M.device)
-    angle = torch.acos((torch.linalg.det(shifted) / (2 * p ** 3).clamp(min=1e-300)).clamp(-1.0, 1.0)) / 3
-    equal = p == 0                                                   # a multiple of the identity
-    return (torch.where(equal, q, q + 2 * p * torch.cos(angle + 2 * torch.pi / 3)),
-            torch.where(equal, q, q + 2 * p * torch.cos(angle)))
-
 def _fit_vertex_by_closest_approach(
     track_position,
     track_direction,
@@ -491,9 +474,6 @@ def _fit_vertex_by_closest_approach(
                 normalised residual r^T W r, ACTS's vertex compatibility).
             vertex_covariance (B, 3, 3): inverse of the normal matrix (the vertex covariance with track_sigma).
             NaN where not valid (except chi_square).
-
-    No call here waits for a GPU: on one the eigenvalue check is closed form, and the solve and inverse skip their
-    error checks (_ex; an invalid event solves against the identity anyway).
     """
     weight = track_weight.clamp(min=0.0)
 
@@ -513,19 +493,14 @@ def _fit_vertex_by_closest_approach(
                              torch.matmul(P, track_position.unsqueeze(-1)).squeeze(-1)).sum(dim=1)
 
     # degeneracy check before solving: smallest/largest eigenvalue ratio (0 tracks: all ~0;
-    # 1 track or parallel tracks: one ~0)
-    # (on a GPU closed form, as eigvalsh waits for the device; on the CPU eigvalsh is the cheaper)
-    if normal_matrix.is_cuda:
-        smallest, largest = _symmetric_eigenvalue_range_3x3(normal_matrix)
-    else:
-        eigenvalues = torch.linalg.eigvalsh(normal_matrix)
-        smallest, largest = eigenvalues[:, 0], eigenvalues[:, -1]
-    fit_is_valid = ((smallest / largest.clamp(min=regularization) > minimum_eigenvalue_ratio)
+    # 1 track or parallel tracks: one ~0). A rank-deficient matrix can make the solve raise.
+    eigenvalues = torch.linalg.eigvalsh(normal_matrix)
+    fit_is_valid = ((eigenvalues[:, 0] / eigenvalues[:, -1].clamp(min=regularization) > minimum_eigenvalue_ratio)
                     & (weight.sum(dim=-1) > minimum_total_weight))
 
     # invalid events solve against the identity instead; their results are set to NaN below
     regularized_normal_matrix = torch.where(fit_is_valid.view(-1, 1, 1), normal_matrix + regularization * I3, I3)
-    PV = torch.linalg.solve_ex(regularized_normal_matrix, weighted_position_sum)[0]
+    PV = torch.linalg.solve(regularized_normal_matrix, weighted_position_sum)
 
     dca_vector = torch.matmul(projector, (track_position - PV.unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
     track_dca = dca_vector.norm(dim=-1)
@@ -534,7 +509,7 @@ def _fit_vertex_by_closest_approach(
                   (dca_vector * torch.matmul(P, dca_vector.unsqueeze(-1)).squeeze(-1)).sum(dim=-1))
     chi_square = (weight * track_chi2).sum(dim=-1)
     # the vertex covariance (meaningful with track_sigma): the inverse of the normal matrix
-    vertex_covariance = torch.linalg.inv_ex(regularized_normal_matrix)[0]
+    vertex_covariance = torch.linalg.inv(regularized_normal_matrix)
 
     invalid = ~fit_is_valid
     return {
@@ -614,6 +589,7 @@ def _fit_vertex_by_helix_closest_approach(
     radius = R_s.abs()
     x0, y0 = circle_centre.unbind(-1)
 
+    result = None
     for _ in range(n_iterations):
         # nearest point on each circle to the vertex in x-y, and the exact tangent there along the
         # direction of travel (anticlockwise <=> R_s < 0); dz/ds = zslope (dz/dx * dx/ds for cosmics)
@@ -631,14 +607,16 @@ def _fit_vertex_by_helix_closest_approach(
         # clamped: a stand-in track (centre at the origin) with the vertex at the origin has no direction
         tangent = tangent / tangent.norm(dim=-1, keepdim=True).clamp(min=1e-12)
 
-        result = _fit_vertex_by_closest_approach(pca, tangent, track_weight, **linear_fit_kwargs)
-
-        still_moving = (still_moving & result["fit_is_valid"] &
-                         ((result["vertex_estimate"] - PV).norm(dim=-1) > tolerance))
-        
+        step = _fit_vertex_by_closest_approach(pca, tangent, track_weight, **linear_fit_kwargs)
+        # each event stops at its own convergence, so its result does not depend on the other events in the
+        # batch: only still-moving events take this step
+        result = step if result is None else {
+            k: torch.where(still_moving.view(-1, *[1] * (v.dim() - 1)), v, result[k]) for k, v in step.items()}
+        moved = (step["vertex_estimate"] - PV).norm(dim=-1) > tolerance
         # advance PV only where the fit is valid, so one bad event can't spread NaN
-        PV = torch.where(result["fit_is_valid"].unsqueeze(-1), result["vertex_estimate"], PV)
-       
+        PV = torch.where((still_moving & step["fit_is_valid"]).unsqueeze(-1), step["vertex_estimate"], PV)
+        still_moving = still_moving & step["fit_is_valid"] & moved
+
         if not still_moving.any():
             break
 
@@ -998,6 +976,7 @@ class VertexHead(nn.Module):
         if not self.adaptive_fit:
             return fit, vertex_weight
         index, equilibrium = 0, False
+        done, previous_weight = torch.zeros_like(fit["fit_is_valid"]), None    # finished events keep their fit
         for _ in range(self.adaptive_max_iterations):
             temperature = self.annealing_temperatures[index]
             # compatibility at the current vertex -> AnnealingUtility weight (single vertex)
@@ -1009,23 +988,29 @@ class VertexHead(nn.Module):
                                        + torch.exp((chi2 - competing_chi2) / (2.0 * temperature)).sum(dim=-1))
                 vertex_weight = vertex_weight.nan_to_num(0.0)
             vertex_weight = vertex_weight.masked_fill(vertex_weight <= self.min_track_weight, 0.0).to(track_weight.dtype)
+            if previous_weight is not None:
+                vertex_weight = torch.where(done.unsqueeze(-1), previous_weight, vertex_weight)
+            previous_weight = vertex_weight
             new = self._fit_step(track_position, track_direction, track_weight * vertex_weight, params,
                                  fit["vertex_estimate"])
             valid = new["fit_is_valid"]
             dx = (new["vertex_estimate"] - fit["vertex_estimate"]).nan_to_num().unsqueeze(-1)
-            relative_shift = (dx * _inverse_3x3(new["vertex_covariance"].nan_to_num(nan=0.0)
-                                                + (~valid).view(-1, 1, 1) * torch.eye(3, dtype=dx.dtype, device=dx.device)) @ dx
+            relative_shift = (dx * torch.linalg.solve(new["vertex_covariance"].nan_to_num(nan=0.0)
+                                                      + (~valid).view(-1, 1, 1) * torch.eye(3, dtype=dx.dtype, device=dx.device), dx)
                               ).sum(dim=(-2, -1))
-            fit = {k: torch.where(valid.view(-1, *[1] * (v.dim() - 1)), v, fit[k]) for k, v in new.items()}
-            small_shift = bool(((relative_shift <= self.max_relative_shift) | ~valid).all())
-            # ACTS: anneal after each update; equilibrium once the last temperature has been used
+            update = valid & ~done
+            fit = {k: torch.where(update.view(-1, *[1] * (v.dim() - 1)), v, fit[k]) for k, v in new.items()}
+            # ACTS: anneal after each update; equilibrium once the last temperature has been used. Then each
+            # event finishes once its shift is small, so its result does not depend on the rest of the batch.
             if not equilibrium:
                 if index < len(self.annealing_temperatures) - 1:
                     index += 1
                 else:
                     equilibrium = True
-            if equilibrium and small_shift:
-                break
+            if equilibrium:
+                done = done | (relative_shift <= self.max_relative_shift) | ~valid
+                if bool(done.all()):
+                    break
         return fit, vertex_weight
 
     def _find_secondary_vertices(self, pv_fit, track_position, track_direction, track_weight, params):
@@ -1111,7 +1096,7 @@ class VertexHead(nn.Module):
                 d = (fit["vertex_estimate"] - pv_position).nan_to_num().unsqueeze(-1)
                 both = ((fit["vertex_covariance"] + pv_fit["vertex_covariance"]).nan_to_num(nan=0.0)
                         + (~fit["fit_is_valid"]).view(-1, 1, 1) * torch.eye(3, dtype=dtype, device=device))
-                far_enough = (d * (_inverse_3x3(both) @ d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
+                far_enough = (d * torch.linalg.solve(both, d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
             else:
                 far_enough = displacement >= self.min_sv_displacement
             is_ok = (seed_valid[:, k] & fit["fit_is_valid"] & (n_used >= self.min_sv_tracks)

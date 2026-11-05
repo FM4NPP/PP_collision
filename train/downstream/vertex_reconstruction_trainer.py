@@ -269,7 +269,14 @@ class DownstreamTrainer():
 
         
     def init_exp_dir(self, exp_dir):
-                   
+        if getattr(self.params, "no_output", False):
+            # a test run (eval --no_output): no directories or log files; logs go to the null device
+            self.params['experiment_dir'] = os.path.abspath(exp_dir)
+            self.params['checkpoint_path'] = os.path.join(exp_dir, 'checkpoints/ckpt.tar')
+            self.params['resuming'] = False
+            self.logfile = self.globalfile = os.devnull
+            return
+
         if self.world_rank==0:
             if not os.path.isdir(exp_dir):
                 os.makedirs(exp_dir)
@@ -808,6 +815,25 @@ class DownstreamTrainer():
             {k: move(x) for k, x in v.items()} if isinstance(v, dict) else v)
         return {k: move(v) for k, v in result.items()}
 
+    def _vertex_head_chunk(self, records):
+        """
+        VertexHead once over several loader batches (records with class_probs (b, T, 2), mask_probs (b, N, T),
+        grouped (b, N, 4), mask (b, N)), padded to the largest hit count (padded hits are masked, padded track
+        slots have P(real) = 0). Returns each record's (vertex_estimate (b, 3), fit_is_valid (b,)).
+        """
+        n_hits = max(r["mask"].shape[1] for r in records)
+        n_tracks = max(r["class_probs"].shape[1] for r in records)
+        pad = lambda t, dims, value=0.0: torch.nn.functional.pad(t, dims, value=value)  # noqa: E731
+        result = self._vertex_head(
+            class_probs=torch.cat([pad(r["class_probs"].float(), (0, 0, 0, n_tracks - r["class_probs"].shape[1]))
+                                   for r in records]),
+            mask_probs=torch.cat([pad(r["mask_probs"].float(), (0, n_tracks - r["mask_probs"].shape[2],
+                                                                 0, n_hits - r["mask_probs"].shape[1])) for r in records]),
+            points=torch.cat([pad(r["grouped"], (0, 0, 0, n_hits - r["grouped"].shape[1])) for r in records]),
+            padding_mask=torch.cat([pad(r["mask"], (0, n_hits - r["mask"].shape[1]), value=False) for r in records]))
+        sizes = [r["mask"].shape[0] for r in records]
+        return list(zip(result["vertex_estimate"].split(sizes), result["fit_is_valid"].split(sizes)))
+
     def inference(self, checkpoint_path, pretrain=True, logfile=None, save_csv=False, csv_output_path=None,
                   momentum_ckpt=None):
         """
@@ -865,10 +891,35 @@ class DownstreamTrainer():
             backbone, track head, VertexHead, of which ACTS (worker start-up and propagation), truth and CSV),
             also in metrics as time_<stage>_ms_per_event. The GPU is synchronised at each stage boundary so
             the stages are attributed correctly.
+
+        The backbone and track head run per loader batch (one event by default: padding several events slows the
+        backbone and slightly changes its output); their outputs are collected and VertexHead runs once per
+        vertex_chunk_events events (YAML / --vertex_chunk_events, default 32; 1 = per batch), as its cost is
+        mostly per call. Each event's vertex does not depend on the rest of its chunk (up to ~1e-4 cm rounding).
         """
         self.model.eval()
         amp = torch.cuda.is_available() and self.use_amp
         est, tgt, ok, per_point = [], [], [], []
+        chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
+        pending = []        # loader batches waiting for VertexHead
+
+        def flush():
+            """VertexHead over the pending batches, then their metrics inputs and CSV rows."""
+            if not pending:
+                return
+            fitted = self._vertex_head_chunk(pending)
+            lap("vertex_head")
+            for r, (vertex, valid) in zip(pending, fitted):
+                if save_csv:
+                    truth_vertex = r["truth"]["vertex_target"].masked_fill(~r["truth"]["vertex_valid"][:, None],
+                                                                           float("nan"))
+                    per_point.append(per_point_columns(r["step"], r["grouped"], r["label"], r["reg"], r["mask"],
+                                                       r["class_probs"], r["mask_probs"], vertex, truth_vertex))
+                est.append(vertex)
+                tgt.append(r["truth"]["vertex_target"])
+                ok.append(valid & r["truth"]["vertex_valid"])
+            pending.clear()
+            lap("truth_and_csv")
 
         timing = dict.fromkeys(("data", "backbone", "track_head", "vertex_head", "truth_and_csv"), 0.0)
         for key in vertexhead.ACTS_TIMING:
@@ -902,23 +953,18 @@ class DownstreamTrainer():
                     out = self.down_model(grouped, feature=None)
                 lap("track_head")
 
-            result = self._vertex_head(
-                class_probs=out["class_probs"].float(), mask_probs=out["mask_probs"].float(),
-                points=grouped, padding_mask=mask)
-            lap("vertex_head")
-
             # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them
             truth = get_vertex_label(reg, valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask)
-            if save_csv:
-                truth_vertex = truth["vertex_target"].masked_fill(~truth["vertex_valid"][:, None], float("nan"))
-                per_point.append(per_point_columns(step, grouped, label, reg, mask, out["class_probs"],
-                                                   out["mask_probs"], result["vertex_estimate"], truth_vertex))
-            est.append(result["vertex_estimate"])
-            tgt.append(truth["vertex_target"])
-            ok.append(result["fit_is_valid"] & truth["vertex_valid"])
+            pending.append({"step": step, "grouped": grouped, "label": label, "reg": reg, "mask": mask, "truth": truth,
+                            "class_probs": out["class_probs"], "mask_probs": out["mask_probs"]})
             lap("truth_and_csv")
-            if max_events and sum(len(x) for x in est) >= max_events:
+            n_seen = sum(len(x) for x in est) + sum(r["mask"].shape[0] for r in pending)
+            last = bool(max_events) and n_seen >= max_events
+            if last or sum(r["mask"].shape[0] for r in pending) >= chunk_events:
+                flush()
+            if last:
                 break
+        flush()              # the loader ended with a partial chunk
 
         est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)
         metrics = compute_vertex_metrics(est, tgt, ok)

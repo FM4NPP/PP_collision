@@ -16,7 +16,8 @@ from --bz (else YAML vertex_bz, else 1.4). VertexHead: --detector (else YAML ver
 detector file (scripts/acts/detectors/<name>/<name>.yaml) with the field, ACTS inputs and fit settings.
 
 Outputs in --root_dir, named after {track_config}_eval_vertex_head_d...log: the .log metrics,
-_per_point_data.csv (unless --no-csv), _metrics.json and _results.npz (per-event vertices).
+_per_point_data.csv (unless --no-csv), _metrics.json and _results.npz (per-event vertices). --no_output writes
+none of these (a test run: metrics and timing are printed only).
 """
 import os
 import sys
@@ -191,6 +192,19 @@ def main():
              "ACTS inputs and fit settings (default: YAML vertex_detector, else the built-in sPHENIX defaults)",
     )
     parser.add_argument(
+        "--no_output",
+        action="store_true",
+        help="Test run: write no files (no CSV, .log, _results.npz, _metrics.json, experiment or global log "
+             "directories); the metrics and timing are only printed. --root_dir is then not needed",
+    )
+    parser.add_argument(
+        "--vertex_chunk_events",
+        type=int,
+        default=None,
+        help="Events per VertexHead call (default: YAML vertex_chunk_events, else 32; 1 = per loader batch); "
+             "the backbone and track head still run per loader batch",
+    )
+    parser.add_argument(
         "--vertex_device",
         type=str,
         default=None,
@@ -222,8 +236,11 @@ def main():
         parser.set_defaults(**{k: os.path.join(base, os.path.expanduser(v)) if k in path_keys and isinstance(v, str) else v
                                for k, v in run.items()})
     args = parser.parse_args()
+    if args.no_output:
+        args.save_csv = False
+        args.root_dir = args.root_dir or "."
     if not args.root_dir:
-        parser.error("--root_dir is required (on the command line or in --run_config)")
+        parser.error("--root_dir is required (on the command line or in --run_config), unless --no_output")
 
     # Prepare hyperparameters
     params = YParams(os.path.abspath(args.yaml_config), args.config)
@@ -258,15 +275,19 @@ def main():
     params.return_dict = False           # the trainer unpacks tuples, like track_finding_trainer
     if args.bz is not None:
         params.vertex_bz = args.bz
+    if args.vertex_chunk_events is not None:
+        params.vertex_chunk_events = args.vertex_chunk_events
     if args.vertex_device is not None:
         params.vertex_device = args.vertex_device
     if args.detector is not None:
         params.vertex_detector = os.path.abspath(args.detector)
 
     # Ensure output directory exists
+    params.no_output = args.no_output
     log_dir = args.root_dir
-    os.makedirs(log_dir, exist_ok=True)
-    logfile = os.path.join(log_dir, params.log_file_name)
+    if not args.no_output:
+        os.makedirs(log_dir, exist_ok=True)
+    logfile = None if args.no_output else os.path.join(log_dir, params.log_file_name)
     print(f"[vertex] backbone   : {params.pretrained_ckpt}")
     print(f"[vertex] track head : {checkpoint_path}")
 
@@ -293,7 +314,7 @@ def main():
         csv_output_path=args.csv_output_path,
         momentum_ckpt=args.momentum_ckpt,
     )
-    if trainer.world_rank == 0:
+    if trainer.world_rank == 0 and not args.no_output:
         save_results(result, trainer, params, args, checkpoint_path, logfile)
     trainer.cleanup()
 
