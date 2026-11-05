@@ -62,10 +62,14 @@ from loss import compute_vertex_metrics, assign_points_to_masks
 
 PAD_VALUE = -100
 
-# track_finding_trainer.inference()'s per-point CSV columns, in its order
+# track_finding_trainer.inference()'s per-point CSV columns, in its order: vtx_x, vtx_y, vtx_z are, as there, the
+# truth production vertex of the hit's particle (reg[..., 3:6], cm)
 PER_POINT_COLUMNS = ("batch_idx", "point_idx", "E_norm", "eta_norm", "phi_norm", "r_norm",
                      "px", "py", "pz", "vtx_x", "vtx_y", "vtx_z", "charge", "energy",
                      "seg_target", "pred_assignment", "confidence")
+
+# the event's reconstructed primary vertex (VertexHead), cm, on every hit of the event
+RECO_COLUMNS = ("reco_vtx_x", "reco_vtx_y", "reco_vtx_z")
 
 # TESTING ONLY, appended after PER_POINT_COLUMNS: the event's truth vertex (get_vertex_label, the
 # one the metrics score against) and the reconstructed-minus-truth residual, all cm; NaN where
@@ -78,8 +82,8 @@ TEST_COLUMNS = ("test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z",
 # sv_x, sv_y, sv_z: position of the best (lowest chi²/ndf) SV the track belongs to; NaN otherwise.
 SV_COLUMNS = ("is_sv_track", "sv_x", "sv_y", "sv_z")
 
-CSV_COLUMNS        = PER_POINT_COLUMNS + TEST_COLUMNS
-CSV_COLUMNS_SV     = PER_POINT_COLUMNS + TEST_COLUMNS + SV_COLUMNS
+CSV_COLUMNS        = PER_POINT_COLUMNS + RECO_COLUMNS + TEST_COLUMNS
+CSV_COLUMNS_SV     = PER_POINT_COLUMNS + RECO_COLUMNS + TEST_COLUMNS + SV_COLUMNS
 
 
 def write_metrics_log(metrics, logfile):
@@ -113,7 +117,7 @@ def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, 
         grouped: (B, N, 4) normalized hits; label: (B, N) truth track ID; mask: (B, N) real hits.
         reg: (B, N, 8) truth (px, py, pz, vx, vy, vz, q, e).
         class_probs, mask_probs: raw (bf16) track-head outputs, so assignments match inference().
-        vertex: (B, 3) reconstructed vertex.
+        vertex: (B, 3) reconstructed vertex (written as reco_vtx_*; vtx_* are the truth production vertices).
         truth_vertex: (B, 3) truth vertex, NaN where undefined; testing only.
 
     Returns:
@@ -133,7 +137,8 @@ def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, 
         "point_idx": n.cpu().numpy(),
         **{name: col(grouped[..., k]) for k, name in enumerate(("E_norm", "eta_norm", "phi_norm", "r_norm"))},
         **{name: col(reg[..., k]) for k, name in enumerate(("px", "py", "pz"))},
-        "vtx_x": col(vertex[:, 0]), "vtx_y": col(vertex[:, 1]), "vtx_z": col(vertex[:, 2]),
+        **{name: col(reg[..., k]) for k, name in zip((3, 4, 5), ("vtx_x", "vtx_y", "vtx_z"))},
+        **{name: col(vertex[:, k]) for k, name in enumerate(RECO_COLUMNS)},
         "charge": col(reg[..., 6]), "energy": col(reg[..., 7]),
         "seg_target": label.to(mask.device)[b, n].cpu().numpy(),
         "pred_assignment": assign[b, n].cpu().numpy(),

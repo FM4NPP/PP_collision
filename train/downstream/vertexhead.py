@@ -17,7 +17,7 @@ Secondary vertices (find_secondary=True, the default):
        sv_max_track_chi2
     4. kept if valid, >= min_sv_tracks, its distance to the PV >= sv_min_displacement_significance (both
        vertex covariances), chi2/ndf <= max_sv_chi2_per_dof
-    5. SVs within seed_merge_distance of a lower chi2/ndf SV are dropped
+    5. of SVs within seed_merge_distance of each other only the lowest chi2/ndf one is kept
     6. the PV is refitted with the SV tracks shared with their SVs (ACTS's multi-vertex weights) and
        reported where the event has an SV and the refit is valid; elsewhere the original fit
        (pv_original) is reported
@@ -27,6 +27,7 @@ normalized points (B, N, 4), padding_mask (B, N). B events, N hits, T track slot
 K = max_sv_per_event SV slots. Positions in cm.
 """
 import atexit
+import inspect
 import json
 import math
 import os
@@ -538,11 +539,10 @@ def _fit_vertex_by_helix_closest_approach(
     zslope,
     z0,
     track_weight,
+    start,
     n_iterations=100,
-    linear_fit=None,
     tolerance=1e-4,
     beam_position=(0.0, 0.0),
-    inputs_finite=False,
     **linear_fit_kwargs,
 ):
     """
@@ -553,35 +553,20 @@ def _fit_vertex_by_helix_closest_approach(
         circle_centre (B, T, 2), R_s (B, T): the track model's circle; sign(R_s) = sign(q Bz).
         zslope, z0: (B, T) z line z = zslope * s + z0, s the signed arc length from the circle's
             closest approach to the beam line (_arc_length).
-        track_weight: (B, T); tracks with NaN parameters are excluded.
-        n_iterations: maximum; stops once every vertex moves < tolerance; below 1 returns linear_fit.
-        linear_fit: straight-line fit result whose vertex is the start (origin if None or NaN).
+            All finite: an unfitted track needs a finite stand-in (and weight 0); its outputs are meaningless.
+        track_weight: (B, T).
+        start: (B, 3) the vertex the iterations begin at (NaN rows: the origin).
+        n_iterations: maximum (>= 1); each event stops once its vertex moves < tolerance.
         tolerance: cm; convergence threshold on the vertex step.
         beam_position: (x, y) of the beam line, cm, as in the track model (the origin of s).
-        inputs_finite: the caller has already replaced unfitted tracks by finite stand-ins with zero weight and
-            masks their outputs itself (VertexHead does so once per forward instead of once per fit).
         **linear_fit_kwargs: passed to _fit_vertex_by_closest_approach.
 
     Returns:
-        dict as _fit_vertex_by_closest_approach, from the last iteration; excluded tracks get NaN.
+        dict as _fit_vertex_by_closest_approach, from each event's last iteration.
     """
     n_events = R_s.shape[0]
-
-    if n_iterations < 1:
-        return linear_fit
-
-    PV = linear_fit["vertex_estimate"].nan_to_num() if linear_fit is not None else torch.zeros(n_events, 3, dtype=R_s.dtype, device=R_s.device)
-
+    PV = start.nan_to_num()
     still_moving = torch.ones(n_events, dtype=torch.bool, device=R_s.device)
-
-    # tracks without a fitted circle or z line get finite stand-ins, so they can't put NaN into the
-    # solve, and zero weight, so they don't pull; their outputs are set to NaN after the loop
-    if not inputs_finite:
-        failed = ~(torch.isfinite(circle_centre).all(dim=-1) & torch.isfinite(R_s) & torch.isfinite(zslope) & torch.isfinite(z0))
-        circle_centre = circle_centre.masked_fill(failed.unsqueeze(-1), 0.0)
-        R_s, zslope, z0 = R_s.masked_fill(failed, 1.0), zslope.masked_fill(failed, 0.0), z0.masked_fill(failed, 0.0)
-        track_weight = track_weight.masked_fill(failed, 0.0)
-
     radius = R_s.abs()
     x0, y0 = circle_centre.unbind(-1)
 
@@ -612,11 +597,6 @@ def _fit_vertex_by_helix_closest_approach(
 
         if not still_moving.any():
             break
-
-    if not inputs_finite:
-        result["track_dca"] = result["track_dca"].masked_fill(failed, float("nan"))
-        result["track_chi2"] = result["track_chi2"].masked_fill(failed, float("nan"))
-        result["track_closest_approach_point"] = result["track_closest_approach_point"].masked_fill(failed.unsqueeze(-1), float("nan"))
     return result
 
 class VertexHead(nn.Module):
@@ -692,7 +672,8 @@ class VertexHead(nn.Module):
             sv_max_track_chi2: candidates are attached to a seed with a compatibility chi2 up to this (9).
             min_sv_tracks, max_sv_chi2_per_dof (ndf = 2 n_tracks - 3), sv_min_displacement_significance (the
                 SV-PV distance in units of both vertex covariances, 3): SV cuts.
-            seed_merge_distance: cm, duplicate-SV radius. max_sv_per_event: SV slots per event (K).
+            seed_merge_distance: cm, duplicate-SV radius: of the SVs within it of each other only the one with the
+                lowest chi2/ndf is kept (exact ties: the lowest slot). max_sv_per_event: SV slots per event (K).
         refit_pv: report the PV refitted with the SV tracks shared with their SVs (ACTS's multi-vertex annealing
             weights) where an SV was found and the refit is valid; False = the original fit.
     """
@@ -837,6 +818,11 @@ class VertexHead(nn.Module):
             "acts_max_steps": acts.get("max_steps"),
             **(d.get("vertex_head") or {}),
         }
+        unknown = sorted(set(d.get("vertex_head") or {}) - set(inspect.signature(cls.__init__).parameters))
+        if unknown:
+            raise ValueError(f"{path}: vertex_head sets {unknown}, which VertexHead does not take (removed in the "
+                             "2026-11-05 simplification: vertex_weighting and adaptive_fit, as the covariance-weighted "
+                             "adaptive fit is now the only fit)")
         return cls(**{**kwargs, **overrides})
 
     def setScalingFactor(self, scaling_factor: float = 100.0):
@@ -870,55 +856,30 @@ class VertexHead(nn.Module):
         return {k: getattr(self, k) for k in ("Bz", "scaling_factor", "noise_pt_threshold",
                                               "valid_radius", "min_hits", "beam_position", "normalization")}
 
-    def _fit(self, track_position, track_direction, track_weight, params, start=None):
+    def _fit(self, track_position, track_direction, track_weight, params, start=None, single_step=False):
         """
-        Straight-line fit, refined by the helix fit (PV, SVs and refit); an event whose helix fit is not
-        valid, and every event when Bz = 0, keeps the straight-line result.
-        Tracks without a fitted circle and z line get NaN track_dca and track_closest_approach_point.
-        start: (B, 3) where the helix iterations begin (e.g. the previous fit's vertex, so a refit with slightly
-            changed weights converges in a few iterations); NaN rows, or None, start from the straight-line fit.
+        Vertex fit with these track weights. The straight lines at the perigees give a first vertex, then each
+        helix's tangent at its closest approach to the current vertex is refitted until every vertex moves less
+        than convergence_tolerance (helix_iterations at most); an event whose helix fit is not valid keeps the
+        straight-line result. single_step: exactly one such update from start, without the straight-line fit
+        (ACTS's adaptive fitter makes one linearised update per annealing step). With Bz = 0 (or
+        helix_iterations < 1) the straight-line fit is the result.
+        start: (B, 3) where the helix iterations begin; NaN rows (or None) start from the straight-line vertex.
+        Unfitted tracks' per-track outputs come from their finite stand-ins (weight 0); forward masks them.
         """
-        fit = _fit_vertex_by_closest_approach(track_position, track_direction, track_weight,
-                                              minimum_total_weight=self.minimum_total_weight,
-                                              track_sigma=params["track_sigma"])
-        if self.Bz != 0.0:
-            linear, fit = fit, _fit_vertex_by_helix_closest_approach(
-                *params["helix"],            # finite stand-ins for unfitted tracks (forward)
-                track_weight,               # already zeroed for bad tracks
-                n_iterations=self.helix_iterations,
-                linear_fit=fit if start is None or self.helix_iterations < 1 else
-                {"vertex_estimate": torch.where(torch.isfinite(start), start, fit["vertex_estimate"])},
-                tolerance=self.convergence_tolerance,
-                beam_position=self.beam_position,
-                minimum_total_weight=self.minimum_total_weight,
-                track_sigma=params["track_sigma"],
-                inputs_finite=True,
-            )
+        kwargs = dict(minimum_total_weight=self.minimum_total_weight, track_sigma=params["track_sigma"])
+        if self.Bz == 0.0 or self.helix_iterations < 1:
+            return _fit_vertex_by_closest_approach(track_position, track_direction, track_weight, **kwargs)
+        linear = None if single_step else _fit_vertex_by_closest_approach(
+            track_position, track_direction, track_weight, **kwargs)
+        begin = start if single_step else (linear["vertex_estimate"] if start is None else
+                                           torch.where(torch.isfinite(start), start, linear["vertex_estimate"]))
+        fit = _fit_vertex_by_helix_closest_approach(
+            *params["helix"], track_weight, begin, n_iterations=1 if single_step else self.helix_iterations,
+            tolerance=self.convergence_tolerance, beam_position=self.beam_position, **kwargs)
+        if linear is not None:
             keep_linear = ~fit["fit_is_valid"]
             fit = {k: torch.where(keep_linear.view(-1, *[1] * (v.dim() - 1)), linear[k], v) for k, v in fit.items()}
-        fit["track_dca"] = fit["track_dca"].masked_fill(~params["fit_ok"], float("nan"))
-        fit["track_chi2"] = fit["track_chi2"].masked_fill(~params["fit_ok"], float("nan"))
-        fit["track_closest_approach_point"] = fit["track_closest_approach_point"].masked_fill(
-            ~params["fit_ok"].unsqueeze(-1), float("nan"))
-        return fit
-
-    def _fit_step(self, track_position, track_direction, track_weight, params, start):
-        """
-        One update of a vertex fit from start (B, 3), as ACTS's adaptive fitter makes one linearised update per
-        annealing step: each helix's tangent at its closest approach to start, then one closest-approach solve
-        (straight lines when Bz = 0). Iterated to convergence this is _fit's result.
-        """
-        if self.Bz == 0.0 or self.helix_iterations < 1:
-            return self._fit(track_position, track_direction, track_weight, params)
-        fit = _fit_vertex_by_helix_closest_approach(
-            *params["helix"], track_weight, n_iterations=1,
-            linear_fit={"vertex_estimate": start}, tolerance=self.convergence_tolerance,
-            beam_position=self.beam_position, minimum_total_weight=self.minimum_total_weight,
-            track_sigma=params["track_sigma"], inputs_finite=True)
-        for key in ("track_dca", "track_chi2"):
-            fit[key] = fit[key].masked_fill(~params["fit_ok"], float("nan"))
-        fit["track_closest_approach_point"] = fit["track_closest_approach_point"].masked_fill(
-            ~params["fit_ok"].unsqueeze(-1), float("nan"))
         return fit
 
     def _fit_adaptive(self, track_position, track_direction, track_weight, params, competing_chi2=None, start=None):
@@ -949,8 +910,8 @@ class VertexHead(nn.Module):
             if previous_weight is not None:
                 vertex_weight = torch.where(done.unsqueeze(-1), previous_weight, vertex_weight)
             previous_weight = vertex_weight
-            new = self._fit_step(track_position, track_direction, track_weight * vertex_weight, params,
-                                 fit["vertex_estimate"])
+            new = self._fit(track_position, track_direction, track_weight * vertex_weight, params,
+                            start=fit["vertex_estimate"], single_step=True)
             valid = new["fit_is_valid"]
             dx = (new["vertex_estimate"] - fit["vertex_estimate"]).nan_to_num().unsqueeze(-1)
             relative_shift = (dx * torch.linalg.solve(new["vertex_covariance"].nan_to_num(nan=0.0)
@@ -1024,45 +985,49 @@ class VertexHead(nn.Module):
         sv_track_dca = torch.full((n_events, K, n_tracks), float("nan"), device=device, dtype=dtype)
         sv_track_chi2 = torch.full((n_events, K, n_tracks), float("nan"), device=device, dtype=dtype)
 
-        for k in range(K):
-            if not seed_valid[:, k].any():
-                continue                 # no event has a seed in this slot: its outputs stay empty
-            # candidates compatible with this seed (chi2, the fit's metric); an empty slot's NaN seed becomes the origin
-            in_sv = ((_track_compatibility(seeds[:, k].nan_to_num(), track_position, track_direction, track_sigma)
-                      <= self.sv_max_track_chi2) & (displaced_weight > 0))
-            sv_weight = displaced_weight * in_sv.to(displaced_weight.dtype)
-            fit = self._fit(track_position, track_direction, sv_weight, params)
+        # every seeded (event, slot) pair is one row of a single fit
+        event, slot = seed_valid.nonzero(as_tuple=True)
+        if len(event):
+            # candidates compatible with the seed (chi2, the fit's metric)
+            in_sv = ((_track_compatibility(seeds[event, slot], track_position[event], track_direction[event],
+                                           track_sigma[event]) <= self.sv_max_track_chi2)
+                     & (displaced_weight[event] > 0))
+            sv_weight = displaced_weight[event] * in_sv.to(displaced_weight.dtype)
+            fit = self._fit(track_position[event], track_direction[event], sv_weight,
+                            {"track_sigma": track_sigma[event], "helix": tuple(t[event] for t in params["helix"])})
 
             n_used = sv_weight.gt(0).sum(dim=-1)
             ndf = (2 * n_used.clamp(min=1) - 3).clamp(min=1).to(fit["chi_square"].dtype)
             chi2_per_dof = (fit["chi_square"] / ndf).masked_fill(~fit["fit_is_valid"], float("nan"))
-            displacement = (fit["vertex_estimate"] - pv_position).norm(dim=-1)
+            displacement = (fit["vertex_estimate"] - pv_position[event]).norm(dim=-1)
 
             # significance of the SV-PV distance, with both vertex covariances
-            d = (fit["vertex_estimate"] - pv_position).nan_to_num().unsqueeze(-1)
-            both = ((fit["vertex_covariance"] + pv_fit["vertex_covariance"]).nan_to_num(nan=0.0)
+            d = (fit["vertex_estimate"] - pv_position[event]).nan_to_num().unsqueeze(-1)
+            both = ((fit["vertex_covariance"] + pv_fit["vertex_covariance"][event]).nan_to_num(nan=0.0)
                     + (~fit["fit_is_valid"]).view(-1, 1, 1) * torch.eye(3, dtype=dtype, device=device))
             far_enough = (d * torch.linalg.solve(both, d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
-            is_ok = (seed_valid[:, k] & fit["fit_is_valid"] & (n_used >= self.min_sv_tracks)
-                     & far_enough
+            is_ok = (fit["fit_is_valid"] & (n_used >= self.min_sv_tracks) & far_enough
                      & (chi2_per_dof.nan_to_num(nan=float("inf")) <= self.max_sv_chi2_per_dof))
 
-            sv_estimate[:, k] = fit["vertex_estimate"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
-            sv_chi2[:, k] = fit["chi_square"].masked_fill(~is_ok, float("nan"))
-            sv_chi2_per_dof[:, k] = chi2_per_dof.masked_fill(~is_ok, float("nan"))
-            sv_is_valid[:, k] = is_ok
-            sv_n_tracks[:, k] = n_used.masked_fill(~is_ok, 0)
-            sv_displacement[:, k] = displacement.masked_fill(~is_ok, float("nan"))
-            sv_track_mask[:, k] = in_sv & is_ok.unsqueeze(-1)
-            sv_track_dca[:, k] = fit["track_dca"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
-            sv_track_chi2[:, k] = fit["track_chi2"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
+            sv_estimate[event, slot] = fit["vertex_estimate"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
+            sv_chi2[event, slot] = fit["chi_square"].masked_fill(~is_ok, float("nan"))
+            sv_chi2_per_dof[event, slot] = chi2_per_dof.masked_fill(~is_ok, float("nan"))
+            sv_is_valid[event, slot] = is_ok
+            sv_n_tracks[event, slot] = n_used.masked_fill(~is_ok, 0)
+            sv_displacement[event, slot] = displacement.masked_fill(~is_ok, float("nan"))
+            sv_track_mask[event, slot] = in_sv & is_ok.unsqueeze(-1)
+            sv_track_dca[event, slot] = fit["track_dca"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
+            sv_track_chi2[event, slot] = fit["track_chi2"].masked_fill(~is_ok.unsqueeze(-1), float("nan"))
 
-        # drop SVs within seed_merge_distance of a valid SV with a strictly lower chi2/ndf
+        # keep one SV per group within seed_merge_distance: drop each SV that has a valid neighbour with a lower
+        # chi2/ndf, or the same chi2/ndf and a lower slot (different seeds often converge to the same SV, and every
+        # copy would pull its tracks away from the PV again in the refit)
         dist = (sv_estimate.unsqueeze(2) - sv_estimate.unsqueeze(1)).nan_to_num().norm(dim=-1)
         q = sv_chi2_per_dof.nan_to_num(nan=float("inf"))
+        q_i, q_j = q.unsqueeze(2), q.unsqueeze(1)                     # [b, i, j]: does SV j beat SV i?
+        lower_slot = torch.ones(K, K, device=device, dtype=torch.bool).tril(diagonal=-1)   # j < i
         sv_is_valid = sv_is_valid & ~(sv_is_valid.unsqueeze(1) & (dist < self.seed_merge_distance)
-                                      & (q.unsqueeze(1) < q.unsqueeze(2))
-                                      & ~torch.eye(K, device=device, dtype=torch.bool)).any(dim=2)
+                                      & ((q_j < q_i) | ((q_j == q_i) & lower_slot))).any(dim=2)
         result = {
             "sv_estimate": sv_estimate.masked_fill(~sv_is_valid.unsqueeze(-1), float("nan")),
             "sv_is_valid": sv_is_valid,
@@ -1265,12 +1230,20 @@ class VertexHead(nn.Module):
         if acts_failed is not None:
             result["acts_failed"] = acts_failed
         result["track_sigma"] = params["track_sigma"]
+        # per-track outputs of unfitted tracks (bad) come from their finite stand-ins: NaN in what is reported
+        def masked(f):
+            return {**f, "track_dca": f["track_dca"].masked_fill(bad, float("nan")),
+                    "track_chi2": f["track_chi2"].masked_fill(bad, float("nan")),
+                    "track_closest_approach_point": f["track_closest_approach_point"].masked_fill(
+                        bad.unsqueeze(-1), float("nan"))}
+
         if self.find_secondary:
             secondary = self._find_secondary_vertices(fit, track_position, track_direction, track_weight, params)
             refit = secondary.pop("pv_refit", None)
             refit_vertex_weight = secondary.pop("pv_refit_vertex_weight", None)
+            secondary["sv_track_dca"] = secondary["sv_track_dca"].masked_fill(bad.unsqueeze(1), float("nan"))
             result.update(secondary)
-            result["pv_original"] = fit
+            result["pv_original"] = masked(fit)
             # the refit PV where the event has an SV and the refit is valid; else the original PV fit
             used_refit = secondary["sv_is_valid"].any(dim=1)
             if refit is not None:
@@ -1280,13 +1253,14 @@ class VertexHead(nn.Module):
             else:
                 used_refit = torch.zeros_like(used_refit)
             result["used_refit"] = used_refit
+        fit = masked(fit)
         result.update({
             "vertex_estimate": fit["vertex_estimate"],
             "chi_square": fit["chi_square"],
             "fit_is_valid": fit["fit_is_valid"],
             "track_closest_approach_point": fit["track_closest_approach_point"],
             "track_dca": fit["track_dca"],
-            "track_vertex_weight": vertex_weight,
+            "track_vertex_weight": vertex_weight.masked_fill(bad, 0.0),
             "track_chi2": fit["track_chi2"],
             "vertex_covariance": fit["vertex_covariance"],
         })
