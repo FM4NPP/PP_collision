@@ -680,14 +680,15 @@ class VertexHead(nn.Module):
             vertex) for the PV and its refit; needs vertex_weighting="covariance". Each iteration takes every
             track's compatibility chi2 to the current vertex (ACTS getVertexCompatibility: r^T W r with the
             track's impact-parameter errors), weights it w = 1 / (1 + exp(-(annealing_cut_off - chi2) / (2 T)))
-            (tracks with w <= min_track_weight are left out), refits, and steps T through
+            (tracks with w <= min_track_weight are left out), updates the vertex once (each helix's tangent at
+            the current vertex, one solve: one linearised update per iteration, as in ACTS), and steps T through
             annealing_temperatures; it stops after the last temperature once every vertex moves less than
             max_relative_shift in units of its covariance (dx^T C^-1 dx), or after adaptive_max_iterations.
-            An event whose refit is not valid keeps its previous fit. Defaults are ACTS's (AnnealingUtility:
+            An event whose update is not valid keeps its previous fit. Defaults are ACTS's (AnnealingUtility:
             cutOff 9, temperatures 64, 16, 4, 2, 1.5, 1; AdaptiveMultiVertexFitter: minWeight 1e-4,
             maxIterations 30, maxRelativeShift 0.01). Differences from ACTS: one vertex (the PV) instead of
-            weights shared between vertices, the d0-z0 correlation is ignored, and each refit is this module's
-            helix fit, not ACTS's linearised Kalman update.
+            weights shared between vertices, the d0-z0 correlation is ignored, and the update is this module's
+            helix-tangent least squares, not ACTS's Kalman update.
         find_secondary: find SVs and report the refitted PV; False = original PV-only fit.
         min_track_pv_dca, min_track_beam_dca: cm, SV candidate cuts.
         max_pair_doca, max_track_sv_doca: cm, seeding and attachment cuts.
@@ -900,11 +901,13 @@ class VertexHead(nn.Module):
         return {k: getattr(self, k) for k in ("Bz", "is_cosmics", "scaling_factor", "noise_pt_threshold",
                                               "valid_radius", "min_hits", "beam_position", "normalization")}
 
-    def _fit(self, track_position, track_direction, track_weight, params):
+    def _fit(self, track_position, track_direction, track_weight, params, start=None):
         """
         Straight-line fit, refined by the helix fit (PV, SVs and refit); an event whose helix fit is not
         valid, and every event when Bz = 0, keeps the straight-line result.
         Tracks without a fitted circle and z line get NaN track_dca and track_closest_approach_point.
+        start: (B, 3) where the helix iterations begin (e.g. the previous fit's vertex, so a refit with slightly
+            changed weights converges in a few iterations); NaN rows, or None, start from the straight-line fit.
         """
         fit = _fit_vertex_by_closest_approach(track_position, track_direction, track_weight,
                                               minimum_total_weight=self.minimum_total_weight,
@@ -917,7 +920,8 @@ class VertexHead(nn.Module):
                 params["z0"],
                 track_weight,               # already zeroed for bad tracks
                 n_iterations=self.helix_iterations,
-                linear_fit=fit,
+                linear_fit=fit if start is None or self.helix_iterations < 1 else
+                {"vertex_estimate": torch.where(torch.isfinite(start), start, fit["vertex_estimate"])},
                 is_cosmics=self.is_cosmics,
                 tolerance=self.convergence_tolerance,
                 beam_position=self.beam_position,
@@ -932,16 +936,38 @@ class VertexHead(nn.Module):
             ~params["fit_ok"].unsqueeze(-1), float("nan"))
         return fit
 
-    def _fit_adaptive(self, track_position, track_direction, track_weight, params, competing_chi2=None):
+    def _fit_step(self, track_position, track_direction, track_weight, params, start):
+        """
+        One update of a vertex fit from start (B, 3), as ACTS's adaptive fitter makes one linearised update per
+        annealing step: each helix's tangent at its closest approach to start, then one closest-approach solve
+        (straight lines when Bz = 0). Iterated to convergence this is _fit's result.
+        """
+        if self.Bz == 0.0 or self.helix_iterations < 1:
+            return self._fit(track_position, track_direction, track_weight, params)
+        fit = _fit_vertex_by_helix_closest_approach(
+            params["circle_centre"], params["R_s"], params["zslope"], params["z0"], track_weight, n_iterations=1,
+            linear_fit={"vertex_estimate": start}, is_cosmics=self.is_cosmics, tolerance=self.convergence_tolerance,
+            beam_position=self.beam_position, minimum_total_weight=self.minimum_total_weight,
+            track_sigma=params.get("track_sigma"))
+        for key in ("track_dca", "track_chi2"):
+            fit[key] = fit[key].masked_fill(~params["fit_ok"], float("nan"))
+        fit["track_closest_approach_point"] = fit["track_closest_approach_point"].masked_fill(
+            ~params["fit_ok"].unsqueeze(-1), float("nan"))
+        return fit
+
+    def _fit_adaptive(self, track_position, track_direction, track_weight, params, competing_chi2=None, start=None):
         """
         ACTS's adaptive (annealed) vertex fit for one vertex, started from the plain fit (see adaptive_fit).
         competing_chi2: (B, T, K) each track's compatibility chi2 to other vertices it is attached to (inf
             where not), for ACTS's multi-vertex weight exp(-chi2/2T) / (exp(-cutOff/2T) + sum_vertices
             exp(-chi2_v/2T)), so a track shared with an SV pulls the PV only as far as it is more compatible
             with it; None = the single-vertex weight.
+        start: (B, 3) where the first fit's helix iterations begin (see _fit); each refit then starts from the
+            previous vertex.
         Returns the fit and each track's annealing weight (B, T) (ACTS trackWeight; 0 = left out).
         """
-        fit = self._fit(track_position, track_direction, track_weight, params)
+        fit = self._fit(track_position, track_direction, track_weight, params,
+                        start=start if self.adaptive_fit else None)
         vertex_weight = torch.ones_like(track_weight)
         if not self.adaptive_fit:
             return fit, vertex_weight
@@ -957,7 +983,8 @@ class VertexHead(nn.Module):
                                        + torch.exp((chi2 - competing_chi2) / (2.0 * temperature)).sum(dim=-1))
                 vertex_weight = vertex_weight.nan_to_num(0.0)
             vertex_weight = vertex_weight.masked_fill(vertex_weight <= self.min_track_weight, 0.0).to(track_weight.dtype)
-            new = self._fit(track_position, track_direction, track_weight * vertex_weight, params)
+            new = self._fit_step(track_position, track_direction, track_weight * vertex_weight, params,
+                                 fit["vertex_estimate"])
             valid = new["fit_is_valid"]
             dx = (new["vertex_estimate"] - fit["vertex_estimate"]).nan_to_num().unsqueeze(-1)
             relative_shift = (dx * torch.linalg.solve(new["vertex_covariance"].nan_to_num(nan=0.0)
@@ -1100,7 +1127,8 @@ class VertexHead(nn.Module):
                 competing = torch.where(result["sv_track_mask"], sv_track_chi2.nan_to_num(nan=float("inf")),
                                         float("inf")).transpose(1, 2)
                 result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(
-                    track_position, track_direction, track_weight, params, competing_chi2=competing)
+                    track_position, track_direction, track_weight, params, competing_chi2=competing,
+                    start=pv_fit["vertex_estimate"])
             else:
                 refit_weight = track_weight * (~result["sv_track_mask"].any(dim=1)).to(track_weight.dtype)
                 result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(

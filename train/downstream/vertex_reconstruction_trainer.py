@@ -786,15 +786,27 @@ class DownstreamTrainer():
             max_sv_chi2_per_dof = _p("sv_max_sv_chi2_per_dof", 10.0),
             max_sv_per_event    = _p("sv_max_sv_per_event",     6),
         )
+        # VertexHead's device (YAML vertex_device, e.g. "cpu"): its many small per-iteration operations can run
+        # faster on the CPU than on the GPU, where each convergence test waits for the device
+        self.vertex_device = torch.device(getattr(self.params, "vertex_device", None) or self.device)
         detector = getattr(self.params, "vertex_detector", None)
         if detector:
             # the detector file (scripts/acts/detectors/<name>/<name>.yaml) sets field, ACTS and fit settings;
             # an explicit vertex_bz (YAML or --bz) still overrides its field
             if getattr(self.params, "vertex_bz", None) is not None:
                 settings["Bz"] = bz
-            self.vertex_head = VertexHead.from_detector(detector, **settings).to(self.device).eval()
+            self.vertex_head = VertexHead.from_detector(detector, **settings).to(self.vertex_device).eval()
         else:
-            self.vertex_head = VertexHead(Bz=bz, **settings).to(self.device).eval()
+            self.vertex_head = VertexHead(Bz=bz, **settings).to(self.vertex_device).eval()
+
+    def _vertex_head(self, class_probs, mask_probs, points, padding_mask):
+        """VertexHead on its device (vertex_device); its tensor outputs back on the trainer's device."""
+        d = self.vertex_device
+        result = self.vertex_head(class_probs=class_probs.to(d), mask_probs=mask_probs.to(d), points=points.to(d),
+                                  padding_mask=padding_mask.to(d))
+        move = lambda v: v.to(self.device) if torch.is_tensor(v) else (  # noqa: E731
+            {k: move(x) for k, x in v.items()} if isinstance(v, dict) else v)
+        return {k: move(v) for k, v in result.items()}
 
     def inference(self, checkpoint_path, pretrain=True, logfile=None, save_csv=False, csv_output_path=None,
                   momentum_ckpt=None):
@@ -890,7 +902,7 @@ class DownstreamTrainer():
                     out = self.down_model(grouped, feature=None)
                 lap("track_head")
 
-            result = self.vertex_head(
+            result = self._vertex_head(
                 class_probs=out["class_probs"].float(), mask_probs=out["mask_probs"].float(),
                 points=grouped, padding_mask=mask)
             lap("vertex_head")
@@ -982,7 +994,7 @@ class DownstreamTrainer():
             mask_probs  = out["mask_probs"].float()
 
             # ── Step 1: PV, SVs and the PV refitted without SV tracks ────────
-            sv_result = self.vertex_head(
+            sv_result = self._vertex_head(
                 class_probs=class_probs,
                 mask_probs=mask_probs,
                 points=grouped,

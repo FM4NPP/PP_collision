@@ -191,6 +191,12 @@ def main():
              "ACTS inputs and fit settings (default: YAML vertex_detector, else the built-in sPHENIX defaults)",
     )
     parser.add_argument(
+        "--vertex_device",
+        type=str,
+        default=None,
+        help="Device for VertexHead, e.g. cpu (default: YAML vertex_device, else the backbone's device)",
+    )
+    parser.add_argument(
         "--run_config",
         type=str,
         default=None,
@@ -252,6 +258,8 @@ def main():
     params.return_dict = False           # the trainer unpacks tuples, like track_finding_trainer
     if args.bz is not None:
         params.vertex_bz = args.bz
+    if args.vertex_device is not None:
+        params.vertex_device = args.vertex_device
     if args.detector is not None:
         params.vertex_detector = os.path.abspath(args.detector)
 
