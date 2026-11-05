@@ -29,6 +29,7 @@ import os
 import struct
 import subprocess
 import sys
+import time
 
 import torch
 import torch.nn as nn
@@ -380,10 +381,13 @@ def _circle_from_perigee(perigee, Bz, scaling_factor=100.0, beam_position=(0.0, 
 ACTS_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                                   "scripts", "acts", "acts_worker.py")
 _ACTS_WORKERS = {}
+# time spent in ACTS workers by this process (seconds; reset by whoever reads it): starting them, and propagating
+ACTS_TIMING = {"start_s": 0.0, "propagate_s": 0.0, "states": 0}
 
 class _ActsWorker:
     """One ACTS worker process: command (e.g. singularity exec <image> acts-python) + worker script + config."""
     def __init__(self, command, config):
+        t0 = time.perf_counter()
         self.process = subprocess.Popen(list(command) + [ACTS_WORKER_SCRIPT, json.dumps(config)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         while True:                     # start-up output (e.g. ACTS's setup) until the ready line
@@ -394,12 +398,14 @@ class _ActsWorker:
             if line.strip() == b"ACTS_WORKER_READY":
                 break
             sys.stderr.write(line.decode(errors="replace"))
+        ACTS_TIMING["start_s"] += time.perf_counter() - t0
 
     def propagate(self, position, direction, qop, backward, covariance=None):
         """numpy (n, 3), (n, 3), (n,), (n,) bool in mm, e/GeV -> perigee parameters (n, 6) and ok (n,); with
         covariance (n, 6, 6) (a worker started with "covariance": true in its config) also the perigee
         covariance (n, 6, 6)."""
         import numpy as np
+        t0 = time.perf_counter()
         n = len(qop)
         extra = b"" if covariance is None else np.ascontiguousarray(covariance, "<f8").tobytes()
         self.process.stdin.write(struct.pack("<Q", n) + np.ascontiguousarray(position, "<f8").tobytes()
@@ -412,6 +418,8 @@ class _ActsWorker:
         if len(reply) != size:
             raise RuntimeError(f"ACTS worker stopped (code {self.process.poll()}); its error output is above")
         params, ok = np.frombuffer(reply[: n * 48], "<f8").reshape(n, 6).copy(), np.frombuffer(reply[size - n:], np.uint8).astype(bool)
+        ACTS_TIMING["propagate_s"] += time.perf_counter() - t0
+        ACTS_TIMING["states"] += n
         if covariance is None:
             return params, ok
         return params, ok, np.frombuffer(reply[n * 48: n * 336], "<f8").reshape(n, 6, 6).copy()

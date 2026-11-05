@@ -54,6 +54,7 @@ from loss import *
 from cached_dataset import get_cached_data_loader
 import csv
 
+import vertexhead
 from vertexhead import VertexHead
 from downstream_util import get_vertex_label
 from loss import compute_vertex_metrics, assign_points_to_masks
@@ -848,11 +849,26 @@ class DownstreamTrainer():
         Returns:
             dict: metrics (compute_vertex_metrics plus n_events, fit_valid_rate); vertex_estimate,
             vertex_target (n_events, 3); fit_is_valid (n_events,) fit valid and truth defined;
-            per_point (CSV columns, with save_csv).
+            per_point (CSV columns, with save_csv); timing: seconds per stage (data loading and transfer,
+            backbone, track head, VertexHead, of which ACTS (worker start-up and propagation), truth and CSV),
+            also in metrics as time_<stage>_ms_per_event. The GPU is synchronised at each stage boundary so
+            the stages are attributed correctly.
         """
         self.model.eval()
         amp = torch.cuda.is_available() and self.use_amp
         est, tgt, ok, per_point = [], [], [], []
+
+        timing = dict.fromkeys(("data", "backbone", "track_head", "vertex_head", "truth_and_csv"), 0.0)
+        for key in vertexhead.ACTS_TIMING:
+            vertexhead.ACTS_TIMING[key] = type(vertexhead.ACTS_TIMING[key])(0)
+        sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+        clock = [time.perf_counter()]
+
+        def lap(stage):
+            sync()
+            now = time.perf_counter()
+            timing[stage] += now - clock[0]
+            clock[0] = now
 
         for step, batch in enumerate(tqdm(self.val_data_loader)):
             if len(batch) != 4:
@@ -863,17 +879,21 @@ class DownstreamTrainer():
             grouped = grouped.reshape(b, -1, c).to(self.device)
             reg = reg.to(self.device)
             mask = grouped[..., 0] != PAD_VALUE
+            lap("data")
 
             with autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext():
                 if pretrain:
                     _, pre_embed, _ = self.model(grouped, return_z=True)
+                    lap("backbone")
                     out = self.down_model(grouped, self._layer_features(pre_embed), pretrain=True, padding_mask=mask)
                 else:
                     out = self.down_model(grouped, feature=None)
+                lap("track_head")
 
             result = self.vertex_head(
                 class_probs=out["class_probs"].float(), mask_probs=out["mask_probs"].float(),
                 points=grouped, padding_mask=mask)
+            lap("vertex_head")
 
             # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them
             truth = get_vertex_label(reg, valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask)
@@ -884,17 +904,30 @@ class DownstreamTrainer():
             est.append(result["vertex_estimate"])
             tgt.append(truth["vertex_target"])
             ok.append(result["fit_is_valid"] & truth["vertex_valid"])
+            lap("truth_and_csv")
             if max_events and sum(len(x) for x in est) >= max_events:
                 break
 
         est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)
         metrics = compute_vertex_metrics(est, tgt, ok)
         metrics.update(n_events=len(ok), fit_valid_rate=ok.float().mean().item())
+        timing["acts_start"] = vertexhead.ACTS_TIMING["start_s"]
+        timing["acts_propagate"] = vertexhead.ACTS_TIMING["propagate_s"]
+        n_events = max(len(ok), 1)
+        metrics.update({f"time_{k}_ms_per_event": v / n_events * 1e3 for k, v in timing.items()})
         if self.log_to_screen:
             print("[vertex] " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
-                                          for k, v in metrics.items()))
+                                          for k, v in metrics.items() if not k.startswith("time_")))
+            total = sum(timing[k] for k in ("data", "backbone", "track_head", "vertex_head", "truth_and_csv"))
+            print(f"[vertex] time over {len(ok)} events: {total:.1f} s ({total / n_events * 1e3:.1f} ms/event)")
+            for k in ("data", "backbone", "track_head", "vertex_head", "truth_and_csv"):
+                print(f"[vertex]   {k:14s} {timing[k]:8.2f} s  {timing[k] / n_events * 1e3:8.2f} ms/event  "
+                      f"{timing[k] / max(total, 1e-12):6.1%}")
+            if timing["acts_start"] or timing["acts_propagate"]:
+                print(f"[vertex]     of which ACTS: worker start {timing['acts_start']:.2f} s, propagation "
+                      f"{timing['acts_propagate']:.2f} s ({vertexhead.ACTS_TIMING['states']} track states)")
         output = {"metrics": metrics, "vertex_estimate": est.cpu(), "vertex_target": tgt.cpu(),
-                  "fit_is_valid": ok.cpu()}
+                  "fit_is_valid": ok.cpu(), "timing": timing}
         if save_csv:
             output["per_point"] = {k: np.concatenate([p[k] for p in per_point]) for k in CSV_COLUMNS}
         return output

@@ -4,6 +4,10 @@ Evaluate vertex reconstruction (VertexHead) after a trained track-finding head, 
 eval_track_finding.py evaluates that head. Run from train/downstream:
 
     python eval_vertex_reconstruction.py --root_dir out/ [--checkpoint <head.pth>] [--no-csv]
+    python eval_vertex_reconstruction.py --run_config runs/<run>.yaml [any option to override it]
+
+A run file (runs/) holds any of the options below as YAML keys (option names without --), so a model and
+site setup is one file; options on the command line override it.
 
 Backbone: --pretrained_ckpt, else pretrained_ckpt in --config. Track head: --checkpoint, else
 {track_config}_nerf_tracking_head_d{eventnumber}_{run_num}_seed{seed}[_nopretrain]_checkpoint.pth
@@ -130,8 +134,8 @@ def main():
     parser.add_argument(
         "--root_dir",
         type=str,
-        required=True,
-        help="Root directory to store evaluation outputs",
+        default=None,
+        help="Root directory to store evaluation outputs (required, here or in --run_config)",
     )
     parser.add_argument(
         "--eventnumber",
@@ -186,7 +190,31 @@ def main():
         help="Detector file for VertexHead.from_detector (scripts/acts/detectors/<name>/<name>.yaml): field, "
              "ACTS inputs and fit settings (default: YAML vertex_detector, else the built-in sPHENIX defaults)",
     )
+    parser.add_argument(
+        "--run_config",
+        type=str,
+        default=None,
+        help="YAML file of this script's options (keys = option names without --, e.g. runs/example.yaml); "
+             "command-line options override it, relative paths are relative to the file",
+    )
+    # a run file sets the defaults; anything given on the command line still wins
+    run_config = parser.parse_known_args()[0].run_config
+    if run_config:
+        import yaml
+        with open(run_config) as f:
+            run = yaml.safe_load(f) or {}
+        known = {a.dest for a in parser._actions}
+        unknown = sorted(set(run) - known)
+        if unknown:
+            sys.exit(f"{run_config}: unknown option(s) {unknown}; valid: {sorted(known - {'help', 'run_config'})}")
+        base = os.path.dirname(os.path.abspath(run_config))
+        path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir", "momentum_ckpt",
+                     "csv_output_path", "data_root_test", "root_dir", "detector", "global_log_dir"}
+        parser.set_defaults(**{k: os.path.join(base, os.path.expanduser(v)) if k in path_keys and isinstance(v, str) else v
+                               for k, v in run.items()})
     args = parser.parse_args()
+    if not args.root_dir:
+        parser.error("--root_dir is required (on the command line or in --run_config)")
 
     # Prepare hyperparameters
     params = YParams(os.path.abspath(args.yaml_config), args.config)
