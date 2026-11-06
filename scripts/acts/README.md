@@ -28,7 +28,8 @@ and updated by its options, which also overwrite an existing file's settings:
 
 ```bash
 scripts/run/vertexing.sh setup --geometry <tgeo.root> --geometry_config <config.json> --material_map <material.json> \
-    [--field_map <field.txt>] [--set acts.energy_loss=true] [--set vertex_head.track_error_scale=2.5]
+    [--field_map <map.root or field.txt> [--field_kind rz] [--field_rescale <factor>]] \
+    [--set acts.energy_loss=true] [--set vertex_head.track_error_scale=2.5]
 ```
 
 The input files must exist (see sPHENIX inputs); `--set section.key=value` sets any other key, keeping its comment.
@@ -76,8 +77,10 @@ worker prints a failure summary when it exits.
   writes `sphenix_ana559_tgeo.root` with the TPC measurement boxes sPHENIX's tracking adds.
 - **TGeo configuration:** CDB key `ACTSGEOMETRYCONFIG`; **material map:** CDB key `ACTSMATERIALMAP` (made for ACTS
   v45, whose layer building is the same as v48.2's; all 56 entries land).
-- **Field map:** the CDB field map (ROOT ntuple `fieldmap`, cm and T):
-  `python scripts/acts/detectors/sphenix/convert_field_map.py <map>.root field_xyz.txt`.
+- **Field map:** part of the detector: the CDB field map (ROOT ntuple `fieldmap`, cm and T), given once to
+  `setup --field_map <map>.root`, is converted (`convert_field_map.py`, needs uproot) to
+  `detectors/sphenix/field_xyz.txt` (gitignored); every site file without a map of its own then uses it
+  (`field.map`). Without a map, ACTS uses the uniform `bz_tesla`; VertexHead's own hit fit always does.
 
 ACTS builds sPHENIX's MVTX as one layer, merges INTT sub-layers and lets TPC layers overlap ("Layers are
 overlapping"): that is the configuration's layering, the same in sPHENIX's own tracking, which assigns its layers

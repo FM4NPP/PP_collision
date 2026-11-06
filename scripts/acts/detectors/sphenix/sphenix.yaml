@@ -6,7 +6,8 @@ name: sphenix
 
 field:
   bz_tesla: 1.4                # uniform solenoid field: the hit fit, and ACTS when no map is given
-  map: null                    # ACTS text field map (convert_field_map.py from the CDB field map), mm and T
+  map: null                    # ACTS text field map, mm and T: field_xyz.txt in this folder, made by
+                               # scripts/run/vertexing.sh setup --field_map <CDB map>.root
   map_kind: xyz                # xyz or rz
 
 beam_position_cm: [0.0, 0.0]   # beam line in x-y; the perigee reference

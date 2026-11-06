@@ -77,3 +77,5 @@ slurm-*.out
 
 # site detector files (scripts/run/vertexing.sh setup)
 scripts/configs/sphenix_*.yaml
+# field maps converted by setup into the detector folder
+scripts/acts/detectors/*/field_*.txt

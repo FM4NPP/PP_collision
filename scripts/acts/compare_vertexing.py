@@ -90,7 +90,8 @@ def acts_vertices(head, outs):
         if command[:2] == ["singularity", "exec"]:
             command = [*command[:2], "--bind", tmp, *command[2:]]
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "acts_vertexing.py")
-        subprocess.run([*command, script, tmp, "--bz_tesla", str(head.Bz)], check=True)
+        field = ["--field_map", head.acts_field_map, "--field_map_kind", head.acts_field_map_kind] if head.acts_field_map else []
+        subprocess.run([*command, script, tmp, "--bz_tesla", str(head.Bz), *field], check=True)
         found = []
         for e in range(len(outs)):
             with open(os.path.join(tmp, f"event{e:09d}-vertices.csv"), newline="") as f:
