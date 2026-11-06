@@ -82,7 +82,7 @@ def acts_vertices(head, outs):
             cov = o["track_covariance"][0].double().numpy() * head.track_error_scale ** 2
             keep = (o["track_weight"][0] > 0).numpy() & np.isfinite(params[:, :5]).all(1) & np.isfinite(cov).all((1, 2))
             with open(os.path.join(tmp, f"event{e:09d}-tracks.csv"), "w", newline="") as f:
-                writer = csv.writer(f)
+                writer = csv.writer(f, lineterminator="\n")   # LF only: ACTS keeps a CR in the last column
                 writer.writerow(TRACK_COLUMNS)
                 for i, (p, c) in enumerate(zip(params[keep], cov[keep])):
                     writer.writerow([i, *p[:5], *np.diag(c)[:5], *(c[a, b] for a in range(5) for b in range(5) if a != b)])
