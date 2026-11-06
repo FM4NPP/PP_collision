@@ -1,5 +1,6 @@
 # Vertex evaluation of the m5 backbone and its track head on gpuserver0:
-#   python eval_vertex_reconstruction.py --run_config runs/m5_gpuserver0.yaml [--max_eval_events 5000 ...]
+#   python eval_vertex_reconstruction.py --run_config ../../scripts/configs/vertex_m5_gpuserver0.yaml [--max_eval_events 5000 ...]
+#   (from train/downstream)
 # Keys are eval_vertex_reconstruction.py's options without --; relative paths are relative to this file.
 # ~ is the home directory of whoever runs it.
 

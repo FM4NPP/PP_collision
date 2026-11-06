@@ -2,7 +2,7 @@
 """
 Evaluate VertexHead after a trained track-finding head. Run from train/downstream:
 
-    python eval_vertex_reconstruction.py --run_config runs/<run>.yaml [options override the file]
+    python eval_vertex_reconstruction.py --run_config ../../scripts/configs/vertex_<run>.yaml [options override the file]
     python eval_vertex_reconstruction.py --root_dir out/ --checkpoint <head.pth> [--no-csv]
 
 Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
@@ -196,7 +196,7 @@ def main():
         "--run_config",
         type=str,
         default=None,
-        help="YAML file of this script's options (keys = option names without --, e.g. runs/example.yaml); "
+        help="YAML file of this script's options (keys = option names without --, e.g. scripts/configs/vertex_m5_gpuserver0.yaml); "
              "command-line options override it, relative paths are relative to the file",
     )
     # a run file sets the defaults; anything given on the command line still wins
