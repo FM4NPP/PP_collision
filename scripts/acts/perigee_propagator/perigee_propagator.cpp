@@ -1,6 +1,7 @@
 // acts_perigee_propagator: ACTS propagation of track states to a perigee surface, for acts_worker.py; the one
 // call ACTS's Python bindings lack (direction, covariance, material). Takes the field and geometry objects the
-// bindings build. Without a geometry: field only (VoidNavigator); with one: navigated with MaterialInteractor.
+// bindings build. Without a geometry: field only (VoidNavigator); with one: navigated with MaterialInteractor,
+// and a state the navigation fails on is retried field only (no material effects).
 // Units mm, GeV, e; backward states are propagated backward, so energy loss is added back.
 #include <Acts/Definitions/Algebra.hpp>
 #include <Acts/Definitions/Direction.hpp>
@@ -63,15 +64,16 @@ class PerigeePropagator {
       m_geometryPropagator.emplace(Acts::EigenStepper<>(m_field),
                                    Acts::Navigator(config, Acts::getDefaultLogger("Navigator", Acts::Logging::WARNING)),
                                    Acts::getDefaultLogger("PerigeePropagator", Acts::Logging::WARNING));
-    } else {
-      m_fieldPropagator.emplace(Acts::EigenStepper<>(m_field), Acts::VoidNavigator(),
-                                Acts::getDefaultLogger("PerigeePropagator", Acts::Logging::WARNING));
     }
+    m_fieldPropagator.emplace(Acts::EigenStepper<>(m_field), Acts::VoidNavigator(),
+                              Acts::getDefaultLogger("PerigeePropagator", Acts::Logging::WARNING));
   }
 
   // (n, 6) perigee parameters (d0, z0, phi, theta, q/p, t; NaN where ACTS failed or the input is not
-  // finite), ok (n,), {error message: count} and, given a start covariance (n, 6, 6) (curvilinear, in the
-  // track's real direction), the perigee covariance (n, 6, 6) (NaN where none), else None
+  // finite), status (n,) (0 failed, 1 propagated, 2 propagated field only after the navigation failed),
+  // {error message: count} (retried ones as "field-only retry after: <message>") and, given a start covariance
+  // (n, 6, 6) (curvilinear, in the track's real direction), the perigee covariance (n, 6, 6) (NaN where none),
+  // else None
   py::tuple propagate(py::array_t<double, py::array::c_style | py::array::forcecast> position,
                       py::array_t<double, py::array::c_style | py::array::forcecast> direction,
                       py::array_t<double, py::array::c_style | py::array::forcecast> qop,
@@ -88,7 +90,7 @@ class PerigeePropagator {
     }
     py::array_t<double> params({n, py::ssize_t{6}});
     py::array_t<double> covOut({covariance ? n : py::ssize_t{0}, py::ssize_t{6}, py::ssize_t{6}});
-    py::array_t<bool> ok(n);
+    py::array_t<std::uint8_t> ok(n);
     auto P = position.unchecked<2>();
     auto D = direction.unchecked<2>();
     auto Q = qop.unchecked<1>();
@@ -110,7 +112,7 @@ class PerigeePropagator {
             covWrite(i, k, l) = std::numeric_limits<double>::quiet_NaN();
           }
         }
-        good(i) = false;
+        good(i) = 0;
         const Acts::Vector3 pos(P(i, 0), P(i, 1), P(i, 2));
         const Acts::Vector3 dir(D(i, 0), D(i, 1), D(i, 2));
         std::optional<Acts::BoundMatrix> startCov;
@@ -136,13 +138,19 @@ class PerigeePropagator {
           const auto dirn = B(i) ? Acts::Direction::Backward() : Acts::Direction::Forward();
           std::string error;
           std::optional<Acts::BoundTrackParameters> end;
+          std::uint8_t status = 1;
           if (m_geometryPropagator) {
             GeometryOptions options(m_geometryContext, m_fieldContext);
             auto& interactor = options.actorList.get<Acts::MaterialInteractor>();
             interactor.energyLoss = m_energyLoss;
             interactor.multipleScattering = m_multipleScattering;
             end = run(*m_geometryPropagator, options, start, dirn, error);
-          } else {
+            if (!end) {
+              ++errors["field-only retry after: " + error];
+              status = 2;
+            }
+          }
+          if (!end) {
             end = run(*m_fieldPropagator, FieldOptions(m_geometryContext, m_fieldContext), start, dirn, error);
           }
           if (!end) {
@@ -153,7 +161,7 @@ class PerigeePropagator {
           for (int k = 0; k < 6; ++k) {
             out(i, k) = values[k];
           }
-          good(i) = values.allFinite();
+          good(i) = values.allFinite() ? status : 0;
           if (C && end->covariance().has_value()) {
             const auto& endCov = *end->covariance();
             for (int k = 0; k < 6; ++k) {

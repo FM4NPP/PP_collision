@@ -942,7 +942,7 @@ class VertexHead(nn.Module):
                 vertex_estimate (B, 3), chi_square, fit_is_valid (B,), vertex_covariance (B, 3, 3).
                 track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
                 track_quality_mask, track_sigma (B, T, 2), track_vertex_weight, track_chi2, track_dca (B, T),
-                track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts.
+                track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS.
                 With find_secondary: sv_estimate (B, K, 3), sv_is_valid, sv_chi2, sv_chi2_per_dof, sv_displacement,
                 sv_n_tracks (B, K), sv_track_mask, sv_track_dca (B, K, T), displaced_mask, displaced_weight (B, T),
                 pv_original (dict), used_refit (B,).
@@ -994,7 +994,7 @@ class VertexHead(nn.Module):
                     (q * torch.sin(theta) / params["pT"]).reshape(-1).cpu().numpy(), [True] * q.numel(),
                     start_covariance)
                 track_parameters = torch.from_numpy(acts_out[0]).reshape(*q.shape, 6).to(hits.device, total_hit_weight.dtype)
-                acts_failed = params["fit_ok"] & ~torch.from_numpy(acts_out[1]).reshape(q.shape).to(hits.device)
+                acts_failed = params["usable"] & ~torch.from_numpy(acts_out[1]).reshape(q.shape).to(hits.device)
                 track_covariance = torch.from_numpy(acts_out[2]).reshape(*q.shape, 6, 6).to(hits.device)
                 track_weight = torch.ones_like(total_hit_weight)
             else:
