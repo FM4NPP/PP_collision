@@ -565,7 +565,8 @@ class VertexHead(nn.Module):
             the adaptive fit (ACTS's defaults).
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped);
             acts_image or acts_command, acts_field_map (+ _kind), acts_geometry + acts_geometry_config,
-            acts_material_map, acts_energy_loss, acts_max_steps configure it.
+            acts_material_map, acts_layer_envelope_mm (None: ACTS's 1 mm), acts_energy_loss, acts_max_steps
+            configure it.
         track_parameter_length_scale: cm per length unit of forward's track_parameters (ACTS mm: 0.1).
         find_secondary: find SVs; refit_pv: report the PV refitted with SV tracks shared.
         sv_min_track_pv_chi2, sv_min_track_beam_significance: SV candidate cuts.
@@ -595,6 +596,7 @@ class VertexHead(nn.Module):
         acts_geometry: str = None,
         acts_geometry_config: str = None,
         acts_material_map: str = None,
+        acts_layer_envelope_mm: float = None,
         acts_energy_loss: bool = True,
         hit_sigma_rphi: float = 0.034,
         hit_sigma_z: float = 0.1,
@@ -634,6 +636,7 @@ class VertexHead(nn.Module):
         self.acts_geometry = acts_geometry
         self.acts_geometry_config = acts_geometry_config
         self.acts_material_map = acts_material_map
+        self.acts_layer_envelope_mm = acts_layer_envelope_mm
         self.acts_energy_loss = acts_energy_loss
         if (acts_geometry is None) != (acts_geometry_config is None) or (acts_material_map and not acts_geometry):
             raise ValueError("acts_geometry and acts_geometry_config go together; acts_material_map needs both")
@@ -707,6 +710,7 @@ class VertexHead(nn.Module):
             "acts_geometry": resolve(acts.get("geometry")),
             "acts_geometry_config": resolve(acts.get("geometry_config")),
             "acts_material_map": resolve(acts.get("material_map")),
+            "acts_layer_envelope_mm": acts.get("layer_envelope_mm"),
             "acts_energy_loss": acts.get("energy_loss", True),
             "acts_max_steps": acts.get("max_steps"),
             **(d.get("vertex_head") or {}),
@@ -740,7 +744,8 @@ class VertexHead(nn.Module):
                 "bz_tesla": self.Bz, "field_map": self.acts_field_map, "field_map_kind": self.acts_field_map_kind,
                 "max_steps": self.acts_max_steps, "geometry": self.acts_geometry,
                 "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
-                "energy_loss": self.acts_energy_loss, "covariance": True}
+                "layer_envelope_mm": self.acts_layer_envelope_mm, "energy_loss": self.acts_energy_loss,
+                "covariance": True}
 
     def track_fit_config(self):
         """The track-model settings."""

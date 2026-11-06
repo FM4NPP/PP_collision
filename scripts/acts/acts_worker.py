@@ -6,7 +6,8 @@ streams batches:
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
 
 Config (VertexHead.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
-geometry + geometry_config (+ material_map, energy_loss, multiple_scattering), max_steps, covariance.
+geometry + geometry_config (+ material_map, layer_envelope_mm, energy_loss, multiple_scattering), max_steps,
+covariance.
 
 Protocol, after the line ACTS_WORKER_READY: n (uint64), position (n, 3), direction (n, 3), qop (n,) float64,
 backward (n,) uint8 [, covariance (n, 6, 6)]; reply params (n, 6) [, covariance (n, 6, 6)], ok (n,) uint8.
@@ -35,13 +36,16 @@ def first_module(*names):
     raise ImportError(f"none of {names} in this ACTS build")
 
 
-def build_tracking_geometry(geometry, geometry_config, material_map=None):
+def build_tracking_geometry(geometry, geometry_config, material_map=None, layer_envelope_mm=None):
     """ACTS tracking geometry from TGeo (TGeoDetector with its JSON configuration), with a JSON material map if
-    given. Returns (detector, geometry): the detector owns the detector elements and must be kept alive."""
+    given; layer_envelope_mm: radial envelope added to each layer (None: ACTS's 1 mm). Returns (detector, geometry): the detector owns the detector elements and must
+    be kept alive."""
     tgeo = first_module("acts.examples.tgeo", "acts.tgeo")
     config = tgeo.TGeoDetector.Config()
     config.readJson(geometry_config)
     config.fileName = geometry
+    if layer_envelope_mm is not None:
+        config.layerEnvelopeR = float(layer_envelope_mm) * acts.UnitConstants.mm
     if material_map:
         json_plugin = first_module("acts.json", "acts.examples.json")
         config.materialDecorator = json_plugin.JsonMaterialDecorator(
@@ -67,7 +71,8 @@ def build_propagator(config):
         field = acts.ConstantBField(acts.Vector3(0.0, 0.0, float(config["bz_tesla"]) * u.T))
     detector = geometry = None
     if config.get("geometry"):
-        detector, geometry = build_tracking_geometry(config["geometry"], config["geometry_config"], config.get("material_map"))
+        detector, geometry = build_tracking_geometry(config["geometry"], config["geometry_config"], config.get("material_map"),
+                                                     layer_envelope_mm=config.get("layer_envelope_mm"))
     propagator = acts_perigee_propagator.PerigeePropagator(
         field=field, reference=[float(v) for v in config.get("reference", (0.0, 0.0, 0.0))], geometry=geometry,
         energy_loss=bool(config.get("energy_loss", True)), multiple_scattering=bool(config.get("multiple_scattering", True)),

@@ -3,9 +3,10 @@
 check_geometry.py: check a detector's ACTS geometry and material map, inside the ACTS image:
 
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/check_geometry.py \
-        --geometry <tgeo.root> --geometry_config <config.json> [--material_map <material.json>]
+        --geometry <tgeo.root> --geometry_config <config.json> [--material_map <material.json>]         [--layer_envelope_mm 0.1]
 
-Prints surfaces per ACTS volume, how many carry material, and material-map entries that found no surface.
+Prints surfaces per ACTS volume, how many carry material, and material-map entries that found no surface;
+ACTS logs overlapping layers ("Layers are overlapping") while building.
 sPHENIX (ana559): 432 MVTX, 224 INTT, 13824 TPC, 16 micromegas sensitive surfaces; all 56 map entries land.
 """
 import argparse
@@ -31,10 +32,13 @@ def main():
     parser.add_argument("--geometry", required=True, help="TGeo ROOT file")
     parser.add_argument("--geometry_config", required=True, help="ACTS TGeo JSON configuration")
     parser.add_argument("--material_map", default=None, help="ACTS JSON material map; none = geometry only")
+    parser.add_argument("--layer_envelope_mm", type=float, default=None,
+                        help="radial envelope added to each layer, mm (default: ACTS's 1 mm)")
     args = parser.parse_args()
 
     t0 = time.perf_counter()
-    _, geometry = build_tracking_geometry(args.geometry, args.geometry_config, args.material_map)
+    _, geometry = build_tracking_geometry(args.geometry, args.geometry_config, args.material_map,
+                                          layer_envelope_mm=args.layer_envelope_mm)
     print(f"geometry built in {time.perf_counter() - t0:.1f} s from {args.geometry}")
 
     surfaces = []

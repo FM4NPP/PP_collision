@@ -29,6 +29,7 @@ acts:                          # use_acts is on when image (or command) is set
   geometry: null               # TGeo file from export_sphenix_geometry.C, e.g. sphenix_ana559_tgeo.root
   geometry_config: null        # ACTS TGeo JSON configuration, CDB key ACTSGEOMETRYCONFIG
   material_map: null           # ACTS JSON material map, CDB key ACTSMATERIALMAP
+  layer_envelope_mm: null      # radial envelope per layer (null: ACTS's 1 mm; check_geometry.py shows overlaps)
   energy_loss: false           # neutral to slightly worse on the 100 test events (2026-11-04)
   max_steps: null              # ACTS's propagation step limit (null: ACTS's default)
 
