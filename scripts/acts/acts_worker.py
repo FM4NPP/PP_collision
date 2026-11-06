@@ -1,32 +1,15 @@
 """
-acts_worker.py: ACTS (unmodified, an external library) computing bound perigee parameters for track states.
-Runs INSIDE the worker image (acts-worker.def: Python 3.12, NumPy, ACTS, the acts_perigee_propagator module;
-no torch). Two uses:
-
-- as a module: build_propagator() and propagate_to_perigee();
-- as a persistent worker for VertexHead(use_acts=True), which starts it once and streams batches:
+acts_worker.py: ACTS computing perigee parameters (and covariances) for track states, inside the worker image.
+VertexHead(use_acts=True) starts it once and streams batches:
 
     singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
 
-Config (JSON, ACTS units; VertexHead.acts_worker_config() writes it):
-    reference [x, y, z] mm: the perigee surface centre;
-    bz_tesla (constant field) or field_map (a text map as the container sees it) with field_map_kind "xyz" or
-        "rz", field_map_length_unit / field_map_field_unit (ACTS units per file unit; default mm and T);
-    geometry (TGeo ROOT file), geometry_config (ACTS TGeo JSON configuration) and optionally material_map (ACTS
-        JSON material map): propagate through that tracking geometry with material effects; energy_loss and
-        multiple_scattering (default true; scattering only widens a given covariance); without a geometry,
-        through the field alone;
-    max_steps (ACTS's default if absent); covariance: exchange covariances (protocol below).
+Config (VertexHead.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
+geometry + geometry_config (+ material_map, energy_loss, multiple_scattering), max_steps, covariance.
 
-Tracks are propagated in their real direction; a backward state (perigee behind it, e.g. at the innermost hit)
-is propagated backward, so energy lost on the way out is added back.
-
-Protocol on stdin/stdout, after a line "ACTS_WORKER_READY": per batch the parent writes n (uint64), then
-position (n, 3), direction (n, 3), qop (n,) as float64 and backward (n,) as uint8, and with "covariance": true
-each state's ACTS curvilinear covariance (n, 6, 6) float64; the worker answers params (n, 6) float64 (d0, z0,
-phi, theta, q/p, t in mm, GeV; NaN where ACTS failed or the input is not finite), with covariance the perigee
-covariance (n, 6, 6) float64, then ok (n,) uint8. EOF on stdin ends it, printing a summary of failures.
-Everything else the worker or ACTS prints goes to stderr.
+Protocol, after the line ACTS_WORKER_READY: n (uint64), position (n, 3), direction (n, 3), qop (n,) float64,
+backward (n,) uint8 [, covariance (n, 6, 6)]; reply params (n, 6) [, covariance (n, 6, 6)], ok (n,) uint8.
+EOF ends it and prints a failure summary; everything else goes to stderr.
 """
 import importlib
 import json

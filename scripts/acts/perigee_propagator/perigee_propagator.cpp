@@ -1,16 +1,7 @@
-// acts_perigee_propagator: ACTS (unmodified, linked as an external library) propagating track states to a perigee
-// surface, for acts_worker.py. ACTS's core Python bindings only offer propagateToSurface without actors and
-// without a direction or covariance; this module adds that one call, nothing else. It takes the field (and
-// geometry) objects ACTS's own Python bindings build (same pybind11, built against the same ACTS libraries), so
-// field map, geometry and material map stay configured in Python.
-//
-// Without a geometry the track is stepped through the field alone (VoidNavigator). With one it is navigated
-// through the tracking geometry with ACTS's MaterialInteractor: energy loss changes q/p, multiple scattering
-// widens a given covariance (it changes nothing without one).
-//
-// Units are ACTS's (mm, GeV, e). Tracks are propagated in their real direction: a state whose perigee lies
-// behind it (e.g. at the innermost hit) is propagated with Direction::Backward(), so energy loss is added back
-// (MaterialInteractor: "in forward(backward) propagation, energy decreases(increases)").
+// acts_perigee_propagator: ACTS propagation of track states to a perigee surface, for acts_worker.py; the one
+// call ACTS's Python bindings lack (direction, covariance, material). Takes the field and geometry objects the
+// bindings build. Without a geometry: field only (VoidNavigator); with one: navigated with MaterialInteractor.
+// Units mm, GeV, e; backward states are propagated backward, so energy loss is added back.
 #include <Acts/Definitions/Algebra.hpp>
 #include <Acts/Definitions/Direction.hpp>
 #include <Acts/EventData/BoundTrackParameters.hpp>

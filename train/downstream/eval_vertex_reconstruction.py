@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-Evaluate vertex reconstruction (VertexHead) after a trained track-finding head, the way
-eval_track_finding.py evaluates that head. Run from train/downstream:
+Evaluate VertexHead after a trained track-finding head. Run from train/downstream:
 
-    python eval_vertex_reconstruction.py --root_dir out/ [--checkpoint <head.pth>] [--no-csv]
-    python eval_vertex_reconstruction.py --run_config runs/<run>.yaml [any option to override it]
+    python eval_vertex_reconstruction.py --run_config runs/<run>.yaml [options override the file]
+    python eval_vertex_reconstruction.py --root_dir out/ --checkpoint <head.pth> [--no-csv]
 
-A run file (runs/) holds any of the options below as YAML keys (option names without --), so a model and
-site setup is one file; options on the command line override it.
-
-Backbone: --pretrained_ckpt, else pretrained_ckpt in --config. Track head: --checkpoint, else
-{track_config}_nerf_tracking_head_d{eventnumber}_{run_num}_seed{seed}[_nopretrain]_checkpoint.pth
-in --checkpoint_dir (default: the config's checkpoint_dir). Field: --bz, else YAML vertex_bz, else the
-detector file's, else 1.4. VertexHead: --detector (else YAML vertex_detector) gives a
-detector file (scripts/acts/detectors/<name>/<name>.yaml) with the field, ACTS inputs and fit settings.
-
-Outputs in --root_dir, named after {track_config}_eval_vertex_head_d...log: the .log metrics,
-_per_point_data.csv (unless --no-csv), _metrics.json and _results.npz (per-event vertices). --no_output writes
-none of these (a test run: metrics and timing are printed only).
+Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
+--checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events.
+Outputs in --root_dir: .log, _per_point_data.csv, _metrics.json, _results.npz; --no_output writes nothing.
 """
 import os
 import sys

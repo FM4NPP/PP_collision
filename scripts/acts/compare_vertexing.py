@@ -1,34 +1,15 @@
 #!/usr/bin/env python3
 """
-compare_vertexing.py: the regular check of VertexHead for one detector, against truth, on real events (the
-per-point CSV of eval_vertex_reconstruction.py --save_csv), PV only and with SV finding. The detector file
-(scripts/acts/detectors/<name>/<name>.yaml) gives the configured setup; the variants switch one thing each, so
-the tables show what every ingredient is worth:
+compare_vertexing.py: VertexHead variants for one detector against truth, on the per-point CSV of
+eval_vertex_reconstruction.py, PV only and with SVs:
 
-    own track fit             the detector's settings without ACTS
-    detector settings         the detector file as it is
-    no material map           ... ACTS without the material map (if one is set)
-    energy loss on / off      ... with the detector's energy-loss setting flipped (if a material map is set)
-    error scale x<s>          ... with track_error_scale = s (per --error_scales)
-    loose SV cuts             ... with loose SV-finding cuts (--loose_sv; many seeds per event)
+    python scripts/acts/compare_vertexing.py --csv <per-point csv> --detector <detector yaml> \
+        [--tracks finder|truth|both] [--loose_sv] [--max_events 500]
 
-Tracks (--tracks): the track finder's (pred_assignment), and/or truth tracks (hits grouped by their truth
-particle, seg_target), which separates vertexing errors from track-finding errors.
-
-PV table: quantiles of the PV residual |reconstructed - true| (3D, cm), events within 1 cm, the median PV
-chi2/ndf (about 1 if the track errors are right), tracks ACTS dropped, time per event (after the first, which
-starts the ACTS worker). PV residual table: the residual split into transverse (xy) and z, and per axis its bias
-(median) and robust width (1.4826 x median absolute deviation, a Gaussian sigma).
-
-SV table (runs with SV finding), against the truth IDs (a track is a Geant secondary if the majority truth ID of
-its hits is < 0): SV candidates, the share of the usable secondaries among them and their purity; SVs found, the
-share of their tracks that are secondaries, SVs made only of secondaries. With a CSV that has each particle's
-truth production vertex (vtx_x/y/z, written since 2026-11-05 with the reconstructed PV as reco_vtx_*), also SVs
-whose tracks share one true origin displaced from the true PV (all within --origin_tolerance), and the SV residual:
-the median distance of each SV to the median true origin of its tracks.
-
-    python scripts/acts/compare_vertexing.py --csv vertex_per_point_data.csv \\
-        --detector scripts/acts/detectors/sphenix/sphenix.yaml [--tracks both] [--loose_sv] [--max_events 500]
+Variants (one change each): own track fit, detector settings, no material map, energy loss flipped,
+other error scales, loose SV cuts. Tracks: the track finder's or truth tracks (seg_target).
+Tables: PV residual |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); SVs against
+truth IDs (secondary = truth ID < 0) and, with truth origins in the CSV (vtx_*), true SVs and SV residuals.
 """
 import argparse
 import csv

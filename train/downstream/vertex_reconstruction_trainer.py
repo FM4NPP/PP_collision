@@ -1,17 +1,11 @@
 """
-vertex_reconstruction_trainer.py: VertexHead after an already-trained track-finding head.
+vertex_reconstruction_trainer.py: VertexHead after a trained track-finding head.
 
-    frozen backbone -> frozen track finder (train_track_finding.py checkpoint) -> VertexHead
+    frozen backbone -> frozen track finder -> VertexHead (PV + SVs)
 
-DownstreamTrainer is standalone: its setup is a verbatim copy of track_finding_trainer's, and
-train() and the epoch loops are phase-2 hooks. The entry point is inference(), as in the other
-trainers (driven by eval_vertex_reconstruction.py). VertexHead finds secondary vertices by default
-and reports the PV refitted without their tracks where valid (vertexhead.py); run_sv_vertexing()
-also scores the original PV and summarizes the SVs. Truth is used only for scoring.
-
-Per-point CSV: track_finding_trainer.inference()'s, row for row, except vtx_x/y/z hold the
-reconstructed vertex; then the TESTING ONLY test_* truth columns (never reconstruction output),
-and SV_COLUMNS from run_sv_vertexing.
+Entry point: inference() (eval_vertex_reconstruction.py); train() is a phase-2 hook. Truth is used only for
+scoring. Per-point CSV: track finding's columns (vtx_*: truth production vertex), reco_vtx_* (reconstructed PV)
+and test_* truth columns.
 """
 
 import numpy as np
@@ -62,28 +56,19 @@ from loss import compute_vertex_metrics, assign_points_to_masks
 
 PAD_VALUE = -100
 
-# track_finding_trainer.inference()'s per-point CSV columns, in its order: vtx_x, vtx_y, vtx_z are, as there, the
-# truth production vertex of the hit's particle (reg[..., 3:6], cm)
+# track finding's per-point CSV columns (vtx_*: the hit's particle's truth production vertex, cm)
 PER_POINT_COLUMNS = ("batch_idx", "point_idx", "E_norm", "eta_norm", "phi_norm", "r_norm",
                      "px", "py", "pz", "vtx_x", "vtx_y", "vtx_z", "charge", "energy",
                      "seg_target", "pred_assignment", "confidence")
 
-# the event's reconstructed primary vertex (VertexHead), cm, on every hit of the event
+# the reconstructed PV, cm
 RECO_COLUMNS = ("reco_vtx_x", "reco_vtx_y", "reco_vtx_z")
 
-# TESTING ONLY, appended after PER_POINT_COLUMNS: the event's truth vertex (get_vertex_label, the
-# one the metrics score against) and the reconstructed-minus-truth residual, all cm; NaN where
-# either vertex is undefined
+# TESTING ONLY: the truth PV (get_vertex_label) and reconstructed - truth, cm; NaN where undefined
 TEST_COLUMNS = ("test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z",
                 "test_residual_x", "test_residual_y", "test_residual_z", "test_residual_3d")
 
-# SV columns appended by run_sv_vertexing when save_csv=True.
-# is_sv_track: the track that owns this hit was assigned to at least one SV.
-# sv_x, sv_y, sv_z: position of the best (lowest chi²/ndf) SV the track belongs to; NaN otherwise.
-SV_COLUMNS = ("is_sv_track", "sv_x", "sv_y", "sv_z")
-
-CSV_COLUMNS        = PER_POINT_COLUMNS + RECO_COLUMNS + TEST_COLUMNS
-CSV_COLUMNS_SV     = PER_POINT_COLUMNS + RECO_COLUMNS + TEST_COLUMNS + SV_COLUMNS
+CSV_COLUMNS = PER_POINT_COLUMNS + RECO_COLUMNS + TEST_COLUMNS
 
 
 def write_metrics_log(metrics, logfile):
@@ -110,18 +95,15 @@ def write_per_point_csv(columns, path):
 
 def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, vertex, truth_vertex):
     """
-    One batch of the per-point CSV with the reconstructed vertex.
+    One batch of the per-point CSV.
 
     Args:
-        step: loader step, written as batch_idx.
-        grouped: (B, N, 4) normalized hits; label: (B, N) truth track ID; mask: (B, N) real hits.
-        reg: (B, N, 8) truth (px, py, pz, vx, vy, vz, q, e).
-        class_probs, mask_probs: raw (bf16) track-head outputs, so assignments match inference().
-        vertex: (B, 3) reconstructed vertex (written as reco_vtx_*; vtx_* are the truth production vertices).
-        truth_vertex: (B, 3) truth vertex, NaN where undefined; testing only.
+        step: written as batch_idx; grouped: (B, N, 4); label: (B, N) truth track ID; reg: (B, N, 8) truth;
+        mask: (B, N) real hits; class_probs, mask_probs: raw track-head outputs; vertex: (B, 3) reconstructed PV;
+        truth_vertex: (B, 3), NaN where undefined.
 
     Returns:
-        dict column -> 1-D numpy array in CSV_COLUMNS order, one entry per real hit.
+        dict column -> 1-D array (CSV_COLUMNS), one entry per real hit.
     """
     assign = assign_points_to_masks({"pred_probs": class_probs, "pred_masks": mask_probs.permute(0, 2, 1)},
                                     option=2)["assignments"]
@@ -151,66 +133,6 @@ def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, 
         columns[f"test_residual_{axis}"] = col(residual[:, k])
     columns["test_residual_3d"] = col(residual.norm(dim=-1))
     return {k: columns[k] for k in CSV_COLUMNS}
-
-
-def per_point_columns_sv(
-    step, grouped, label, reg, mask, class_probs, mask_probs,
-    vertex, truth_vertex, sv_result,
-):
-    """
-    per_point_columns plus SV_COLUMNS: whether each hit's track is in an SV, and the position of its
-    lowest chi2/ndf SV.
-
-    Args:
-        sv_result: VertexHead output; the other arguments as per_point_columns.
-
-    Returns:
-        dict column -> 1-D numpy array in CSV_COLUMNS_SV order.
-    """
-    base = per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs,
-                              vertex, truth_vertex)
-
-    assign = assign_points_to_masks(
-        {"pred_probs": class_probs, "pred_masks": mask_probs.permute(0, 2, 1)},
-        option=2,
-    )["assignments"]                           # (B, N)  long – track index per hit
-    b, n = mask.nonzero(as_tuple=True)
-
-    # sv_track_mask: (B, K, T) bool; sv_chi2_per_dof: (B, K)
-    sv_mask  = sv_result["sv_track_mask"]      # (B, K, T)
-    sv_chi2  = sv_result["sv_chi2_per_dof"]    # (B, K)  NaN where invalid
-    sv_pos   = sv_result["sv_estimate"]        # (B, K, 3)
-
-    # For each track, find which SV it belongs to (the one with lowest chi²/ndf)
-    # sv_track_any: (B, T) – True if track i belongs to any SV
-    sv_track_any = sv_mask.any(dim=1)          # (B, T)
-
-    # Best SV index per track: among the K slots that include this track,
-    # pick the one with lowest chi²/ndf.  Slots not including the track get +inf.
-    # sv_q_per_track: (B, T, K) – chi²/ndf or +inf
-    K = sv_mask.shape[1]
-    sv_q_per_track = sv_chi2.unsqueeze(1).expand(-1, sv_mask.shape[2], -1)   # (B, T, K)
-    sv_q_per_track = sv_q_per_track.nan_to_num(nan=float("inf"))
-    sv_q_per_track = sv_q_per_track.masked_fill(~sv_mask.permute(0, 2, 1), float("inf"))
-    best_sv_idx = sv_q_per_track.argmin(dim=-1)    # (B, T)  – 0 where not in any SV
-
-    # Look up the best SV position for each track
-    ev_idx  = torch.arange(sv_pos.shape[0], device=sv_pos.device).unsqueeze(-1).expand_as(best_sv_idx)
-    best_sv_pos = sv_pos[ev_idx, best_sv_idx]      # (B, T, 3)
-    # Zero out tracks not in any SV
-    best_sv_pos = best_sv_pos.masked_fill(~sv_track_any.unsqueeze(-1), float("nan"))
-
-    # Look up per-hit values: the track each hit belongs to
-    track_idx  = assign[b, n]                       # (n_real_hits,) long
-    is_sv      = sv_track_any[b, track_idx]         # (n_real_hits,) bool
-    hit_sv_pos = best_sv_pos[b, track_idx]          # (n_real_hits, 3)
-
-    columns = dict(base)
-    columns["is_sv_track"] = is_sv.cpu().numpy().astype(np.float32)
-    for k, axis in enumerate("xyz"):
-        columns[f"sv_{axis}"] = hit_sv_pos[:, k].double().cpu().numpy()
-
-    return {k: columns[k] for k in CSV_COLUMNS_SV}
 
 
 class DownstreamTrainer():
@@ -749,14 +671,8 @@ class DownstreamTrainer():
 
     def setup_vertexing(self, track_ckpt):
         """
-        Build and strictly load the track head, then build VertexHead. Call after launch().
-
-        VertexHead from params: vertex_detector (a detector file, VertexHead.from_detector), vertex_bz (T;
-        overrides the detector file's field; 1.4 without either), vertex_device, and any VertexHead argument
-        as vertex_<argument> (e.g. vertex_track_error_scale, vertex_max_sv_chi2_per_dof), each only where set.
-
-        Args:
-            track_ckpt: train_track_finding.py checkpoint.
+        Load the track head and build VertexHead (after launch()). From params: vertex_detector (detector file),
+        vertex_bz, vertex_device, and any VertexHead argument as vertex_<argument>, each only where set.
         """
         n_feat = 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone
         self.down_model = MambaAttentionHead(
@@ -779,8 +695,7 @@ class DownstreamTrainer():
                     if getattr(self.params, "vertex_" + name, None) is not None}
         if getattr(self.params, "vertex_bz", None) is not None:
             settings["Bz"] = float(self.params.vertex_bz)
-        # VertexHead's device (YAML vertex_device, e.g. "cpu"): its many small per-iteration operations run
-        # faster on the CPU than on the GPU, where each convergence test waits for the device
+        # VertexHead's device (vertex_device, e.g. "cpu": faster than the GPU for its many small operations)
         self.vertex_device = torch.device(getattr(self.params, "vertex_device", None) or self.device)
         detector = getattr(self.params, "vertex_detector", None)
         head = VertexHead.from_detector(detector, **settings) if detector else VertexHead(**settings)
@@ -797,9 +712,8 @@ class DownstreamTrainer():
 
     def _vertex_head_chunk(self, records):
         """
-        VertexHead once over several loader batches (records with class_probs (b, T, 2), mask_probs (b, N, T),
-        grouped (b, N, 4), mask (b, N)), padded to the largest hit count (padded hits are masked, padded track
-        slots have P(real) = 0). Returns each record's (vertex_estimate (b, 3), fit_is_valid (b,)).
+        VertexHead once over several loader batches, padded to a common size; returns each batch's
+        (vertex_estimate, fit_is_valid).
         """
         n_hits = max(r["mask"].shape[1] for r in records)
         n_tracks = max(r["class_probs"].shape[1] for r in records)
@@ -816,17 +730,11 @@ class DownstreamTrainer():
 
     def inference(self, checkpoint_path, pretrain=True, logfile=None, save_csv=False, csv_output_path=None):
         """
-        Entry point, as in track_finding_trainer: setup_vertexing, then run_vertexing over at most
-        self.max_eval_events (default 20000); writes the metrics log and, with save_csv, the CSV.
+        setup_vertexing, then run_vertexing over at most max_eval_events; writes the metrics log and the CSV.
 
         Args:
-            checkpoint_path: train_track_finding.py checkpoint.
-            pretrain: True = frozen-backbone features (as trained); False = head on raw points.
-            logfile: metrics log path; None = not written.
-            save_csv, csv_output_path: per-point CSV switch and path (default derived from logfile).
-
-        Returns:
-            run_vertexing's dict, plus csv_output_path when the CSV was written.
+            checkpoint_path: track-head checkpoint; pretrain: backbone features (True) or raw points.
+            logfile: metrics log (None: not written); save_csv, csv_output_path: the per-point CSV.
         """
         self.setup_vertexing(checkpoint_path)
         result = self.run_vertexing(pretrain=pretrain, max_events=getattr(self, "max_eval_events", 20000),
@@ -855,25 +763,14 @@ class DownstreamTrainer():
     @torch.no_grad()
     def run_vertexing(self, pretrain=True, max_events=None, save_csv=False):
         """
-        Backbone -> track head -> VertexHead over the validation loader.
+        Backbone and track head per loader batch; VertexHead per vertex_chunk_events events (default 32).
 
         Args:
-            pretrain: True = frozen-backbone features (as trained); False = head on raw points.
-            max_events: stop after this many events; None = whole loader.
-            save_csv: also build the per-point CSV columns.
+            pretrain: backbone features (True) or raw points; max_events: limit (None: all); save_csv: build the CSV.
 
         Returns:
-            dict: metrics (compute_vertex_metrics plus n_events, fit_valid_rate); vertex_estimate,
-            vertex_target (n_events, 3); fit_is_valid (n_events,) fit valid and truth defined;
-            per_point (CSV columns, with save_csv); timing: seconds per stage (data loading and transfer,
-            backbone, track head, VertexHead, of which ACTS (worker start-up and propagation), truth and CSV),
-            also in metrics as time_<stage>_ms_per_event. The GPU is synchronised at each stage boundary so
-            the stages are attributed correctly.
-
-        The backbone and track head run per loader batch (one event by default: padding several events slows the
-        backbone and slightly changes its output); their outputs are collected and VertexHead runs once per
-        vertex_chunk_events events (YAML / --vertex_chunk_events, default 32; 1 = per batch), as its cost is
-        mostly per call. Each event's vertex does not depend on the rest of its chunk (up to ~1e-4 cm rounding).
+            dict: metrics (incl. time_<stage>_ms_per_event), vertex_estimate, vertex_target (n, 3), fit_is_valid (n,),
+            timing (seconds per stage), per_point (with save_csv).
         """
         self.model.eval()
         amp = torch.cuda.is_available() and self.use_amp
@@ -966,168 +863,4 @@ class DownstreamTrainer():
                   "fit_is_valid": ok.cpu(), "timing": timing}
         if save_csv:
             output["per_point"] = {k: np.concatenate([p[k] for p in per_point]) for k in CSV_COLUMNS}
-        return output
-
-    # ------------------------------------------------------------------------------------------
-    # Secondary-vertex evaluation (PV + SVs, then the PV refitted without SV tracks)
-    # ------------------------------------------------------------------------------------------
-
-    @torch.no_grad()
-    def run_sv_vertexing(self, pretrain=True, max_events=None, save_csv=False, refit_pv=True):
-        """
-        run_vertexing that also scores the original PV and summarizes the secondary vertices.
-
-        Args:
-            pretrain: True = frozen-backbone features (as trained); False = head on raw points.
-            max_events: stop after this many events; None = whole loader.
-            save_csv: also build the per-point CSV columns. SV columns (SV_COLUMNS) are added.
-            refit_pv: report VertexHead's PV (the refit where used); False = the original fit.
-
-        Returns:
-            dict: metrics, vertex_estimate (reported PV); pv_original_metrics, pv_original
-            (original fit); sv_summary (n_sv_mean, n_sv_max, sv_valid_rate, sv_displacement_mean,
-            sv_n_tracks_mean); vertex_target; fit_is_valid; per_point (with save_csv).
-        """
-        self.model.eval()
-        amp = torch.cuda.is_available() and self.use_amp
-
-        est, est_orig, tgt, ok, ok_orig = [], [], [], [], []
-        sv_valid_counts  = []   # (B,) number of valid SVs per event
-        sv_displace_list = []   # flat list of valid SV displacements
-        sv_ntracks_list  = []   # flat list of valid SV n_tracks
-        per_point_rows   = []
-
-        for step, batch in enumerate(tqdm(self.val_data_loader)):
-            if len(batch) != 4:
-                raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
-                                   "set params.return_reg_test = True before launch()")
-            grouped, label, _, reg = batch
-            b, c = grouped.size(0), grouped.size(-1)
-            grouped = grouped.reshape(b, -1, c).to(self.device)
-            reg     = reg.to(self.device)
-            mask    = grouped[..., 0] != PAD_VALUE
-
-            with autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext():
-                if pretrain:
-                    _, pre_embed, _ = self.model(grouped, return_z=True)
-                    out = self.down_model(grouped, self._layer_features(pre_embed), pretrain=True, padding_mask=mask)
-                else:
-                    out = self.down_model(grouped, feature=None)
-
-            class_probs = out["class_probs"].float()
-            mask_probs  = out["mask_probs"].float()
-
-            # ── Step 1: PV, SVs and the PV refitted without SV tracks ────────
-            sv_result = self._vertex_head(
-                class_probs=class_probs,
-                mask_probs=mask_probs,
-                points=grouped,
-                padding_mask=mask,
-            )
-            pv_estimate  = sv_result["pv_original"]["vertex_estimate"]    # (B, 3)
-            pv_valid     = sv_result["pv_original"]["fit_is_valid"]       # (B,)
-
-            # ── Step 2: refined PV (SV tracks removed where that refit is used) ──
-            if refit_pv:
-                refined_estimate = sv_result["vertex_estimate"]  # (B, 3)
-                refined_valid    = sv_result["fit_is_valid"]     # (B,)
-            else:
-                refined_estimate = pv_estimate
-                refined_valid    = pv_valid
-
-            # ── Step 3: truth + metrics accumulation ─────────────────────────
-            truth = get_vertex_label(
-                reg,
-                valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask,
-            )
-            truth_valid  = truth["vertex_valid"]
-            truth_vertex = truth["vertex_target"]
-
-            ok_r   = refined_valid   & truth_valid
-            ok_pvo = pv_valid        & truth_valid
-
-            est.append(refined_estimate)
-            est_orig.append(pv_estimate)
-            tgt.append(truth_vertex)
-            ok.append(ok_r)
-            ok_orig.append(ok_pvo)
-
-            # ── Step 4: SV summary stats ──────────────────────────────────────
-            sv_is_valid  = sv_result["sv_is_valid"]      # (B, K)
-            sv_displace  = sv_result["sv_displacement"]  # (B, K)
-            sv_n_tracks  = sv_result["sv_n_tracks"]      # (B, K) long
-
-            sv_valid_counts.append(sv_is_valid.sum(dim=-1).float().cpu())   # (B,)
-            if sv_is_valid.any():
-                sv_displace_list.append(sv_displace[sv_is_valid].cpu())
-                sv_ntracks_list.append(sv_n_tracks[sv_is_valid].float().cpu())
-
-            # ── Step 5: optional per-point CSV ───────────────────────────────
-            if save_csv:
-                tv_nan = truth_vertex.masked_fill(~truth_valid[:, None], float("nan"))
-                per_point_rows.append(
-                    per_point_columns_sv(
-                        step, grouped, label, reg, mask,
-                        class_probs, mask_probs,
-                        refined_estimate, tv_nan,
-                        sv_result,
-                    )
-                )
-
-            if max_events and sum(len(x) for x in est) >= max_events:
-                break
-
-        # ── Aggregate over all batches ────────────────────────────────────────
-        est      = torch.cat(est)
-        est_orig = torch.cat(est_orig)
-        tgt      = torch.cat(tgt)
-        ok       = torch.cat(ok)
-        ok_orig  = torch.cat(ok_orig)
-
-        metrics = compute_vertex_metrics(est, tgt, ok)
-        metrics.update(n_events=len(ok), fit_valid_rate=ok.float().mean().item())
-
-        pv_orig_metrics = compute_vertex_metrics(est_orig, tgt, ok_orig)
-        pv_orig_metrics.update(n_events=len(ok_orig), fit_valid_rate=ok_orig.float().mean().item())
-
-        sv_counts  = torch.cat(sv_valid_counts)
-        sv_summary = {
-            "n_sv_mean":          sv_counts.mean().item(),
-            "n_sv_max":           int(sv_counts.max().item()),
-            "sv_valid_rate":      (sv_counts > 0).float().mean().item(),
-        }
-        if sv_displace_list:
-            all_disp   = torch.cat(sv_displace_list)
-            all_ntracks = torch.cat(sv_ntracks_list)
-            sv_summary["sv_displacement_mean"] = all_disp.mean().item()
-            sv_summary["sv_n_tracks_mean"]     = all_ntracks.mean().item()
-        else:
-            sv_summary["sv_displacement_mean"] = float("nan")
-            sv_summary["sv_n_tracks_mean"]     = float("nan")
-
-        if self.log_to_screen:
-            print("[vertex-refined] " + "  ".join(
-                f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
-                for k, v in metrics.items()))
-            print("[vertex-original] " + "  ".join(
-                f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
-                for k, v in pv_orig_metrics.items()))
-            print("[sv] " + "  ".join(
-                f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
-                for k, v in sv_summary.items()))
-
-        output = {
-            "metrics":              metrics,
-            "pv_original_metrics":  pv_orig_metrics,
-            "sv_summary":           sv_summary,
-            "vertex_estimate":      est.cpu(),          # refined PV
-            "pv_original":          est_orig.cpu(),     # PV before SV removal
-            "vertex_target":        tgt.cpu(),
-            "fit_is_valid":         ok.cpu(),
-        }
-        if save_csv:
-            output["per_point"] = {
-                k: np.concatenate([p[k] for p in per_point_rows])
-                for k in CSV_COLUMNS_SV
-            }
         return output

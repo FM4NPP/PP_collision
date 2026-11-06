@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-check_geometry.py: a detector's ACTS inputs, checked before use. Builds the tracking geometry as the worker does
-(TGeoDetector from the TGeo file and its JSON configuration, with the JSON material map if given) and reports
-the surfaces built per ACTS volume (sensitive / approach / layer), how many carry material, and which
-material-map entries found no surface. Runs INSIDE the worker image:
+check_geometry.py: check a detector's ACTS geometry and material map, inside the worker image:
 
-    singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/check_geometry.py \\
-        --geometry <tgeo.root> --geometry_config <tgeo config.json> [--material_map <material.json>]
+    singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/check_geometry.py \
+        --geometry <tgeo.root> --geometry_config <config.json> [--material_map <material.json>]
 
-Expect every sensitive detector volume with its module count and every material-map entry landed. sPHENIX
-(ana559 geometry, ACTS v45 map): 432 MVTX, 224 INTT, 13824 TPC and 16 micromegas sensitive surfaces; all 56
-map entries land, on approach surfaces. TGeoDetector's "Layers are overlapping" errors for the TPC (layers
-closer than the configuration's 5 mm tolerance) do not stop that.
+Prints surfaces per ACTS volume, how many carry material, and material-map entries that found no surface.
+sPHENIX (ana559): 432 MVTX, 224 INTT, 13824 TPC, 16 micromegas sensitive surfaces; all 56 map entries land.
 """
 import argparse
 import collections
