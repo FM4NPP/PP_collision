@@ -24,7 +24,7 @@ hit_errors_cm:                 # per-hit errors for the hit fit's covariance (co
   z: 0.1
 
 acts:                          # use_acts is on when image (or command) is set
-  image: null                  # acts-worker-48.2.0.sif (scripts/acts/build_images.sh)
+  image: null                  # acts-base-48.2.0.sif (scripts/acts/build_images.sh, which also builds the module)
   command: null                # instead of image: the command that runs Python with ACTS, a list
   geometry: null               # TGeo file from export_sphenix_geometry.C, e.g. sphenix_ana559_tgeo.root
   geometry_config: null        # ACTS TGeo JSON configuration, CDB key ACTSGEOMETRYCONFIG

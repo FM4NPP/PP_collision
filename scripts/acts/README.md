@@ -22,7 +22,7 @@ covariance-weighted adaptive fit with each track model:
 
 | file | what |
 |---|---|
-| `build_images.sh`, `acts-base.def`, `acts-worker.def` | the container: base (ROOT, HepMC3, ACTS; slow, once) + worker (the module below; minutes) |
+| `build_images.sh`, `acts-base.def` | the container (ROOT, HepMC3, ACTS; slow, once) and the module below, compiled inside it (about a minute) |
 | `perigee_propagator/` | one C++ file: ACTS propagation to the perigee with direction, covariance and material, which ACTS's Python bindings lack |
 | `acts_worker.py` | runs in the container; VertexHead starts it once and streams tracks to it |
 | `detectors/<name>/` | everything detector-specific: the detector file `<name>.yaml` and the tools that make its inputs |
@@ -37,9 +37,10 @@ Singularity (or apptainer) with `--fakeroot`. From anywhere:
 JOBS=8 scripts/acts/build_images.sh
 ```
 
-The base image (ROOT and ACTS compile: an hour or more) is built only if missing (`--rebuild-base` to force); the
-worker image takes minutes. Each ends with an import check (`acts OK`, `perigee propagator OK`). Put
-`scripts/acts/acts-worker-48.2.0.sif` where users can reach it.
+The image (ROOT and ACTS compile: an hour or more) is built only if missing (`--rebuild-base` to force); the module
+is then compiled inside it into `perigee_propagator/build/install` (about a minute; rerun after changing the C++).
+Each ends with an import check (`acts OK`, `perigee propagator OK`). The detector file's `acts.image` is
+`scripts/acts/acts-base-48.2.0.sif`.
 
 ## Use
 
@@ -67,7 +68,7 @@ and flagged in the output `acts_failed`; the worker prints a summary of failures
 4. **Check** the geometry and material map in ACTS:
 
    ```bash
-   singularity exec scripts/acts/acts-worker-48.2.0.sif acts-python scripts/acts/check_geometry.py \
+   singularity exec scripts/acts/acts-base-48.2.0.sif acts-python scripts/acts/check_geometry.py \
        --geometry <tgeo.root> --geometry_config <config.json> --material_map <material.json>
    ```
 

@@ -1,7 +1,7 @@
-# ACTS base image, Singularity recipe (stage 1 of 2; build_images.sh builds both): ROOT (from source, C++20),
+# ACTS base image, Singularity recipe (build_images.sh builds it, then the module inside it): ROOT (from source, C++20),
 # HepMC3 (with ROOT I/O) and ACTS v48.2.0 with its Python bindings, examples, ROOT/TGeo and JSON plugins, all
 # in C++20 and with one nlohmann::json. Unmodified ACTS (MPL-2.0), installed as an external library. Slow (ROOT
-# and ACTS both compile, an hour or more); rebuilt only to change versions. Stage 2 is acts-worker.def.
+# and ACTS both compile, an hour or more); rebuilt only to change versions.
 Bootstrap: docker
 From: ubuntu:24.04
 
@@ -47,7 +47,7 @@ From: ubuntu:24.04
 
     # ACTS: Python bindings + examples with ROOT (TGeoDetector, ROOT and JSON plugins), C++20 (ACTS defaults to
     # C++23; ROOT's headers need their own standard), the system nlohmann::json. The build tree is kept for
-    # python/setup.sh; the install (/opt/acts) is what acts-worker.def compiles against.
+    # python/setup.sh; the install (/opt/acts) is what the module compiles against.
     git clone --depth 1 --branch ${ACTS_VERSION} https://github.com/acts-project/acts.git /opt/acts-src
     cmake -S /opt/acts-src -B /opt/acts-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=${CXX_STANDARD} \
         -DCMAKE_PREFIX_PATH="/opt/root;/opt/hepmc3" -DACTS_USE_SYSTEM_NLOHMANN_JSON=ON \

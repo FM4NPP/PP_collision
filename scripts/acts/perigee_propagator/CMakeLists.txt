@@ -1,6 +1,6 @@
 # acts_perigee_propagator: a pybind11 module linked against an installed ACTS (find_package) and built with the
 # same pybind11 ACTS's Python bindings were built with (PYBIND11_SOURCE_DIR), so it accepts the field and geometry
-# objects those bindings create. Built in the worker image, see acts-worker.def.
+# objects those bindings create. Built inside the ACTS image by build_images.sh.
 cmake_minimum_required(VERSION 3.20)
 project(acts_perigee_propagator CXX)
 

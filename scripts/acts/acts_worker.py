@@ -1,16 +1,16 @@
 """
-acts_worker.py: ACTS computing perigee parameters (and covariances) for track states, inside the worker image.
-VertexHead(use_acts=True) starts it once and streams batches:
+acts_worker.py: ACTS computing perigee parameters (and covariances) for track states, inside the ACTS image with
+the module from build_images.sh (perigee_propagator/build/install). VertexHead(use_acts=True) starts it once and
+streams batches:
 
-    singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
+    singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
 
 Config (VertexHead.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
 geometry + geometry_config (+ material_map, energy_loss, multiple_scattering), max_steps, covariance.
 
 Protocol, after the line ACTS_WORKER_READY: n (uint64), position (n, 3), direction (n, 3), qop (n,) float64,
 backward (n,) uint8 [, covariance (n, 6, 6)]; reply params (n, 6) [, covariance (n, 6, 6)], ok (n,) uint8.
-States the navigation fails on are retried field only (no material). EOF ends it and prints a failure
-summary; everything else goes to stderr.
+EOF ends it and prints a failure summary; everything else goes to stderr.
 """
 import importlib
 import json
@@ -21,7 +21,9 @@ import sys
 import numpy as np
 
 import acts
-import acts_perigee_propagator
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perigee_propagator", "build", "install"))
+import acts_perigee_propagator  # noqa: E402
 
 
 def first_module(*names):
@@ -74,9 +76,9 @@ def build_propagator(config):
 
 
 def propagate_to_perigee(setup, position, direction, qop, backward, errors=None, covariance=None):
-    """(n, 6) perigee parameters (NaN where ACTS failed or the input is not finite) and status (n,) (0 failed,
-    1 propagated, 2 field only after the navigation failed); with a start covariance (n, 6, 6) (ACTS
-    curvilinear, mm) also the perigee covariance (n, 6, 6). errors: a dict that collects {failure: [count, detail]}."""
+    """(n, 6) perigee parameters (NaN where ACTS failed or the input is not finite) and ok (n,); with a start
+    covariance (n, 6, 6) (ACTS curvilinear, mm) also the perigee covariance (n, 6, 6). errors: a dict that
+    collects {failure: [count, detail]}."""
     params, ok, failures, cov = setup[0].propagate(
         np.asarray(position, dtype=np.float64), np.asarray(direction, dtype=np.float64),
         np.asarray(qop, dtype=np.float64), np.asarray(backward, dtype=bool),
@@ -84,7 +86,7 @@ def propagate_to_perigee(setup, position, direction, qop, backward, errors=None,
     if errors is not None:
         for key, count in failures.items():
             errors.setdefault(key, [0, key])[0] += count
-    return (params, ok) if covariance is None else (params, ok, cov)
+    return (params, ok.astype(bool)) if covariance is None else (params, ok.astype(bool), cov)
 
 
 def read_exact(stream, size):
@@ -107,14 +109,13 @@ def serve(config):
     stdin = sys.stdin.buffer
     out.write(b"ACTS_WORKER_READY\n")
     out.flush()
-    errors, counts = {}, [0, 0, 0]  # failure reason -> [count, detail]; [attempted, propagated, field-only retries]
+    errors, counts = {}, [0, 0]  # failure reason -> [count, detail]; [states attempted, propagated]
     with_covariance = bool(config.get("covariance"))
     while True:
         header = read_exact(stdin, 8)
         if header is None:
             # at the end (VertexHead closes the worker at exit): why ACTS failed, for the dropped tracks
-            print(f"ACTS worker: {counts[1]} of {counts[0]} states propagated ({counts[2]} field only after a "
-                  "navigation failure)" + ("; failures:" if errors else ""))
+            print(f"ACTS worker: {counts[1]} of {counts[0]} states propagated" + ("; failures:" if errors else ""))
             for key, (count, _) in sorted(errors.items(), key=lambda item: -item[1][0]):
                 print(f"  {count:7d}  {key}")
             sys.stdout.flush()
@@ -129,10 +130,9 @@ def serve(config):
         covariance = np.frombuffer(body[n * 57:], dtype="<f8").reshape(n, 6, 6) if with_covariance else None
         result = propagate_to_perigee(setup, position, direction, qop, backward, errors, covariance)
         counts[0] += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())
-        counts[1] += int((result[1] > 0).sum())
-        counts[2] += int((result[1] == 2).sum())
+        counts[1] += int(result[1].sum())
         out.write(result[0].astype("<f8").tobytes() + (result[2].astype("<f8").tobytes() if with_covariance else b"")
-                  + (result[1] > 0).astype(np.uint8).tobytes())
+                  + result[1].astype(np.uint8).tobytes())
         out.flush()
 
 

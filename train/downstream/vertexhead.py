@@ -720,13 +720,14 @@ class VertexHead(nn.Module):
 
     def acts_worker_command(self):
         """
-        The command that runs the ACTS worker (singularity exec, with the ACTS input directories bound).
+        The command that runs the ACTS worker (singularity exec, with scripts/acts and the ACTS input directories bound).
         """
         if self.acts_command:
             return list(self.acts_command)
         if not self.acts_image:
             raise ValueError("use_acts needs acts_image (the ACTS container, scripts/acts) or acts_command")
-        inputs = [self.acts_field_map, self.acts_geometry, self.acts_geometry_config, self.acts_material_map]
+        inputs = [ACTS_WORKER_SCRIPT, self.acts_field_map, self.acts_geometry, self.acts_geometry_config,
+                  self.acts_material_map]
         binds = sorted({os.path.dirname(os.path.abspath(p)) for p in inputs if p})
         return ["singularity", "exec", *(["--bind", ",".join(binds)] if binds else []), self.acts_image, "acts-python"]
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-check_geometry.py: check a detector's ACTS geometry and material map, inside the worker image:
+check_geometry.py: check a detector's ACTS geometry and material map, inside the ACTS image:
 
-    singularity exec acts-worker-48.2.0.sif acts-python scripts/acts/check_geometry.py \
+    singularity exec acts-base-48.2.0.sif acts-python scripts/acts/check_geometry.py \
         --geometry <tgeo.root> --geometry_config <config.json> [--material_map <material.json>]
 
 Prints surfaces per ACTS volume, how many carry material, and material-map entries that found no surface.
