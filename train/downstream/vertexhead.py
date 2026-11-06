@@ -939,7 +939,8 @@ class VertexHead(nn.Module):
                 vertex_estimate (B, 3), chi_square, fit_is_valid (B,), vertex_covariance (B, 3, 3).
                 track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
                 track_quality_mask, track_sigma (B, T, 2), track_vertex_weight, track_chi2, track_dca (B, T),
-                track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS.
+                track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS;
+                track_covariance (B, T, 6, 6): the ACTS perigee covariance (mm), with use_acts or given.
                 With find_secondary: sv_estimate (B, K, 3), sv_is_valid, sv_chi2, sv_chi2_per_dof, sv_displacement,
                 sv_n_tracks (B, K), sv_track_mask, sv_track_dca (B, K, T), displaced_mask, displaced_weight (B, T),
                 pv_original (dict), used_refit (B,).
@@ -1070,6 +1071,8 @@ class VertexHead(nn.Module):
         }
         if acts_failed is not None:
             result["acts_failed"] = acts_failed
+        if track_covariance is not None:
+            result["track_covariance"] = track_covariance
         result["track_sigma"] = params["track_sigma"]
         # per-track outputs of unfitted tracks (bad) come from their finite stand-ins: NaN in what is reported
         def masked(f):

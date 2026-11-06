@@ -19,13 +19,21 @@ Truth PV error on 1000 sPHENIX events (median / 68% / 90%, cm), VertexHead's ada
 ```bash
 scripts/run/vertexing.sh setup      # image (once, an hour or more) + module (a minute); site detector file
 scripts/run/vertexing.sh eval       # backbone, track finder, VertexHead -> per-point CSV
-scripts/run/vertexing.sh compare    # VertexHead variants against truth on that CSV
+scripts/run/vertexing.sh compare    # VertexHead and ACTS's own vertex finder against truth on that CSV
 ```
 
 The run is `scripts/configs/vertex_m5_gpuserver0.yaml` (`RUN_CONFIG=<file>` for another). Its `detector:` file,
-`scripts/configs/sphenix_<site>.yaml` (gitignored), is written by `setup` from `detectors/sphenix/sphenix.yaml`;
-fill in its ACTS inputs (see sPHENIX inputs). Options after the command go to the Python script, e.g.
-`eval --max_eval_events 5000` or `compare --loose_sv`. Rerun `setup` after changing the C++.
+`scripts/configs/sphenix_<site>.yaml` (gitignored), is written by `setup` from `detectors/sphenix/sphenix.yaml`
+and updated by its options, which also overwrite an existing file's settings:
+
+```bash
+scripts/run/vertexing.sh setup --geometry <tgeo.root> --geometry_config <config.json> --material_map <material.json> \
+    [--field_map <field.txt>] [--set acts.energy_loss=true] [--set vertex_head.track_error_scale=2.5]
+```
+
+The input files must exist (see sPHENIX inputs); `--set section.key=value` sets any other key, keeping its comment.
+Options after `eval` or `compare` go to the Python script, e.g. `eval --max_eval_events 5000` or
+`compare --tracks finder --max_events 1000`. Rerun `setup` after changing the C++.
 
 ## Pieces
 
@@ -36,7 +44,8 @@ fill in its ACTS inputs (see sPHENIX inputs). Options after the command go to th
 | `acts_worker.py` | runs in the image; VertexHead starts it once and streams track states to it |
 | `detectors/<name>/` | the detector file template `<name>.yaml` and the tools that make its inputs |
 | `check_geometry.py` | a detector's geometry and material map in ACTS (`--layers`: each layer's extent) |
-| `compare_vertexing.py` | VertexHead variants against truth: PV, PV per axis, SVs |
+| `compare_vertexing.py` | VertexHead against ACTS's own vertex finder and truth: PV, PV per axis, SVs |
+| `acts_vertexing.py` | ACTS's vertex finder as shipped (AMVF, Gaussian seeder) on given tracks, for the comparison |
 
 Tracks ACTS fails on (soft curlers the hit fit already rejects) are dropped and flagged in `acts_failed`; the
 worker prints a failure summary when it exits.
@@ -57,8 +66,8 @@ worker prints a failure summary when it exits.
    ```
 
    Every sensitive volume should have its module count and every material-map entry should land.
-5. **Compare** on real events and set the best variant in the file's `vertex_head` block; a PV chi2/ndf far from
-   1 means `track_error_scale` needs adjusting.
+5. **Compare** VertexHead with ACTS's own finder on real events; a PV chi2/ndf far from 1 means
+   `track_error_scale` (the file's `vertex_head` block) needs adjusting.
 
 ## sPHENIX inputs
 

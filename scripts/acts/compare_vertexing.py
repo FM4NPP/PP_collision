@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-compare_vertexing.py: VertexHead variants for one detector against truth, on the per-point CSV of
-eval_vertex_reconstruction.py, PV only and with SVs:
+compare_vertexing.py: VertexHead against ACTS's own vertex finder and truth, on the per-point CSV of
+eval_vertex_reconstruction.py:
 
     python scripts/acts/compare_vertexing.py --csv <per-point csv> --detector <detector yaml> \
-        [--tracks finder|truth|both] [--loose_sv] [--max_events 500]
+        [--tracks finder|truth|both] [--max_events 500]
 
-Variants (one change each): own track fit, detector settings, no material map, energy loss flipped,
-other error scales, loose SV cuts. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
-Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); SVs against truth
-(secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*).
+VertexHead runs with the detector file's settings (PV and SVs). ACTS's finder as shipped (acts_vertexing.py: AMVF,
+Gaussian seeder; its first vertex as the PV) runs on the same tracks with the same errors (x track_error_scale);
+it needs the detector file's ACTS image. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
+Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); VertexHead's SVs against
+truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*).
 """
 import argparse
 import csv
 import os
+import subprocess
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -24,8 +27,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
                                 "train", "downstream"))
 import vertexhead as vh  # noqa: E402
 
-LOOSE_SV = dict(sv_min_track_pv_chi2=1.0, sv_max_track_chi2=50.0, sv_min_displacement_significance=0.0,
-                max_sv_chi2_per_dof=100.0, max_pair_doca=3.0)
+PARAMS = ("d0", "z0", "phi", "theta", "qop")
+TRACK_COLUMNS = ["trackId", *PARAMS, *(f"var_{a}" for a in PARAMS),
+                 *(f"cov_{a}{b}" for a in PARAMS for b in PARAMS if a != b)]   # CsvTrackParameterReader's columns
 
 
 def load_events(path, max_events, tracks="finder"):
@@ -68,41 +72,48 @@ def load_events(path, max_events, tracks="finder"):
     return events
 
 
-def variants(detector, error_scales, loose_sv):
-    """(name, VertexHead overrides) for this detector."""
-    base = vh.VertexHead.from_detector(detector)
-    if base.use_acts:
-        yield "own track fit", dict(use_acts=False)
-    yield "detector settings", {}
-    if base.use_acts and base.acts_material_map:
-        yield "no material map", dict(acts_material_map=None)
-        yield f"energy loss {'off' if base.acts_energy_loss else 'on'}", dict(acts_energy_loss=not base.acts_energy_loss)
-    for scale in error_scales:
-        if scale != base.track_error_scale:
-            yield f"error scale x{scale:g}", dict(track_error_scale=scale)
-    if loose_sv:
-        yield "loose SV cuts", dict(LOOSE_SV)
+def acts_vertices(head, outs):
+    """ACTS's own vertex finder (acts_vertexing.py) on each event's VertexHead input tracks (weight > 0), errors
+    scaled by track_error_scale: the first vertex found per event (E, 3) cm (NaN without one), vertices per event."""
+    with tempfile.TemporaryDirectory(dir=os.path.expanduser("~")) as tmp:      # the home is visible in the image
+        for e, o in enumerate(outs):
+            params = o["track_parameters"][0].double().numpy().copy()
+            params[:, :2] /= head.track_parameter_length_scale                   # d0, z0: cm -> mm
+            cov = o["track_covariance"][0].double().numpy() * head.track_error_scale ** 2
+            keep = (o["track_weight"][0] > 0).numpy() & np.isfinite(params[:, :5]).all(1) & np.isfinite(cov).all((1, 2))
+            with open(os.path.join(tmp, f"event{e:09d}-tracks.csv"), "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(TRACK_COLUMNS)
+                for i, (p, c) in enumerate(zip(params[keep], cov[keep])):
+                    writer.writerow([i, *p[:5], *np.diag(c)[:5], *(c[a, b] for a in range(5) for b in range(5) if a != b)])
+        command = head.acts_worker_command()
+        if command[:2] == ["singularity", "exec"]:
+            command = [*command[:2], "--bind", tmp, *command[2:]]
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "acts_vertexing.py")
+        subprocess.run([*command, script, tmp, "--bz_tesla", str(head.Bz)], check=True)
+        found = []
+        for e in range(len(outs)):
+            with open(os.path.join(tmp, f"event{e:09d}-vertices.csv"), newline="") as f:
+                found.append([[float(r[k]) for k in "xyz"] for r in csv.DictReader(f)])
+    first = np.array([v[0] if v else [np.nan] * 3 for v in found]) * head.track_parameter_length_scale
+    return first, [len(v) for v in found]
 
 
-def pv_stats(outs, events, times):
-    """The PV table's and the per-axis table's numbers for one run."""
-    residual = np.array([o["vertex_estimate"][0].double().numpy() - e[1] for o, e in zip(outs, events)])
+def pv_stats(vertices, events):
+    """The PV table's and the per-axis table's numbers for PVs (E, 3), cm."""
+    residual = vertices - np.array([e[1] for e in events])
     residual = residual[np.isfinite(residual).all(axis=1)]          # (events, 3): reconstructed - true, cm
     if not len(residual):
-        return (0, *[np.nan] * 5, 0, np.nan), [np.nan] * 10
+        return (0, *[np.nan] * 4), [np.nan] * 10
     err, transverse, bias = np.linalg.norm(residual, axis=1), np.linalg.norm(residual[:, :2], axis=1), np.median(residual, axis=0)
-    # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
-    ndf = [2 * float((o["track_weight"] > 0).double().mul(o["track_vertex_weight"].double()).sum()) - 3 for o in outs]
-    chi2 = [o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()]
-    pv = (len(err), *(np.percentile(err, q) for q in (50, 68, 90)), (err < 1.0).mean(), np.median(chi2) if chi2 else np.nan,
-          sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)
+    pv = (len(err), *(np.percentile(err, q) for q in (50, 68, 90)), (err < 1.0).mean())
     axes = (np.median(transverse), np.percentile(transverse, 68), np.median(np.abs(residual[:, 2])),
             np.percentile(np.abs(residual[:, 2]), 68), *bias, *(1.4826 * np.median(np.abs(residual - bias), axis=0)))
     return pv, axes
 
 
 def sv_stats(outs, events, origin_tolerance):
-    """The SV table's numbers for one run with SV finding."""
+    """The SV table's numbers for VertexHead's SVs."""
     n_sec = n_cand = n_cand_sec = n_sv = sv_tracks = sv_tracks_sec = sv_all_sec = sv_true = 0
     residual = []
     for o, (_, truth, sec, origin) in zip(outs, events):
@@ -126,48 +137,55 @@ def main():
     parser.add_argument("--csv", required=True)
     parser.add_argument("--detector", required=True, help="detector file (scripts/acts/detectors/<name>/<name>.yaml)")
     parser.add_argument("--tracks", choices=("finder", "truth", "both"), default="both")
-    parser.add_argument("--error_scales", type=float, nargs="*", default=[1.0, 2.5])
-    parser.add_argument("--loose_sv", action="store_true", help="also a variant with loose SV cuts")
     parser.add_argument("--origin_tolerance", type=float, default=0.1, help="cm, for true (shared, displaced) origins")
     parser.add_argument("--max_events", type=int, default=500)
     args = parser.parse_args()
 
-    pv_rows, axis_rows, sv_rows = [], [], []
+    head = vh.VertexHead.from_detector(args.detector, find_secondary=True).eval()
+    pv_rows, axis_rows, sv_rows, notes = [], [], [], []
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
         events = load_events(args.csv, args.max_events, tracks)
         n_truth = sum(bool(np.isfinite(e[1]).all()) for e in events)
         print(f"{tracks} tracks: {len(events)} events ({n_truth} with a true vertex) from {args.csv}; detector "
               f"{args.detector}", flush=True)
-        for mode, find_secondary in (("PV only", False), ("with SVs", True)):
-            for name, kw in variants(args.detector, args.error_scales, args.loose_sv):
-                if name == "loose SV cuts" and not find_secondary:
-                    continue
-                head = vh.VertexHead.from_detector(args.detector, find_secondary=find_secondary, **kw).eval()
-                outs, times = [], []
-                with torch.no_grad():
-                    for inputs, *_ in events:
-                        t0 = time.perf_counter()
-                        outs.append(head(*inputs))
-                        times.append(time.perf_counter() - t0)
-                label = f"{tracks:7s} {mode:9s} {name:22s}"
-                pv, axes = pv_stats(outs, events, times)
-                n, m, p68, p90, within, chi2, dropped, ms = pv
-                pv_rows.append(f"{label} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} "
-                               f"{'' if np.isnan(chi2) else f'{chi2:8.2f}':>8s} {dropped:7d} {ms:7.1f}")
-                axis_rows.append(f"{label} " + " ".join(f"{x:7.4f}" for x in axes))
-                if find_secondary:
-                    sv_rows.append(f"{tracks:7s} {name:22s} {sv_stats(outs, events, args.origin_tolerance)}")
-                print(f"  done: {tracks} tracks / {mode} / {name}", flush=True)
+        outs, times = [], []
+        with torch.no_grad():
+            for inputs, *_ in events:
+                t0 = time.perf_counter()
+                outs.append(head(*inputs))
+                times.append(time.perf_counter() - t0)
+        # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
+        ndf = [2 * float((o["track_weight"] > 0).double().mul(o["track_vertex_weight"].double()).sum()) - 3 for o in outs]
+        chi2 = [o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()]
+        vertices = np.array([o["vertex_estimate"][0].double().numpy() for o in outs])
+        runs = [("VertexHead", vertices, f"{np.median(chi2):8.2f}" if chi2 else "",
+                 sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)]
+        if head.use_acts:
+            acts_pv, n_found = acts_vertices(head, outs)
+            runs.append(("ACTS AMVF", acts_pv, "", runs[0][3], None))
+            distance = np.linalg.norm(acts_pv - vertices, axis=1)
+            notes.append(f"{tracks} tracks: ACTS AMVF found {np.mean(n_found):.2f} vertices per event, none in "
+                         f"{n_found.count(0)}; its first vertex - VertexHead's PV: median {np.nanmedian(distance):.4f} cm, "
+                         f"90% {np.nanpercentile(distance, 90):.4f} cm")
+        for name, run_vertices, run_chi2, dropped, ms in runs:
+            label = f"{tracks:7s} {name:12s}"
+            (n, m, p68, p90, within), axes = pv_stats(run_vertices, events)
+            pv_rows.append(f"{label} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} {run_chi2:>8s} {dropped:7d} "
+                           f"{'' if ms is None else f'{ms:7.1f}':>7s}")
+            axis_rows.append(f"{label} " + " ".join(f"{x:7.4f}" for x in axes))
+        sv_rows.append(f"{tracks:7s} {sv_stats(outs, events, args.origin_tolerance)}")
 
-    head = f"{'tracks':7s} {'mode':9s} {'variant':22s}"
-    print(f"\n{head} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} {'chi2/ndf':>8s} {'dropped':>7s} "
+    head_row = f"{'tracks':7s} {'vertexing':12s}"
+    print(f"\n{head_row} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} {'chi2/ndf':>8s} {'dropped':>7s} "
           f"{'ms/evt':>7s}   (PV truth error, cm)", *pv_rows, sep="\n")
-    print(f"\n{head} {'xy med':>7s} {'xy 68%':>7s} {'|z| med':>7s} {'|z| 68%':>7s} {'bias x':>7s} {'bias y':>7s} "
+    print(f"\n{head_row} {'xy med':>7s} {'xy 68%':>7s} {'|z| med':>7s} {'|z| 68%':>7s} {'bias x':>7s} {'bias y':>7s} "
           f"{'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (PV residual reco - true, cm; bias = median, "
           "sig = 1.4826 MAD)", *axis_rows, sep="\n")
-    print(f"\n{'tracks':7s} {'variant':22s} {'cands':>6s} {'sec. found':>11s} {'eff':>5s} {'pure':>5s} {'SVs':>5s} "
-          f"{'sec. tracks':>12s} {'all-sec':>7s} {'true SVs':>8s} {'residual':>8s}   (SVs against truth; residual cm)",
+    print(f"\n{'tracks':7s} {'cands':>6s} {'sec. found':>11s} {'eff':>5s} {'pure':>5s} {'SVs':>5s} {'sec. tracks':>12s} "
+          f"{'all-sec':>7s} {'true SVs':>8s} {'residual':>8s}   (VertexHead's SVs against truth; residual cm)",
           *sv_rows, sep="\n")
+    if notes:
+        print("", *notes, sep="\n")
     return 0
 
 
