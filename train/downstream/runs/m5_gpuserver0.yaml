@@ -1,6 +1,7 @@
 # Vertex evaluation of the m5 backbone and its track head on gpuserver0:
 #   python eval_vertex_reconstruction.py --run_config runs/m5_gpuserver0.yaml [--max_eval_events 5000 ...]
 # Keys are eval_vertex_reconstruction.py's options without --; relative paths are relative to this file.
+# ~ is the home directory of whoever runs it.
 
 # backbone: the m5 architecture block of the model YAML, and its weights
 config: d9_m5_k30_p20
@@ -17,8 +18,8 @@ seed: 42
 # what to evaluate and where to write it
 max_eval_events: 1000         # events evaluated and written to the per-point CSV
 data_root_test: null          # null: the model YAML's data_root_test
-root_dir: /home/bmartin/vertex_eval   # .log, CSV, _metrics.json, _results.npz and globallogs/ go here
+root_dir: ~/vertex_eval        # run folders <config>/<run_num>/: performance<N>.log, its CSV and _metrics.json
 
 # VertexHead: field, ACTS inputs and fit settings
-detector: /home/bmartin/sphenix_gpuserver0.yaml
+detector: ~/sphenix_gpuserver0.yaml
 vertex_device: cpu            # VertexHead on the CPU: 36 against 54 ms/event on the GPU, same results (2026-11-05)
