@@ -373,29 +373,25 @@ class _ActsWorker:
             sys.stderr.write(line.decode(errors="replace"))
         ACTS_TIMING["start_s"] += time.perf_counter() - t0
 
-    def propagate(self, position, direction, qop, backward, covariance=None):
+    def propagate(self, position, direction, qop, covariance):
         """
-        Perigee parameters (n, 6) and ok (n,) for states in mm; with covariance (n, 6, 6) also the perigee covariance.
+        States in mm (position, direction (n, 3), qop (n,), covariance (n, 6, 6)) propagated backward to the
+        perigee: parameters (n, 6), ok (n,) and covariance (n, 6, 6).
         """
         import numpy as np
         t0 = time.perf_counter()
         n = len(qop)
-        extra = b"" if covariance is None else np.ascontiguousarray(covariance, "<f8").tobytes()
-        self.process.stdin.write(struct.pack("<Q", n) + np.ascontiguousarray(position, "<f8").tobytes()
-                                 + np.ascontiguousarray(direction, "<f8").tobytes()
-                                 + np.ascontiguousarray(qop, "<f8").tobytes() + np.asarray(backward, np.uint8).tobytes()
-                                 + extra)
+        self.process.stdin.write(struct.pack("<Q", n) + b"".join(
+            np.ascontiguousarray(a, "<f8").tobytes() for a in (position, direction, qop, covariance)))
         self.process.stdin.flush()
-        size = n * 49 + (0 if covariance is None else n * 288)
-        reply = self.process.stdout.read(size)
-        if len(reply) != size:
+        reply = self.process.stdout.read(n * 337)
+        if len(reply) != n * 337:
             raise RuntimeError(f"ACTS worker stopped (code {self.process.poll()}); its error output is above")
-        params, ok = np.frombuffer(reply[: n * 48], "<f8").reshape(n, 6).copy(), np.frombuffer(reply[size - n:], np.uint8).astype(bool)
         ACTS_TIMING["propagate_s"] += time.perf_counter() - t0
         ACTS_TIMING["states"] += n
-        if covariance is None:
-            return params, ok
-        return params, ok, np.frombuffer(reply[n * 48: n * 336], "<f8").reshape(n, 6, 6).copy()
+        return (np.frombuffer(reply[: n * 48], "<f8").reshape(n, 6).copy(),
+                np.frombuffer(reply[n * 336:], np.uint8).astype(bool),
+                np.frombuffer(reply[n * 48: n * 336], "<f8").reshape(n, 6, 6).copy())
 
     def close(self):
         if self.process.poll() is None:
@@ -565,8 +561,7 @@ class VertexHead(nn.Module):
             the adaptive fit (ACTS's defaults).
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped);
             acts_image or acts_command, acts_field_map (+ _kind), acts_geometry + acts_geometry_config,
-            acts_material_map, acts_layer_envelope_mm (None: ACTS's 1 mm), acts_energy_loss, acts_max_steps
-            configure it.
+            acts_material_map, acts_energy_loss, acts_max_steps configure it.
         track_parameter_length_scale: cm per length unit of forward's track_parameters (ACTS mm: 0.1).
         find_secondary: find SVs; refit_pv: report the PV refitted with SV tracks shared.
         sv_min_track_pv_chi2, sv_min_track_beam_significance: SV candidate cuts.
@@ -596,7 +591,6 @@ class VertexHead(nn.Module):
         acts_geometry: str = None,
         acts_geometry_config: str = None,
         acts_material_map: str = None,
-        acts_layer_envelope_mm: float = None,
         acts_energy_loss: bool = True,
         hit_sigma_rphi: float = 0.034,
         hit_sigma_z: float = 0.1,
@@ -636,7 +630,6 @@ class VertexHead(nn.Module):
         self.acts_geometry = acts_geometry
         self.acts_geometry_config = acts_geometry_config
         self.acts_material_map = acts_material_map
-        self.acts_layer_envelope_mm = acts_layer_envelope_mm
         self.acts_energy_loss = acts_energy_loss
         if (acts_geometry is None) != (acts_geometry_config is None) or (acts_material_map and not acts_geometry):
             raise ValueError("acts_geometry and acts_geometry_config go together; acts_material_map needs both")
@@ -710,7 +703,6 @@ class VertexHead(nn.Module):
             "acts_geometry": resolve(acts.get("geometry")),
             "acts_geometry_config": resolve(acts.get("geometry_config")),
             "acts_material_map": resolve(acts.get("material_map")),
-            "acts_layer_envelope_mm": acts.get("layer_envelope_mm"),
             "acts_energy_loss": acts.get("energy_loss", True),
             "acts_max_steps": acts.get("max_steps"),
             **(d.get("vertex_head") or {}),
@@ -744,8 +736,7 @@ class VertexHead(nn.Module):
                 "bz_tesla": self.Bz, "field_map": self.acts_field_map, "field_map_kind": self.acts_field_map_kind,
                 "max_steps": self.acts_max_steps, "geometry": self.acts_geometry,
                 "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
-                "layer_envelope_mm": self.acts_layer_envelope_mm, "energy_loss": self.acts_energy_loss,
-                "covariance": True}
+                "energy_loss": self.acts_energy_loss}
 
     def track_fit_config(self):
         """The track-model settings."""
@@ -997,8 +988,7 @@ class VertexHead(nn.Module):
                 acts_out = _acts_worker(self.acts_worker_command(), self.acts_worker_config()).propagate(
                     (torch.cat([start_xy, start_z.unsqueeze(-1)], dim=-1) / self.track_parameter_length_scale
                      ).reshape(-1, 3).cpu().numpy(), direction.reshape(-1, 3).cpu().numpy(),
-                    (q * torch.sin(theta) / params["pT"]).reshape(-1).cpu().numpy(), [True] * q.numel(),
-                    start_covariance)
+                    (q * torch.sin(theta) / params["pT"]).reshape(-1).cpu().numpy(), start_covariance)
                 track_parameters = torch.from_numpy(acts_out[0]).reshape(*q.shape, 6).to(hits.device, total_hit_weight.dtype)
                 acts_failed = params["usable"] & ~torch.from_numpy(acts_out[1]).reshape(q.shape).to(hits.device)
                 track_covariance = torch.from_numpy(acts_out[2]).reshape(*q.shape, 6, 6).to(hits.device)

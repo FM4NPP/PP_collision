@@ -1,71 +1,55 @@
 # ACTS for VertexHead
 
-[ACTS](https://github.com/acts-project/acts) (MPL-2.0), unmodified, in a container, so it never touches
-`fm4npp-env`. It is run as a separate program, not copied, so its licence places no conditions on this
-repository's code. `VertexHead(use_acts=True)` hands each fitted track to ACTS, which propagates it from the
-innermost hit to the beam line (through the field, or through the detector's tracking geometry with its material)
-and returns ACTS bound perigee parameters and their covariance. The experimental pure-torch alternative
-(MomentumHead) and its check against ACTS live on the branch `experimental-momentum`.
+[ACTS](https://github.com/acts-project/acts) v48.2 (MPL-2.0), unmodified, in a Singularity/apptainer image, so it
+never touches `fm4npp-env`; it runs as a separate program, so its licence places no conditions on this repository.
+`VertexHead(use_acts=True)` hands each fitted track to ACTS, which propagates it from the innermost hit back to the
+beam line, through the field or the detector's tracking geometry with its material, and returns perigee
+parameters with their covariance.
 
-What ACTS adds, measured on 1000 sPHENIX events (truth PV error, median / 68% / 90%, cm), VertexHead's
-covariance-weighted adaptive fit with each track model:
+Truth PV error on 1000 sPHENIX events (median / 68% / 90%, cm), VertexHead's adaptive fit with each track model:
 
 | track model | median | 68% | 90% |
 |---|---|---|---|
 | VertexHead's own hit fit | 0.247 | 0.380 | 1.49 |
-| ACTS, through the geometry, no material map | 0.246 | 0.377 | 1.41 |
-| ACTS with the material map (multiple scattering in the errors) | 0.234 | 0.351 | 1.37 |
+| ACTS, geometry without material | 0.246 | 0.377 | 1.41 |
+| ACTS with the material map | 0.234 | 0.351 | 1.37 |
 
-(The old hit-count-weighted fit, since removed, gave 0.339 / 0.595 / 6.20.)
+## Quick start
+
+```bash
+scripts/run/vertexing.sh setup      # image (once, an hour or more) + module (a minute); site detector file
+scripts/run/vertexing.sh eval       # backbone, track finder, VertexHead -> per-point CSV
+scripts/run/vertexing.sh compare    # VertexHead variants against truth on that CSV
+```
+
+The run is `scripts/configs/vertex_m5_gpuserver0.yaml` (`RUN_CONFIG=<file>` for another). Its `detector:` file,
+`scripts/configs/sphenix_<site>.yaml` (gitignored), is written by `setup` from `detectors/sphenix/sphenix.yaml`;
+fill in its ACTS inputs (see sPHENIX inputs). Options after the command go to the Python script, e.g.
+`eval --max_eval_events 5000` or `compare --loose_sv`. Rerun `setup` after changing the C++.
 
 ## Pieces
 
 | file | what |
 |---|---|
-| `build_images.sh`, `acts-base.def` | the container (ROOT, HepMC3, ACTS; slow, once) and the module below, compiled inside it (about a minute) |
-| `perigee_propagator/` | one C++ file: ACTS propagation to the perigee with direction, covariance and material, which ACTS's Python bindings lack |
-| `acts_worker.py` | runs in the container; VertexHead starts it once and streams tracks to it |
-| `detectors/<name>/` | everything detector-specific: the detector file `<name>.yaml` and the tools that make its inputs |
-| `check_geometry.py` | checks a detector's geometry and material map in ACTS |
-| `compare_vertexing.py` | VertexHead variants for one detector against the true vertex |
+| `build_images.sh`, `acts-base.def` | the image (ROOT, HepMC3, ACTS) and the module compiled inside it into `perigee_propagator/build/install` |
+| `perigee_propagator/` | one C++ file: backward propagation to the perigee with covariance and material (not in ACTS's Python bindings) |
+| `acts_worker.py` | runs in the image; VertexHead starts it once and streams track states to it |
+| `detectors/<name>/` | the detector file template `<name>.yaml` and the tools that make its inputs |
+| `check_geometry.py` | a detector's geometry and material map in ACTS (`--layers`: each layer's extent) |
+| `compare_vertexing.py` | VertexHead variants against truth: PV, PV per axis, SVs |
 
-## Build (once)
-
-Singularity (or apptainer) with `--fakeroot`. From anywhere:
-
-```bash
-JOBS=8 scripts/acts/build_images.sh
-```
-
-The image (ROOT and ACTS compile: an hour or more) is built only if missing (`--rebuild-base` to force); the module
-is then compiled inside it into `perigee_propagator/build/install` (about a minute; rerun after changing the C++).
-Each ends with an import check (`acts OK`, `perigee propagator OK`). The detector file's `acts.image` is
-`scripts/acts/acts-base-48.2.0.sif`.
-
-## Use
-
-```python
-head = VertexHead.from_detector("scripts/acts/detectors/sphenix/sphenix.yaml")
-```
-
-or `eval_vertex_reconstruction.py --detector scripts/acts/detectors/sphenix/sphenix.yaml` (YAML key
-`vertex_detector`). Keyword arguments override the file. ACTS is used when the file's `acts.image` is set;
-VertexHead binds the directories of the ACTS input files into the container itself, and the worker names any
-input file it cannot see. Tracks ACTS fails on (mostly very soft curlers that never reach the beam line) are dropped
-and flagged in the output `acts_failed`; the worker prints a summary of failures when it exits.
+Tracks ACTS fails on (soft curlers the hit fit already rejects) are dropped and flagged in `acts_failed`; the
+worker prints a failure summary when it exits.
 
 ## Adding a detector
 
 1. **Detector file.** Copy `detectors/sphenix/` to `detectors/<name>/` and fill in `<name>.yaml`: field (uniform
-   Bz, or an ACTS text field map), beam position, the dataset's hit normalization, per-hit errors, the ACTS inputs
-   below and any VertexHead settings.
-2. **Geometry (optional, for material).** ACTS builds the tracking geometry from a TGeo ROOT file and an ACTS TGeo
-   JSON configuration (TGeoDetector), the way the experiment's own ACTS tracking does. Export the TGeo file from
-   the experiment's geometry (sPHENIX: `export_sphenix_geometry.C`, which also adds the TPC measurement boxes
-   sPHENIX's tracking inserts) and take the configuration and the ACTS JSON material map from the experiment.
-3. **Field map (optional).** Convert to ACTS's text format (mm, T; a full regular grid covering beam line to
-   tracker): sPHENIX `convert_field_map.py`.
-4. **Check** the geometry and material map in ACTS:
+   Bz or an ACTS text field map), beam position, the dataset's hit normalization, per-hit errors, ACTS inputs and
+   any VertexHead settings. Relative paths are relative to the file.
+2. **Geometry (optional, for material).** A TGeo ROOT file and the experiment's ACTS TGeo JSON configuration and
+   material map, as its own ACTS tracking uses them.
+3. **Field map (optional).** ACTS text format (mm, T; a regular grid from the beam line to the tracker).
+4. **Check** in ACTS:
 
    ```bash
    singularity exec scripts/acts/acts-base-48.2.0.sif acts-python scripts/acts/check_geometry.py \
@@ -73,24 +57,21 @@ and flagged in the output `acts_failed`; the worker prints a summary of failures
    ```
 
    Every sensitive volume should have its module count and every material-map entry should land.
-5. **Compare** the variants on real events (`eval_vertex_reconstruction.py --save_csv` output) and set the best in
-   the file's `vertex_head` block; a PV chi2/ndf far from 1 means `track_error_scale` needs adjusting:
-
-   ```bash
-   python scripts/acts/compare_vertexing.py --csv vertex_per_point_data.csv --detector scripts/acts/detectors/<name>/<name>.yaml
-   ```
+5. **Compare** on real events and set the best variant in the file's `vertex_head` block; a PV chi2/ndf far from
+   1 means `track_error_scale` needs adjusting.
 
 ## sPHENIX inputs
 
-- Geometry: CDB key `Tracking_Geometry` (a PHOOL file), exported once on a machine with the sPHENIX software:
+- **Geometry:** CDB key `Tracking_Geometry` (a PHOOL file), exported once on a machine with the sPHENIX software:
   `root -l -b -q 'scripts/acts/detectors/sphenix/export_sphenix_geometry.C("<file>.root", "sphenix_ana559")'`
-  writes `sphenix_ana559_tgeo.root` (plus the TPC layer table and volume tree, for checking).
-- TGeo configuration: CDB key `ACTSGEOMETRYCONFIG`; material map: CDB key `ACTSMATERIALMAP` (made for ACTS v45; it
-  lands completely on the ACTS v48 geometry). TGeoDetector's "Layers are overlapping" errors for the TPC come
-  from the configuration's 5 mm layer tolerance and are harmless.
-- Field map: the CDB field map (ROOT ntuple `fieldmap`, cm and T):
-  `python scripts/acts/detectors/sphenix/convert_field_map.py <map>.root field_xyz.txt` (`--uniform 1.4` writes a
-  test map that must reproduce the constant field).
+  writes `sphenix_ana559_tgeo.root` with the TPC measurement boxes sPHENIX's tracking adds.
+- **TGeo configuration:** CDB key `ACTSGEOMETRYCONFIG`; **material map:** CDB key `ACTSMATERIALMAP` (made for ACTS
+  v45, whose layer building is the same as v48.2's; all 56 entries land).
+- **Field map:** the CDB field map (ROOT ntuple `fieldmap`, cm and T):
+  `python scripts/acts/detectors/sphenix/convert_field_map.py <map>.root field_xyz.txt`.
 
-The container has Python 3.12 and NumPy only (no torch): data goes between the environments through files, or
-through the worker's pipe.
+ACTS builds sPHENIX's MVTX as one layer, merges INTT sub-layers and lets TPC layers overlap ("Layers are
+overlapping"): that is the configuration's layering, the same in sPHENIX's own tracking, which assigns its layers
+by radius and logs ACTS at FATAL only. The worker does the same; `check_geometry.py` shows the full log.
+
+The image has Python 3.12 and NumPy only (no torch): data goes between the environments through the worker's pipe.

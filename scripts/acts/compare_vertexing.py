@@ -7,9 +7,9 @@ eval_vertex_reconstruction.py, PV only and with SVs:
         [--tracks finder|truth|both] [--loose_sv] [--max_events 500]
 
 Variants (one change each): own track fit, detector settings, no material map, energy loss flipped,
-other error scales, loose SV cuts. Tracks: the track finder's or truth tracks (seg_target).
-Tables: PV residual |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); SVs against
-truth IDs (secondary = truth ID < 0) and, with truth origins in the CSV (vtx_*), true SVs and SV residuals.
+other error scales, loose SV cuts. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
+Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); SVs against truth
+(secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*).
 """
 import argparse
 import csv
@@ -30,46 +30,41 @@ LOOSE_SV = dict(sv_min_track_pv_chi2=1.0, sv_max_track_chi2=50.0, sv_min_displac
 
 def load_events(path, max_events, tracks="finder"):
     """
-    Per event: (class_probs, mask_probs, points, padding_mask) as VertexHead takes them, the true vertex, and per
-    track slot whether it is a Geant secondary and its particle's truth production vertex (NaN without one).
-    tracks: "finder" (pred_assignment) or "truth" (seg_target).
+    Per event: (class_probs, mask_probs, points, padding_mask) as VertexHead takes them, the true vertex and, per
+    track slot, whether it is a Geant secondary and its particle's truth production vertex.
     """
     with open(path, newline="") as f:
         rows = list(csv.reader(f))
-    header, rows = rows[0], rows[1:]
-    ix = {h: i for i, h in enumerate(header)}
-    has_origin = "reco_vtx_x" in ix          # vtx_* are truth origins only in the newer CSV format
-    column = "pred_assignment" if tracks == "finder" else "seg_target"
-    by_event = {}
-    for row in rows:
-        by_event.setdefault(int(row[ix["batch_idx"]]), []).append(row)
+    col = dict(zip(rows[0], map(np.array, zip(*rows[1:]))))
+    num = lambda name, empty="nan": np.array([float(v or empty) for v in col[name]])  # noqa: E731
+    event = num("batch_idx").astype(int)
+    label = num("pred_assignment" if tracks == "finder" else "seg_target", "-999999").astype(int)
+    truth_id = num("seg_target", "0").astype(int)
+    points = np.stack([num(k) for k in ("E_norm", "eta_norm", "phi_norm", "r_norm")], axis=1)
+    true_vertex = np.stack([num(f"test_truth_vtx_{a}") for a in "xyz"], axis=1)
+    origin_all = np.stack([num(f"vtx_{a}") for a in "xyz"], axis=1)
     events = []
-    for e in sorted(by_event)[:max_events]:
-        R = by_event[e]
-        truth = np.array([float(R[0][ix[f"test_truth_vtx_{a}"]] or "nan") for a in "xyz"]) \
-            if "test_truth_vtx_x" in ix else np.full(3, np.nan)
-        label = np.array([int(float(r[ix[column]])) if r[ix[column]] != "" else -999999 for r in R])
-        keep = (label != -999999) & ((label != -1) if tracks == "finder" else True)
+    for e in np.unique(event)[:max_events]:
+        hits = np.flatnonzero(event == e)
+        keep = (label[hits] != -999999) & ((label[hits] != -1) if tracks == "finder" else True)
         if not keep.any():
             continue
-        _, slot = np.unique(label[keep], return_inverse=True)
+        _, slot = np.unique(label[hits][keep], return_inverse=True)
         n_slots = slot.max() + 1
-        mask = torch.zeros(1, len(R), n_slots)
+        mask = torch.zeros(1, len(hits), n_slots)
         mask[0, torch.tensor(np.flatnonzero(keep)), torch.tensor(slot)] = 0.9
         class_probs = torch.zeros(1, n_slots, 2)
         class_probs[..., 1] = 0.8
-        points = torch.tensor([[float(r[ix[k]]) for k in ("E_norm", "eta_norm", "phi_norm", "r_norm")] for r in R])[None]
-        # truth per track slot: secondary (majority truth ID < 0) and that particle's production vertex
-        truth_id = np.array([int(float(r[ix["seg_target"]])) if r[ix["seg_target"]] != "" else 0 for r in R])[keep]
-        kept = [r for r, k in zip(R, keep) if k]
+        # per track slot: secondary (majority truth ID < 0) and that particle's production vertex (first such hit)
+        ids_kept, origin_kept = truth_id[hits][keep], origin_all[hits][keep]
         secondary, origin = np.zeros(n_slots, dtype=bool), np.full((n_slots, 3), np.nan)
         for t in range(n_slots):
-            ids, counts = np.unique(truth_id[slot == t], return_counts=True)
+            ids, counts = np.unique(ids_kept[slot == t], return_counts=True)
             secondary[t] = ids[counts.argmax()] < 0
-            if has_origin:
-                row = kept[int(np.flatnonzero((slot == t) & (truth_id == ids[counts.argmax()]))[0])]
-                origin[t] = [float(row[ix[f"vtx_{a}"]] or "nan") for a in "xyz"]
-        events.append(((class_probs, mask, points, torch.ones(1, len(R), dtype=torch.bool)), truth, secondary, origin))
+            origin[t] = origin_kept[np.flatnonzero((slot == t) & (ids_kept == ids[counts.argmax()]))[0]]
+        inputs = (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
+                  torch.ones(1, len(hits), dtype=torch.bool))
+        events.append((inputs, true_vertex[hits[0]], secondary, origin))
     return events
 
 
@@ -89,7 +84,24 @@ def variants(detector, error_scales, loose_sv):
         yield "loose SV cuts", dict(LOOSE_SV)
 
 
-def sv_truth(outs, events, origin_tolerance):
+def pv_stats(outs, events, times):
+    """The PV table's and the per-axis table's numbers for one run."""
+    residual = np.array([o["vertex_estimate"][0].double().numpy() - e[1] for o, e in zip(outs, events)])
+    residual = residual[np.isfinite(residual).all(axis=1)]          # (events, 3): reconstructed - true, cm
+    if not len(residual):
+        return (0, *[np.nan] * 5, 0, np.nan), [np.nan] * 10
+    err, transverse, bias = np.linalg.norm(residual, axis=1), np.linalg.norm(residual[:, :2], axis=1), np.median(residual, axis=0)
+    # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
+    ndf = [2 * float((o["track_weight"] > 0).double().mul(o["track_vertex_weight"].double()).sum()) - 3 for o in outs]
+    chi2 = [o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()]
+    pv = (len(err), *(np.percentile(err, q) for q in (50, 68, 90)), (err < 1.0).mean(), np.median(chi2) if chi2 else np.nan,
+          sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)
+    axes = (np.median(transverse), np.percentile(transverse, 68), np.median(np.abs(residual[:, 2])),
+            np.percentile(np.abs(residual[:, 2]), 68), *bias, *(1.4826 * np.median(np.abs(residual - bias), axis=0)))
+    return pv, axes
+
+
+def sv_stats(outs, events, origin_tolerance):
     """The SV table's numbers for one run with SV finding."""
     n_sec = n_cand = n_cand_sec = n_sv = sv_tracks = sv_tracks_sec = sv_all_sec = sv_true = 0
     residual = []
@@ -99,16 +111,14 @@ def sv_truth(outs, events, origin_tolerance):
         for k in np.flatnonzero(o["sv_is_valid"][0].numpy()):
             m = o["sv_track_mask"][0, k].numpy()
             n_sv += 1; sv_tracks += int(m.sum()); sv_tracks_sec += int((m & sec).sum()); sv_all_sec += int(sec[m].all())
-            o_k = origin[m]
-            if np.isfinite(o_k).all():
-                true_sv = np.median(o_k, axis=0)
+            if np.isfinite(origin[m]).all():
+                true_sv = np.median(origin[m], axis=0)
                 residual.append(np.linalg.norm(o["sv_estimate"][0, k].double().numpy() - true_sv))
-                shared = np.linalg.norm(o_k - true_sv, axis=1).max() <= origin_tolerance
+                shared = np.linalg.norm(origin[m] - true_sv, axis=1).max() <= origin_tolerance
                 sv_true += int(shared and np.linalg.norm(true_sv - truth) > origin_tolerance)
-    return {"candidates": n_cand, "secondaries found": f"{n_cand_sec}/{n_sec}",
-            "eff": n_cand_sec / max(n_sec, 1), "purity": n_cand_sec / max(n_cand, 1), "SVs": n_sv,
-            "secondary tracks": f"{sv_tracks_sec}/{sv_tracks}", "all-secondary": sv_all_sec,
-            "true SVs": sv_true if residual else None, "residual": np.median(residual) if residual else None}
+    return (f"{n_cand:6d} {f'{n_cand_sec}/{n_sec}':>11s} {n_cand_sec / max(n_sec, 1):5.0%} {n_cand_sec / max(n_cand, 1):5.0%} "
+            f"{n_sv:5d} {f'{sv_tracks_sec}/{sv_tracks}':>12s} {sv_all_sec:7d} "
+            f"{str(sv_true) if residual else '':>8s} {f'{np.median(residual):.3f}' if residual else '':>8s}")
 
 
 def main():
@@ -122,62 +132,42 @@ def main():
     parser.add_argument("--max_events", type=int, default=500)
     args = parser.parse_args()
 
-    pv_rows, res_rows, sv_rows = [], [], []
+    pv_rows, axis_rows, sv_rows = [], [], []
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
         events = load_events(args.csv, args.max_events, tracks)
         n_truth = sum(bool(np.isfinite(e[1]).all()) for e in events)
         print(f"{tracks} tracks: {len(events)} events ({n_truth} with a true vertex) from {args.csv}; detector "
               f"{args.detector}", flush=True)
-        for mode, mode_kw in (("PV only", {"find_secondary": False}), ("with SVs", {"find_secondary": True})):
+        for mode, find_secondary in (("PV only", False), ("with SVs", True)):
             for name, kw in variants(args.detector, args.error_scales, args.loose_sv):
-                if name == "loose SV cuts" and mode == "PV only":
+                if name == "loose SV cuts" and not find_secondary:
                     continue
-                head = vh.VertexHead.from_detector(args.detector, **mode_kw, **kw).eval()
+                head = vh.VertexHead.from_detector(args.detector, find_secondary=find_secondary, **kw).eval()
                 outs, times = [], []
                 with torch.no_grad():
                     for inputs, *_ in events:
                         t0 = time.perf_counter()
                         outs.append(head(*inputs))
                         times.append(time.perf_counter() - t0)
-                residual = np.array([o["vertex_estimate"][0].double().numpy() - e[1] for o, e in zip(outs, events)])
-                residual = residual[np.isfinite(residual).all(axis=1)]          # (events, 3): reconstructed - true, cm
-                err = np.linalg.norm(residual, axis=1)
-                transverse = np.linalg.norm(residual[:, :2], axis=1)
-                res_rows.append((tracks, mode, name, np.median(transverse), np.percentile(transverse, 68),
-                                 np.median(np.abs(residual[:, 2])), np.percentile(np.abs(residual[:, 2]), 68),
-                                 *np.median(residual, axis=0), *(1.4826 * np.median(np.abs(residual - np.median(residual, axis=0)), axis=0)))
-                       if len(residual) else (tracks, mode, name, *[np.nan] * 10))
-                # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
-                ndf = [2 * float((o["track_weight"] > 0).double().mul(o["track_vertex_weight"].double()).sum()) - 3
-                       for o in outs]
-                chi2 = np.array([o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()])
-                pv_rows.append((tracks, mode, name, len(err),
-                                *(np.percentile(err, q) if len(err) else np.nan for q in (50, 68, 90)),
-                                (err < 1.0).mean() if len(err) else np.nan, np.median(chi2) if len(chi2) else np.nan,
-                                sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o),
-                                np.mean(times[1:] if len(times) > 1 else times) * 1e3))
-                if mode == "with SVs":
-                    sv_rows.append((tracks, name, sv_truth(outs, events, args.origin_tolerance)))
+                label = f"{tracks:7s} {mode:9s} {name:22s}"
+                pv, axes = pv_stats(outs, events, times)
+                n, m, p68, p90, within, chi2, dropped, ms = pv
+                pv_rows.append(f"{label} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} "
+                               f"{'' if np.isnan(chi2) else f'{chi2:8.2f}':>8s} {dropped:7d} {ms:7.1f}")
+                axis_rows.append(f"{label} " + " ".join(f"{x:7.4f}" for x in axes))
+                if find_secondary:
+                    sv_rows.append(f"{tracks:7s} {name:22s} {sv_stats(outs, events, args.origin_tolerance)}")
                 print(f"  done: {tracks} tracks / {mode} / {name}", flush=True)
 
-    print(f"\n{'tracks':7s} {'mode':9s} {'variant':22s} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} "
-          f"{'chi2/ndf':>8s} {'dropped':>7s} {'ms/evt':>7s}   (PV truth error, cm)")
-    for tracks, mode, name, n, m, p68, p90, within, chi2, dropped, ms in pv_rows:
-        print(f"{tracks:7s} {mode:9s} {name:22s} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} "
-              f"{'' if np.isnan(chi2) else f'{chi2:8.2f}':>8s} {dropped:7d} {ms:7.1f}")
-    print(f"\n{'tracks':7s} {'mode':9s} {'variant':22s} {'xy med':>7s} {'xy 68%':>7s} {'|z| med':>7s} {'|z| 68%':>7s} "
-          f"{'bias x':>7s} {'bias y':>7s} {'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}"
-          f"   (PV residual reco - true, cm; bias = median, sig = 1.4826 MAD)")
-    for tracks, mode, name, *v in res_rows:
-        print(f"{tracks:7s} {mode:9s} {name:22s} " + " ".join(f"{x:7.4f}" for x in v))
+    head = f"{'tracks':7s} {'mode':9s} {'variant':22s}"
+    print(f"\n{head} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} {'chi2/ndf':>8s} {'dropped':>7s} "
+          f"{'ms/evt':>7s}   (PV truth error, cm)", *pv_rows, sep="\n")
+    print(f"\n{head} {'xy med':>7s} {'xy 68%':>7s} {'|z| med':>7s} {'|z| 68%':>7s} {'bias x':>7s} {'bias y':>7s} "
+          f"{'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (PV residual reco - true, cm; bias = median, "
+          "sig = 1.4826 MAD)", *axis_rows, sep="\n")
     print(f"\n{'tracks':7s} {'variant':22s} {'cands':>6s} {'sec. found':>11s} {'eff':>5s} {'pure':>5s} {'SVs':>5s} "
-          f"{'sec. tracks':>12s} {'all-sec':>7s} {'true SVs':>8s} {'residual':>8s}   (SVs against truth; residual cm)")
-    for tracks, name, s in sv_rows:
-        true_svs = "" if s["true SVs"] is None else str(s["true SVs"])
-        residual = "" if s["residual"] is None else f"{s['residual']:.3f}"
-        print(f"{tracks:7s} {name:22s} {s['candidates']:6d} {s['secondaries found']:>11s} {s['eff']:5.0%} "
-              f"{s['purity']:5.0%} {s['SVs']:5d} {s['secondary tracks']:>12s} {s['all-secondary']:7d} {true_svs:>8s} "
-              f"{residual:>8s}")
+          f"{'sec. tracks':>12s} {'all-sec':>7s} {'true SVs':>8s} {'residual':>8s}   (SVs against truth; residual cm)",
+          *sv_rows, sep="\n")
     return 0
 
 

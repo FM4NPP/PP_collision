@@ -22,5 +22,5 @@ data_root_test: null          # null: the model YAML's data_root_test
 root_dir: ~/vertex_eval        # run folders <config>/<run_num>/: performance<N>.log, its CSV and _metrics.json
 
 # VertexHead: field, ACTS inputs and fit settings
-detector: ~/sphenix_gpuserver0.yaml
+detector: sphenix_gpuserver0.yaml   # site detector file (scripts/run/vertexing.sh setup makes it)
 vertex_device: cpu            # VertexHead on the CPU: 36 against 54 ms/event on the GPU, same results (2026-11-05)

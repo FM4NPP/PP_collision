@@ -3,12 +3,13 @@
 check_geometry.py: check a detector's ACTS geometry and material map, inside the ACTS image:
 
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/check_geometry.py \
-        --geometry <tgeo.root> --geometry_config <config.json> [--material_map <material.json>]         [--layer_envelope_mm 0.1]
+        --geometry <tgeo.root> --geometry_config <config.json> [--material_map <material.json>] [--layers]
 
 Prints surfaces per ACTS volume, how many carry material, material-map entries that found no surface and, with
 --layers, each sensitive layer's radial extent as ACTS computes it (ProtoLayer) and its overlap with the next layer;
 ACTS logs overlapping layers ("Layers are overlapping") while building.
-sPHENIX (ana559): 432 MVTX, 224 INTT, 13824 TPC, 16 micromegas sensitive surfaces; all 56 map entries land.
+sPHENIX (ana559): 432 MVTX, 224 INTT, 13824 TPC, 16 micromegas sensitive surfaces; all 56 map entries land. Its
+layers overlap by design (sPHENIX assigns its layers by radius instead).
 """
 import argparse
 import collections
@@ -19,6 +20,8 @@ import time
 
 import numpy as np
 
+import acts
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from acts_worker import build_tracking_geometry  # noqa: E402
 
@@ -26,15 +29,13 @@ from acts_worker import build_tracking_geometry  # noqa: E402
 def geometry_id(surface):
     """(volume, layer, approach, sensitive) of a surface's geometry identifier."""
     gid = surface.geometryId
-    gid = gid() if callable(gid) else gid
-    return tuple((lambda v: v() if callable(v) else v)(getattr(gid, k)) for k in ("volume", "layer", "approach", "sensitive"))
+    return gid.volume, gid.layer, gid.approach, gid.sensitive
 
 
 def layer_table(surfaces):
     """Per sensitive layer (volume, layer): surface count, radius of the surface centres, the layer's r and z extent
     from ACTS's ProtoLayer (no envelope), the sensors' thickness and the radial overlap with the next layer (mm)."""
-    import acts
-    gctx = acts.GeometryContext.dangerouslyDefaultConstruct() if hasattr(acts.GeometryContext, "dangerouslyDefaultConstruct")         else acts.GeometryContext()
+    gctx = acts.GeometryContext.dangerouslyDefaultConstruct()
     axis_r, axis_z = acts.AxisDirection.AxisR, acts.AxisDirection.AxisZ
     layers = collections.defaultdict(list)
     for surface in surfaces:
@@ -60,21 +61,15 @@ def main():
     parser.add_argument("--geometry", required=True, help="TGeo ROOT file")
     parser.add_argument("--geometry_config", required=True, help="ACTS TGeo JSON configuration")
     parser.add_argument("--material_map", default=None, help="ACTS JSON material map; none = geometry only")
-    parser.add_argument("--layer_envelope_mm", type=float, default=None,
-                        help="radial envelope added to each layer, mm (default: ACTS's 1 mm)")
     parser.add_argument("--layers", action="store_true", help="print each sensitive layer's extent and overlap")
     args = parser.parse_args()
 
     t0 = time.perf_counter()
-    _, geometry = build_tracking_geometry(args.geometry, args.geometry_config, args.material_map,
-                                          layer_envelope_mm=args.layer_envelope_mm)
+    _, geometry = build_tracking_geometry(args.geometry, args.geometry_config, args.material_map)
     print(f"geometry built in {time.perf_counter() - t0:.1f} s from {args.geometry}")
 
     surfaces = []
-    try:
-        geometry.visitSurfaces(lambda s: surfaces.append(s), False)
-    except TypeError:
-        geometry.visitSurfaces(lambda s: surfaces.append(s))
+    geometry.visitSurfaces(surfaces.append, False)
     by_volume, with_material, ids_with_material = collections.Counter(), collections.Counter(), set()
     for surface in surfaces:
         vol, lay, app, sen = geometry_id(surface)
@@ -94,12 +89,12 @@ def main():
     if args.material_map:
         with open(args.material_map) as f:
             entries = json.load(f)["Surfaces"]["entries"]
-        unmatched = [e for e in entries if (e.get("volume", 0), e.get("layer", 0), e.get("approach", 0),
-                                            e.get("sensitive", 0)) not in ids_with_material]
+        keys = ("volume", "layer", "approach", "sensitive")
+        unmatched = [e for e in entries if tuple(e.get(k, 0) for k in keys) not in ids_with_material]
         print(f"material map: {len(entries)} surface entries, {len(entries) - len(unmatched)} landed on a surface, "
               f"{len(unmatched)} found none")
         for e in unmatched[:20]:
-            print("  no surface for", {k: e.get(k) for k in ("volume", "layer", "approach", "sensitive")})
+            print("  no surface for", {k: e.get(k) for k in keys})
     return 0
 
 

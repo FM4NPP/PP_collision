@@ -74,3 +74,6 @@ slurm-*.out
 # statistics that every downstream run loads unconditionally, which is why they were
 # never published. They are a few KB each and belong in the repository.
 !stats/*.pkl
+
+# site detector files (scripts/run/vertexing.sh setup)
+scripts/configs/sphenix_*.yaml
