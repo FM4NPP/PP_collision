@@ -73,10 +73,10 @@ CSV_COLUMNS = PER_POINT_COLUMNS + RECO_COLUMNS + TEST_COLUMNS
 
 def write_metrics_log(metrics, logfile):
     """
-    Write metrics to logfile as track_finding_trainer.inference() does: a tab-separated header line,
+    Append metrics to logfile as track_finding_trainer.inference() writes them: a tab-separated header line,
     then the values.
     """
-    with open(logfile, "w") as f:
+    with open(logfile, "a") as f:
         f.write("\t".join(metrics) + "\n")
         f.write("\t".join(str(v) for v in metrics.values()) + "\n")
 
@@ -156,7 +156,6 @@ class DownstreamTrainer():
         
         ''' init vars for distributed training (ddp) and logging'''
         self.root_dir = args.root_dir
-        self.global_log_dir = os.path.join(args.root_dir, args.global_log_dir)
         self.config = args.config 
         self.run_num = args.run_num
         self.world_size = 1
@@ -197,81 +196,29 @@ class DownstreamTrainer():
 
         
     def init_exp_dir(self, exp_dir):
-        if getattr(self.params, "no_output", False):
-            # a test run (eval --no_output): no directories or log files; logs go to the null device
-            self.params['experiment_dir'] = os.path.abspath(exp_dir)
-            self.params['checkpoint_path'] = os.path.join(exp_dir, 'checkpoints/ckpt.tar')
-            self.params['resuming'] = False
-            self.logfile = self.globalfile = os.devnull
-            return
-
-        if self.world_rank==0:
-            if not os.path.isdir(exp_dir):
-                os.makedirs(exp_dir)
-                os.makedirs(os.path.join(exp_dir, 'checkpoints/'))
-                
+        """
+        Run folder exp_dir with a new performance<N>.log (parameters, then metrics); no files with no_output.
+        """
         self.params['experiment_dir'] = os.path.abspath(exp_dir)
-        self.params['checkpoint_path'] = os.path.join(exp_dir, 'checkpoints/ckpt.tar')
-
-        if self.params.continue_from_best:
-            self.params['checkpoint_path'] = os.path.join(exp_dir, 'checkpoints/ckpt_best.tar')
-
-        self.params['resuming'] = True if os.path.isfile(self.params.checkpoint_path) else False
+        if getattr(self.params, "no_output", False):
+            self.logfile = os.devnull
+            return
         idx = 0
-        logfile = os.path.join(exp_dir, 'performance{}.log'.format(idx))
-        
-        if self.world_rank==0:    
-            while os.path.exists(logfile):
+        if self.world_rank == 0:
+            os.makedirs(exp_dir, exist_ok=True)
+            while os.path.exists(os.path.join(exp_dir, f'performance{idx}.log')):
                 idx += 1
-                logfile = os.path.join(exp_dir, 'performance{}.log'.format(idx))
-                
-        if dist.is_initialized():
-            dist.barrier()
-        
-        self.logfile = logfile
-
-        if self.world_rank==0:            
+        self.logfile = os.path.join(exp_dir, f'performance{idx}.log')
+        if self.world_rank == 0:
             with open(self.logfile, 'w') as f:
                 f.write('Initialized at: {}\n'.format(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))))
-    
-            # Preparing global log directory
-            if not os.path.isdir(self.global_log_dir):
-                os.makedirs(self.global_log_dir)   
-                
-            self.globalfile = os.path.join(self.global_log_dir, 
-                                           'config_{}_run_{}_{}.csv'.format(
-                                               self.config,
-                                               self.run_num, 
-                                               self.parse_exp_details(self.params.params, 
-                                                                      partial = ['data_version', 
-                                                                                 'limit_size',
-                                                                                 'model_version'],
-                                                                      globalfile=True)
-                                           ))
-            print(self.globalfile)
-
         if dist.is_initialized():
             dist.barrier()
-        
-        if self.world_rank == 0 and not os.path.exists(self.globalfile):
-            with open(self.globalfile, 'w') as f:
-                pass
-        if dist.is_initialized():
-            dist.barrier()  
-        
+
     def log_infile(self, log):
         with open(self.logfile, "a") as f:
             f.write("{}\n".format(log))
 
-    def log_globalfile(self, split, step, loss, lr):
-        with open(self.globalfile, "a") as f:
-            f.write("{},{},{},{}\n".format(split, step, loss, lr))
-
-    def finish_training(self):
-        with open(self.finisher, 'w') as f:
-            f.write(' ')
-        raise FinishedTrainingError
-    
     def parse_exp_details(self, D, partial=None, globalfile = False):
         """
         D: a dictionary listing parameters
@@ -728,23 +675,22 @@ class DownstreamTrainer():
         sizes = [r["mask"].shape[0] for r in records]
         return list(zip(result["vertex_estimate"].split(sizes), result["fit_is_valid"].split(sizes)))
 
-    def inference(self, checkpoint_path, pretrain=True, logfile=None, save_csv=False, csv_output_path=None):
+    def inference(self, checkpoint_path, pretrain=True, save_csv=False, csv_output_path=None):
         """
-        setup_vertexing, then run_vertexing over at most max_eval_events; writes the metrics log and the CSV.
+        setup_vertexing, then run_vertexing over at most max_eval_events; appends the metrics to the run log and
+        writes the CSV (default: next to the run log).
 
         Args:
             checkpoint_path: track-head checkpoint; pretrain: backbone features (True) or raw points.
-            logfile: metrics log (None: not written); save_csv, csv_output_path: the per-point CSV.
+            save_csv, csv_output_path: the per-point CSV.
         """
         self.setup_vertexing(checkpoint_path)
         result = self.run_vertexing(pretrain=pretrain, max_events=getattr(self, "max_eval_events", 20000),
                                     save_csv=save_csv)
         if self.world_rank == 0:
-            if logfile is not None:
-                write_metrics_log(result["metrics"], logfile)
+            write_metrics_log(result["metrics"], self.logfile)
             if save_csv:
-                result["csv_output_path"] = csv_output_path or (
-                    logfile.replace(".log", "_per_point_data.csv") if logfile else "vertex_per_point_data.csv")
+                result["csv_output_path"] = csv_output_path or self.logfile.replace(".log", "_per_point_data.csv")
                 write_per_point_csv(result["per_point"], result["csv_output_path"])
                 print(f"[vertex] wrote {result['csv_output_path']} ({len(result['per_point']['batch_idx'])} points)")
         return result

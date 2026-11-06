@@ -17,7 +17,7 @@ seed: 42
 # what to evaluate and where to write it
 max_eval_events: 1000         # events evaluated and written to the per-point CSV
 data_root_test: null          # null: the model YAML's data_root_test
-root_dir: /home/bmartin
+root_dir: /home/bmartin/vertex_eval   # .log, CSV, _metrics.json, _results.npz and globallogs/ go here
 
 # VertexHead: field, ACTS inputs and fit settings
 detector: /home/bmartin/sphenix_gpuserver0.yaml

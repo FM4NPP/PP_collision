@@ -7,7 +7,8 @@ Evaluate VertexHead after a trained track-finding head. Run from train/downstrea
 
 Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
 --checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events.
-Outputs in --root_dir: .log, _per_point_data.csv, _metrics.json, _results.npz; --no_output writes nothing.
+Outputs in <root_dir>/<config>/<run_num>/: performance<N>.log (parameters, metrics) and its
+_per_point_data.csv and _metrics.json (inputs, fit settings, metrics); --no_output writes nothing.
 """
 import os
 import sys
@@ -15,7 +16,6 @@ import argparse
 import gc
 import json
 
-import numpy as np
 import torch
 
 # make sure the FM4NPP modules can be imported
@@ -107,7 +107,7 @@ def main():
         "--csv_output_path",
         type=str,
         default=None,
-        help="Path for the per-point CSV (default: derived from the log file name)",
+        help="Path for the per-point CSV (default: next to the run log)",
     )
     parser.add_argument(
         "--data_root_test",
@@ -146,7 +146,6 @@ def main():
         help="disable pretrained model (track head trained with --no-pretrain)",
     )
     parser.set_defaults(usepretrain=True)
-    parser.add_argument("--global_log_dir", default='globallogs', type=str, help="Global dir to store logging only")
     parser.add_argument(
         "--max_eval_events",
         type=int,
@@ -177,8 +176,8 @@ def main():
     parser.add_argument(
         "--no_output",
         action="store_true",
-        help="Test run: write no files (no CSV, .log, _results.npz, _metrics.json, experiment or global log "
-             "directories); the metrics and timing are only printed. --root_dir is then not needed",
+        help="Test run: write no files or run folder; the metrics and timing are only printed. "
+             "--root_dir is then not needed",
     )
     parser.add_argument(
         "--vertex_chunk_events",
@@ -212,7 +211,7 @@ def main():
             sys.exit(f"{run_config}: unknown option(s) {unknown}; valid: {sorted(known - {'help', 'run_config'})}")
         base = os.path.dirname(os.path.abspath(run_config))
         path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir",
-                     "csv_output_path", "data_root_test", "root_dir", "detector", "global_log_dir"}
+                     "csv_output_path", "data_root_test", "root_dir", "detector"}
         # each value converted as the command line would be (e.g. run_num: 2 -> "2")
         types = {a.dest: a.type for a in parser._actions if a.type is not None}
         run = {k: types[k](v) if k in types and v is not None else v for k, v in run.items()}
@@ -240,8 +239,6 @@ def main():
     pretrain_suffix = "" if args.usepretrain else "_nopretrain"
     checkpoint_name = (f"{args.track_config}_nerf_tracking_head_d{params.limit_size}_{args.run_num}"
                        f"{seed_suffix}{pretrain_suffix}_checkpoint.pth")
-    params.log_file_name = (f"{args.track_config}_eval_vertex_head_d{params.limit_size}_{args.run_num}"
-                            f"{seed_suffix}{pretrain_suffix}.log")
     if args.data_root_test:
         params.data_root_test = args.data_root_test
     checkpoint_path = (args.checkpoint if args.checkpoint
@@ -263,12 +260,7 @@ def main():
     if args.detector is not None:
         params.vertex_detector = os.path.abspath(args.detector)
 
-    # Ensure output directory exists
     params.no_output = args.no_output
-    log_dir = args.root_dir
-    if not args.no_output:
-        os.makedirs(log_dir, exist_ok=True)
-    logfile = None if args.no_output else os.path.join(log_dir, params.log_file_name)
     print(f"[vertex] backbone   : {params.pretrained_ckpt}")
     print(f"[vertex] track head : {checkpoint_path}")
 
@@ -290,12 +282,11 @@ def main():
     result = trainer.inference(
         checkpoint_path=checkpoint_path,
         pretrain=args.usepretrain,
-        logfile=logfile,
         save_csv=args.save_csv,
         csv_output_path=args.csv_output_path,
     )
     if trainer.world_rank == 0 and not args.no_output:
-        save_results(result, trainer, params, args, checkpoint_path, logfile)
+        save_results(result, trainer, params, args, checkpoint_path)
     trainer.cleanup()
 
     # Free GPU memory
@@ -303,32 +294,22 @@ def main():
     gc.collect()
 
 
-def save_results(result, trainer, params, args, checkpoint_path, logfile):
+def save_results(result, trainer, params, args, checkpoint_path):
     """
-    Write _results.npz and _metrics.json next to logfile and append the metrics to the performance
-    log.
+    Write _metrics.json next to the run log: inputs, VertexHead's fit settings and the metrics.
     """
-    npz_path = logfile.replace(".log", "_results.npz")
-    np.savez(npz_path,
-             vertex_estimate=result["vertex_estimate"].float().numpy(),
-             vertex_target=result["vertex_target"].float().numpy(),
-             fit_is_valid=result["fit_is_valid"].numpy())
-
-    summary = {
-        "config": args.config,
-        "yaml_config": os.path.abspath(args.yaml_config),
-        "pretrained_ckpt": params.pretrained_ckpt,
-        "track_ckpt": os.path.abspath(checkpoint_path),
-        "track_fit_config": trainer.vertex_head.track_fit_config(),
-        "max_eval_events": args.max_eval_events,
-        "metrics": result["metrics"],
-    }
-    json_path = logfile.replace(".log", "_metrics.json")
+    json_path = trainer.logfile.replace(".log", "_metrics.json")
     with open(json_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    trainer.log_infile("[vertex] " + json.dumps(result["metrics"]))
-    print(f"[vertex] wrote {logfile}\n[vertex] wrote {npz_path}\n[vertex] wrote {json_path}")
+        json.dump({
+            "config": args.config,
+            "yaml_config": os.path.abspath(args.yaml_config),
+            "pretrained_ckpt": params.pretrained_ckpt,
+            "track_ckpt": os.path.abspath(checkpoint_path),
+            "track_fit_config": trainer.vertex_head.track_fit_config(),
+            "max_eval_events": args.max_eval_events,
+            "metrics": result["metrics"],
+        }, f, indent=2)
+    print(f"[vertex] wrote {trainer.logfile}\n[vertex] wrote {json_path}")
 
 
 if __name__ == "__main__":
