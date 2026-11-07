@@ -730,15 +730,16 @@ class DownstreamTrainer():
     @torch.no_grad()
     def run_vertexing(self, pretrain=True, max_events=None, save_csv=False):
         """
-        Backbone and track head per loader batch; VertexHead per vertex_chunk_events events (default 32), with the
-        metrics inputs and CSV rows, in a background thread on CPU copies while the GPU runs the next batches.
+        Backbone and track head per loader batch; truth labels and VertexHead per vertex_chunk_events events (default
+        32), with the metrics inputs and CSV rows, in a background thread on CPU copies while the GPU runs the next
+        batches.
 
         Args:
             pretrain: backbone features (True) or raw points; max_events: limit (None: all); save_csv: build the CSV.
 
         Returns:
             dict: metrics (incl. time_<stage>_ms_per_event), vertex_estimate, vertex_target (n, 3), fit_is_valid (n,),
-            timing (seconds busy per stage; the vertex_head and csv stages overlap the others), per_point (with
+            timing (seconds busy per stage; truth, vertex_head and csv overlap the others), per_point (with
             save_csv).
         """
         self.model.eval()
@@ -749,10 +750,17 @@ class DownstreamTrainer():
         pool, job = ThreadPoolExecutor(max_workers=1), [None]
 
         def finish(records):
-            """VertexHead over these batches, then their metrics inputs and CSV rows (the background thread)."""
+            """Truth labels and VertexHead over these batches, then their metrics inputs and CSV rows (the background
+            thread)."""
             t0 = time.perf_counter()
-            fitted = self._vertex_head_chunk(records)
+            for r in records:
+                # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them. The truth PV: the
+                # origin shared by the most particles
+                r["truth"] = get_vertex_label(r["reg"], particle_id=r["label"], valid_tracks=(
+                    torch.hypot(r["reg"][..., 3], r["reg"][..., 4]) < 1.0) & r["mask"])
             t1 = time.perf_counter()
+            fitted = self._vertex_head_chunk(records)
+            t2 = time.perf_counter()
             for r, (vertex, valid) in zip(records, fitted):
                 if save_csv:
                     truth_vertex = r["truth"]["vertex_target"].masked_fill(~r["truth"]["vertex_valid"][:, None],
@@ -763,8 +771,9 @@ class DownstreamTrainer():
                 est.append(vertex)
                 tgt.append(r["truth"]["vertex_target"])
                 ok.append(valid & r["truth"]["vertex_valid"])
-            timing["vertex_head"] += t1 - t0
-            timing["csv"] += time.perf_counter() - t1
+            timing["truth"] += t1 - t0
+            timing["vertex_head"] += t2 - t1
+            timing["csv"] += time.perf_counter() - t2
 
         def flush():
             """Hands the pending batches to the background thread once it has finished the previous chunk."""
@@ -776,7 +785,7 @@ class DownstreamTrainer():
                 job[0] = pool.submit(finish, list(pending))
                 pending.clear()
 
-        stages = ("data", "backbone", "track_head", "truth", "waiting", "vertex_head", "csv")
+        stages = ("data", "backbone", "track_head", "to_cpu", "waiting", "truth", "vertex_head", "csv")
         timing = dict.fromkeys(stages, 0.0)
         for key in vertexhead.ACTS_TIMING:
             vertexhead.ACTS_TIMING[key] = type(vertexhead.ACTS_TIMING[key])(0)
@@ -812,13 +821,9 @@ class DownstreamTrainer():
                     out = self.down_model(grouped, feature=None)
                 lap("track_head")
 
-            # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them. The truth PV: the
-            # origin shared by the most particles
-            truth = get_vertex_label(reg, valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask,
-                                     particle_id=label)
             pending.append(cpu({"step": step, "grouped": grouped, "label": label, "reg": reg, "mask": mask,
-                                "truth": truth, "class_probs": out["class_probs"], "mask_probs": out["mask_probs"]}))
-            lap("truth")
+                                "class_probs": out["class_probs"], "mask_probs": out["mask_probs"]}))
+            lap("to_cpu")
             n_seen += b
             last = bool(max_events) and n_seen >= max_events
             if last or sum(r["mask"].shape[0] for r in pending) >= chunk_events:
@@ -841,7 +846,7 @@ class DownstreamTrainer():
             print("[vertex] " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
                                           for k, v in metrics.items() if not k.startswith("time_")))
             print(f"[vertex] time over {len(ok)} events: {wall:.1f} s ({wall / n_events * 1e3:.1f} ms/event); busy "
-                  f"time per stage (vertex_head and csv run alongside the others; waiting: for them)")
+                  f"time per stage (truth, vertex_head and csv run alongside the others; waiting: for them)")
             for k in stages:
                 print(f"[vertex]   {k:14s} {timing[k]:8.2f} s  {timing[k] / n_events * 1e3:8.2f} ms/event  "
                       f"{timing[k] / max(wall, 1e-12):6.1%}")
