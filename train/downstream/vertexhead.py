@@ -657,6 +657,10 @@ class VertexHead(nn.Module):
             (ACTS's Gaussian seeder), not the all-track fit; seed_d0_significance, seed_z0_significance: its cuts.
         seed_z_window, seed_z_window_softness (cm): the PV fit's track weights x sigmoid((window - |z0 - z_seed|) /
             softness), a soft form of ACTS AMVF's 1 mm z preselection; None: off.
+        max_vertices: primary vertices to look for (pileup; 1: the PV only); each further one is seeded and fitted on
+            the tracks the earlier ones left, kept with >= min_vertex_tracks tracks of fit weight >= 0.5 and unless
+            within max_merge_significance sigma in z of an earlier one; the PV is the one with the highest sum of fit
+            weight x pT^2.
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped);
             acts_image or acts_command, acts_geometry + acts_geometry_config, acts_material_map, acts_energy_loss,
             acts_max_steps configure it.
@@ -703,6 +707,9 @@ class VertexHead(nn.Module):
         seed_z0_significance: float = 12.0,
         seed_z_window: float = 0.2,
         seed_z_window_softness: float = 0.05,
+        max_vertices: int = 1,
+        min_vertex_tracks: int = 2,
+        max_merge_significance: float = 3.0,
         sv_min_track_pv_chi2: float = 9.0,
         sv_min_track_beam_significance: float = 0.0,
         sv_max_track_chi2: float = 9.0,
@@ -749,6 +756,9 @@ class VertexHead(nn.Module):
         self.seed_z0_significance = seed_z0_significance
         self.seed_z_window = seed_z_window
         self.seed_z_window_softness = seed_z_window_softness
+        self.max_vertices = max_vertices
+        self.min_vertex_tracks = min_vertex_tracks
+        self.max_merge_significance = max_merge_significance
         self.sv_min_track_pv_chi2 = sv_min_track_pv_chi2
         self.sv_min_track_beam_significance = sv_min_track_beam_significance
         self.sv_max_track_chi2 = sv_max_track_chi2
@@ -1057,7 +1067,9 @@ class VertexHead(nn.Module):
         Returns:
             dict (the PV: the refit where used_refit):
                 vertex_estimate (B, 3), chi_square, fit_is_valid (B,), vertex_covariance (B, 3, 3); its quality:
-                vertex_n_tracks (B,) tracks with annealing weight >= 0.5, vertex_ndf (B,) 2 sum(weights) - 3 (ACTS).
+                vertex_n_tracks (B,) tracks with fit weight (annealing x z window) >= 0.5, vertex_ndf (B,) 2 sum(weights) - 3.
+                With max_vertices > 1: primary_vertices (B, V, 3), primary_vertex_valid, primary_vertex_n_tracks (B, V),
+                pv_index (B,) the PV among them, track_primary_vertex (B, T) each track's vertex (-1: none).
                 track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
                 track_quality_mask, track_sigma (B, T, 2), track_vertex_weight, track_chi2, track_dca (B, T),
                 track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS;
@@ -1194,18 +1206,45 @@ class VertexHead(nn.Module):
         bad = ~params["fit_ok"]
         params["helix"] = (params["circle_centre"].masked_fill(bad.unsqueeze(-1), 0.0), params["R_s"].masked_fill(bad, 1.0),
                            params["zslope"].masked_fill(bad, 0.0), params["z0"].masked_fill(bad, 0.0))
-        seed = None
-        if self.density_seed:
-            z = _density_seed(d0, z0, params["track_sigma"], track_weight, self.seed_d0_significance,
-                              self.seed_z0_significance).to(dtype)
-            seed = torch.stack([torch.full_like(z, self.beam_position[0]), torch.full_like(z, self.beam_position[1]), z], -1)
-        # the PV fit's weights: with a z window, faded by each track's z0 distance from the seed (events without a
-        # seed: unchanged); SV finding keeps track_weight
-        pv_weight = track_weight
-        if seed is not None and self.seed_z_window is not None:
-            fade = torch.sigmoid((self.seed_z_window - (z0.to(dtype) - seed[:, 2:]).abs()) / self.seed_z_window_softness)
-            pv_weight = track_weight * torch.where(torch.isfinite(seed[:, 2:]), fade.nan_to_num(0.0), 1.0)
-        fit, vertex_weight = self._fit_adaptive(track_position, track_direction, pv_weight, params, seed=seed)
+        # primary vertices, as ACTS AMVF iterates: seed, z window and adaptive fit on the tracks not yet used, up to
+        # max_vertices; a later vertex needs min_vertex_tracks tracks of fit weight >= 0.5, and the tracks it uses
+        # leave the pool (weight x (1 - fit weight))
+        candidates, available = [], track_weight
+        for k in range(self.max_vertices):
+            seed, window = self._seed_and_window(d0, z0, params["track_sigma"], available, dtype)
+            vertex_fit, annealing = self._fit_adaptive(track_position, track_direction, available * window, params,
+                                                       seed=seed)
+            fit_weight = (annealing * window).masked_fill(bad | (track_weight <= 0), 0.0)
+            valid = vertex_fit["fit_is_valid"]
+            if k > 0:
+                valid = valid & ((fit_weight >= 0.5).sum(dim=-1) >= self.min_vertex_tracks)
+                valid = valid if seed is None else valid & torch.isfinite(seed).all(dim=-1)
+                # a duplicate of an earlier vertex (z within max_merge_significance sigma, ACTS) is not a new one
+                for earlier in candidates:
+                    dz = vertex_fit["vertex_estimate"][:, 2] - earlier[0]["vertex_estimate"][:, 2]
+                    sigma = (vertex_fit["vertex_covariance"][:, 2, 2] + earlier[0]["vertex_covariance"][:, 2, 2]).sqrt()
+                    valid = valid & ~(earlier[6] & (dz.abs() < self.max_merge_significance * sigma))
+            candidates.append((vertex_fit, annealing, seed, window, available * window, fit_weight, valid))
+            # the candidate's tracks leave the pool whether or not it is kept, so its seed is not found again
+            used = vertex_fit["fit_is_valid"].unsqueeze(-1).to(fit_weight.dtype)
+            available = available * (1 - fit_weight * used).clamp(min=0.0)
+        # the PV: one vertex, or the valid one with the highest sum of fit weight x pT^2
+        pv_index = torch.zeros(track_weight.shape[0], dtype=torch.long, device=track_weight.device)
+        if len(candidates) > 1:
+            pT2 = params["pT"].nan_to_num(0.0).to(dtype) ** 2
+            score = torch.stack([(c[5] * pT2).sum(dim=-1).masked_fill(~c[6], -torch.inf) for c in candidates], dim=1)
+            pv_index = score.argmax(dim=1)
+        pick = lambda values: values[0] if len(candidates) == 1 else torch.stack(values, dim=1)[  # noqa: E731
+            torch.arange(len(pv_index), device=pv_index.device), pv_index]
+        fit = {key: pick([c[0][key] for c in candidates]) for key in candidates[0][0]}
+        vertex_weight, window, pv_weight = (pick([c[i] for c in candidates]) for i in (1, 3, 4))
+        seed = None if candidates[0][2] is None else pick([c[2] for c in candidates])
+        # SV finding keeps track_weight, minus the tracks of the other primary vertices
+        sv_weight = track_weight
+        if len(candidates) > 1:
+            others = torch.stack([c[5] * c[6].unsqueeze(-1) for c in candidates], dim=1)
+            others = others.masked_fill(torch.nn.functional.one_hot(pv_index, len(candidates)).bool().unsqueeze(-1), 0.0)
+            sv_weight = track_weight * (1 - others.max(dim=1).values)
 
         result = {
             "track_parameters": perigee.to(dtype),
@@ -1229,7 +1268,7 @@ class VertexHead(nn.Module):
                         bad.unsqueeze(-1), float("nan"))}
 
         if self.find_secondary:
-            secondary = self._find_secondary_vertices(fit, track_position, track_direction, track_weight, params, pv_weight)
+            secondary = self._find_secondary_vertices(fit, track_position, track_direction, sv_weight, params, pv_weight)
             refit = secondary.pop("pv_refit", None)
             refit_vertex_weight = secondary.pop("pv_refit_vertex_weight", None)
             secondary["sv_track_dca"] = secondary["sv_track_dca"].masked_fill(bad.unsqueeze(1), float("nan"))
@@ -1245,8 +1284,9 @@ class VertexHead(nn.Module):
                 used_refit = torch.zeros_like(used_refit)
             result["used_refit"] = used_refit
         fit = masked(fit)
-        # vertex quality, as ACTS judges it: the fitted tracks' annealing weights (tracks with track_weight > 0)
-        weight = vertex_weight.masked_fill(bad | (track_weight <= 0), 0.0)
+        # vertex quality, as ACTS judges it: each fitted track's weight in the fit, its annealing weight x the z window
+        # (tracks with track_weight > 0)
+        weight = (vertex_weight * window).masked_fill(bad | (track_weight <= 0), 0.0)
         result.update({
             "vertex_estimate": fit["vertex_estimate"],
             "chi_square": fit["chi_square"],
@@ -1259,4 +1299,31 @@ class VertexHead(nn.Module):
             "vertex_n_tracks": (weight >= 0.5).sum(dim=-1),
             "vertex_ndf": 2 * weight.sum(dim=-1) - 3,
         })
+        if len(candidates) > 1:
+            # all primary vertices (pileup), each track's (fit weight >= 0.5, else -1) and which one is the PV
+            valid = torch.stack([c[6] for c in candidates], dim=1)
+            fit_weight = torch.stack([c[5] for c in candidates], dim=1) * valid.unsqueeze(-1).to(dtype)
+            best, index = fit_weight.max(dim=1)
+            result.update({
+                "primary_vertices": torch.stack([c[0]["vertex_estimate"] for c in candidates], dim=1).masked_fill(
+                    ~valid.unsqueeze(-1), float("nan")),
+                "primary_vertex_valid": valid,
+                "primary_vertex_n_tracks": (fit_weight >= 0.5).sum(dim=-1).masked_fill(~valid, 0),
+                "pv_index": pv_index,
+                "track_primary_vertex": torch.where(best >= 0.5, index, -1),
+            })
         return result
+
+    def _seed_and_window(self, d0, z0, track_sigma, track_weight, dtype):
+        """
+        The density seed (B, 3) on the beam line (None without density_seed) and each track's z-window factor (B, T)
+        (1 without a window or a seed).
+        """
+        seed, window = None, torch.ones_like(track_weight)
+        if self.density_seed:
+            z = _density_seed(d0, z0, track_sigma, track_weight, self.seed_d0_significance, self.seed_z0_significance).to(dtype)
+            seed = torch.stack([torch.full_like(z, self.beam_position[0]), torch.full_like(z, self.beam_position[1]), z], -1)
+            if self.seed_z_window is not None:
+                fade = torch.sigmoid((self.seed_z_window - (z0.to(dtype) - seed[:, 2:]).abs()) / self.seed_z_window_softness)
+                window = torch.where(torch.isfinite(seed[:, 2:]), fade.nan_to_num(0.0), 1.0)
+        return seed, window

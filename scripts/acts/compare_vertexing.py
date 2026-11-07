@@ -71,7 +71,8 @@ def load_events(path, max_events, tracks="finder"):
     """
     Per event: a function giving (class_probs, mask_probs, points, padding_mask) as VertexHead takes them (built on
     demand), the true vertex, per track slot whether it is a Geant secondary and its particle's truth production
-    vertex, and the number of primary vertices (test_truth_pv_index; NaN in older CSVs).
+    vertex, the number of primary vertices (test_truth_pv_index; NaN in older CSVs) and their truth positions
+    (V, 3), ranked as get_vertex_label ranks them (None in older CSVs).
     """
     col = read_columns(path, max_events)
     nan_to = lambda name, value: np.where(np.isnan(col[name]), value, col[name]).astype(np.int64)  # noqa: E731
@@ -107,8 +108,42 @@ def load_events(path, max_events, tracks="finder"):
             return (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
                     torch.ones(1, len(hits), dtype=torch.bool))
         n_pv = np.nanmax(pv_index[hits], initial=-1) + 1 if pv_index is not None else np.nan
-        events.append((inputs, true_vertex[hits[0]], secondary, origin, n_pv))
+        truth_pvs = None if pv_index is None else np.array(
+            [origin_all[hits][pv_index[hits] == k].mean(axis=0) for k in range(int(n_pv))]).reshape(-1, 3)
+        events.append((inputs, true_vertex[hits[0]], secondary, origin, n_pv, truth_pvs))
     return events
+
+
+TRACK_KEYS = ("track_parameters", "track_covariance", "track_weight", "track_quality_mask", "track_sigma",
+              "track_position", "track_direction", "track_vertex_weight", "track_chi2", "track_dca",
+              "track_closest_approach_point", "track_primary_vertex", "displaced_mask", "displaced_weight", "acts_failed")
+
+
+def run_chunk(head, inputs):
+    """VertexHead once over several events (padded to common hit and track counts, as the eval runs it), split
+    back into one output per event with its own track count."""
+    pad = torch.nn.functional.pad
+    n_hits, n_tracks = max(i[1].shape[1] for i in inputs), max(i[0].shape[1] for i in inputs)
+    out = head(torch.cat([pad(i[0], (0, 0, 0, n_tracks - i[0].shape[1])) for i in inputs]),
+               torch.cat([pad(i[1], (0, n_tracks - i[1].shape[2], 0, n_hits - i[1].shape[1])) for i in inputs]),
+               torch.cat([pad(i[2], (0, 0, 0, n_hits - i[2].shape[1])) for i in inputs]),
+               torch.cat([pad(i[3], (0, n_hits - i[3].shape[1]), value=False) for i in inputs]))
+    split = []
+    for b, i in enumerate(inputs):
+        tracks = i[0].shape[1]
+        one = {}
+        for key, value in out.items():
+            if not torch.is_tensor(value):
+                one[key] = {k: v[b:b + 1] for k, v in value.items()}      # pv_original: per-event PV values only
+                continue
+            value = value[b:b + 1]
+            if key in TRACK_KEYS:
+                value = value[:, :tracks]
+            elif key in ("sv_track_mask", "sv_track_dca"):
+                value = value[..., :tracks]
+            one[key] = value
+        split.append(one)
+    return split
 
 
 def acts_vertices(head, outs):
@@ -156,7 +191,7 @@ def sv_stats(outs, events, origin_tolerance):
     """The SV table's numbers for VertexHead's SVs."""
     n_sec = n_cand = n_cand_sec = n_sv = sv_tracks = sv_tracks_sec = sv_all_sec = sv_true = 0
     residual = []
-    for o, (_, truth, sec, origin, _) in zip(outs, events):
+    for o, (_, truth, sec, origin, *_) in zip(outs, events):
         usable, cand = o["track_quality_mask"][0].numpy(), o["displaced_mask"][0].numpy()
         n_sec += int((sec & usable).sum()); n_cand += int(cand.sum()); n_cand_sec += int((cand & sec).sum())
         for k in np.flatnonzero(o["sv_is_valid"][0].numpy()):
@@ -179,6 +214,7 @@ def main():
     parser.add_argument("--tracks", choices=("finder", "truth", "both"), default="both")
     parser.add_argument("--origin_tolerance", type=float, default=0.1, help="cm, for true (shared, displaced) origins")
     parser.add_argument("--max_events", type=int, default=500)
+    parser.add_argument("--chunk_events", type=int, default=32, help="events per VertexHead call (as the eval)")
     args = parser.parse_args()
 
     head = vh.VertexHead.from_detector(args.detector, find_secondary=True).eval()
@@ -191,14 +227,14 @@ def main():
         n_truth = sum(bool(np.isfinite(e[1]).all()) for e in events)
         print(f"{tracks} tracks: {len(events)} events ({n_truth} with a true vertex) from {args.csv}; detector "
               f"{args.detector}", flush=True)
-        outs, times = [], []
+        outs, times = [], []    # times: per chunk, per event
         with torch.no_grad():
-            for inputs, *_ in events:
+            for k in range(0, len(events), args.chunk_events):
+                chunk = [e[0]() for e in events[k:k + args.chunk_events]]
                 t0 = time.perf_counter()
-                outs.append(head(*inputs()))
-                times.append(time.perf_counter() - t0)
-        timing["VertexHead"] += sum(times)
-        # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
+                outs += run_chunk(head, chunk)
+                times.append((time.perf_counter() - t0) / len(chunk))
+                timing["VertexHead"] += times[-1] * len(chunk)
         chi2 = [o["chi_square"].item() / float(o["vertex_ndf"]) for o in outs
                 if float(o["vertex_ndf"]) > 0 and o["fit_is_valid"].all()]
         vertices = np.array([o["vertex_estimate"][0].double().numpy() for o in outs])
@@ -226,6 +262,19 @@ def main():
             notes.append(f"{tracks} tracks: {(n_pv >= 2).sum()} of {len(n_pv)} events have >= 2 primary vertices "
                          f"(pileup; most {int(n_pv.max())}); VertexHead's PV error with pileup {text(n_pv >= 2)}, "
                          f"without {text(n_pv < 2)}")
+        if "primary_vertices" in outs[0] and np.isfinite(n_pv).all():
+            # pileup vertices (truth rank >= 1) VertexHead found (a non-PV vertex within 2 mm in z), and its extra
+            # vertices matching no truth vertex
+            found = total = fakes = 0
+            for o, e in zip(outs, events):
+                z = o["primary_vertices"][0, :, 2].double().numpy()
+                others = z[o["primary_vertex_valid"][0].numpy() & (np.arange(len(z)) != int(o["pv_index"]))]
+                truth_z = e[5][:, 2]
+                found += sum(bool((np.abs(others - tz) < 0.2).any()) for tz in truth_z[1:])
+                total += len(truth_z[1:])
+                fakes += sum(not (np.abs(truth_z - oz) < 0.2).any() for oz in others)
+            notes.append(f"{tracks} tracks: pileup vertices found {found} of {total} (within 2 mm in z); extra "
+                         f"vertices matching no truth vertex {fakes} in {len(events)} events")
         for name, run_vertices, run_chi2, dropped, ms in runs:
             label = f"{tracks:7s} {name:12s}"
             (n, m, p68, p90, within), axes = pv_stats(run_vertices, events)

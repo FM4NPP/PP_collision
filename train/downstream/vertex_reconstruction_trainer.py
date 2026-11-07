@@ -668,18 +668,29 @@ class DownstreamTrainer():
     def _vertex_head_chunk(self, records):
         """
         VertexHead once over several loader batches, padded to a common size; returns each batch's
-        (vertex_estimate, fit_is_valid).
+        (vertex_estimate, fit_is_valid). Each event keeps only the track slots VertexHead can fit, those at least
+        min_hits real hits are assigned to (VertexHead's argmax), and the hits of the others stay unassigned: the
+        same result, without the track head's mostly empty max_gt_classes slots.
         """
-        n_hits = max(r["mask"].shape[1] for r in records)
-        n_tracks = max(r["class_probs"].shape[1] for r in records)
+        events = []
+        for r in records:
+            for e in range(r["mask"].shape[0]):
+                probs, real = r["mask_probs"][e].float(), r["mask"][e]
+                assigned = real & (probs.max(dim=-1).values > 0)
+                best = probs.argmax(dim=-1)
+                n_hits = torch.zeros(probs.shape[-1], dtype=torch.long, device=probs.device).index_add_(
+                    0, best[assigned], torch.ones_like(best[assigned]))
+                slots = (n_hits >= self.vertex_head.min_hits).nonzero(as_tuple=True)[0]
+                probs = probs * (n_hits >= self.vertex_head.min_hits)[best].unsqueeze(-1)    # other hits: unassigned
+                events.append((r["class_probs"][e, slots].float(), probs[:, slots], r["grouped"][e], real))
+        n_hits = max(len(real) for *_, real in events)
+        n_tracks = max(1, max(len(c) for c, *_ in events))
         pad = lambda t, dims, value=0.0: torch.nn.functional.pad(t, dims, value=value)  # noqa: E731
         result = self._vertex_head(
-            class_probs=torch.cat([pad(r["class_probs"].float(), (0, 0, 0, n_tracks - r["class_probs"].shape[1]))
-                                   for r in records]),
-            mask_probs=torch.cat([pad(r["mask_probs"].float(), (0, n_tracks - r["mask_probs"].shape[2],
-                                                                 0, n_hits - r["mask_probs"].shape[1])) for r in records]),
-            points=torch.cat([pad(r["grouped"], (0, 0, 0, n_hits - r["grouped"].shape[1])) for r in records]),
-            padding_mask=torch.cat([pad(r["mask"], (0, n_hits - r["mask"].shape[1]), value=False) for r in records]))
+            class_probs=torch.stack([pad(c, (0, 0, 0, n_tracks - len(c))) for c, *_ in events]),
+            mask_probs=torch.stack([pad(m, (0, n_tracks - m.shape[1], 0, n_hits - m.shape[0])) for _, m, *_ in events]),
+            points=torch.stack([pad(p, (0, 0, 0, n_hits - len(p))) for *_, p, _ in events]),
+            padding_mask=torch.stack([pad(real, (0, n_hits - len(real)), value=False) for *_, real in events]))
         sizes = [r["mask"].shape[0] for r in records]
         return list(zip(result["vertex_estimate"].split(sizes), result["fit_is_valid"].split(sizes)))
 
