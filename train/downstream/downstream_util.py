@@ -131,6 +131,7 @@ def get_vertex_label(reg, valid_tracks=None, valid_radius_cm=1.0, z_cut_cm=None,
         return result
 
     device = reg.device
+    particle_id, valid_tracks = particle_id.to(device), valid_tracks.to(device)
     hit_vertex = torch.full(valid_tracks.shape, -1, dtype=torch.long, device=device)
     found = []
     for b in range(reg.shape[0]):
