@@ -45,7 +45,7 @@ def main():
     head._find_secondary_vertices = capture
 
     displacement, r_xy, seed_error, fit_error, found_error, n_tracks, primary, event_index = [], [], [], [], [], [], [], []
-    n_events = 0
+    n_events, beam_line = 0, []
     with torch.no_grad():
         for inputs, truth, secondary, origin in cv.load_events(args.csv, args.max_events, "truth"):
             n_events += 1
@@ -60,6 +60,10 @@ def main():
                 if len(group) < 2:
                     continue
                 true_sv = np.median(origin[group], axis=0)
+                if np.hypot(*true_sv[:2]) < 0.1:             # a beam-line group: against the truth PV's own tracks
+                    at_truth = int((usable & (np.linalg.norm(origin - truth, axis=1) <= args.tolerance)).sum())
+                    pv = out["vertex_estimate"][0].double().numpy()
+                    beam_line.append((at_truth, len(group), np.linalg.norm(pv - truth), np.linalg.norm(pv - true_sv)))
                 primary.append(not secondary[group].any())
                 event_index.append(n_events - 1)
                 displacement.append(np.linalg.norm(true_sv - truth))
@@ -117,6 +121,14 @@ def main():
         quantiles("    transverse radius", r_xy[sel])
         quantiles("    helix fit error, exactly its tracks", fit_error[sel])
         print(f"    found within 1 cm: {(found_error[sel] < 1).sum()}")
+
+    if beam_line:
+        at_truth, in_group, to_truth, to_group = np.array(beam_line, dtype=float).T
+        print(f"\nevents with a beam-line group ({len(at_truth)}): usable tracks at the truth PV median {np.median(at_truth):.0f}, "
+              f"in the group median {np.median(in_group):.0f}; group larger in {(in_group > at_truth).sum()}, "
+              f"equal in {(in_group == at_truth).sum()}")
+        print(f"  VertexHead's PV - truth PV median {np.nanmedian(to_truth):.3f} cm, - group median {np.nanmedian(to_group):.3f} cm; "
+              f"closer to the group in {(to_group < to_truth).sum()} events")
 
 
 if __name__ == "__main__":
