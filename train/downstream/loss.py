@@ -599,12 +599,6 @@ def _get_tgt_permutation_idx(indices):
     return batch_idx, tgt_idx
 
 
-
-
-
-
-
-
 def assign_points_to_masks(outputs, no_object_class=0, option=1, threshold=0.0):
     """
     Assign points to masks using either:

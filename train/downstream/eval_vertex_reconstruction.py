@@ -75,7 +75,7 @@ def main():
         "--run_num",
         type=str,
         default="0",
-        help="Run number / seed identifier",
+        help="The track head's run number: names its checkpoint",
     )
     parser.add_argument(
         "--seed",
@@ -94,8 +94,8 @@ def main():
         dest="save_csv",
         action="store_true",
         default=True,
-        help="Save the per-point CSV (default: enabled); vtx_x/y/z hold the reconstructed vertex, "
-             "test_* columns (truth vertex, residual) are for testing only",
+        help="Save the per-point CSV (default: enabled): vtx_x/y/z each hit's truth production vertex, reco_vtx_* "
+             "the reconstructed PV, test_* columns (truth PV, residual) for testing only",
     )
     parser.add_argument(
         "--no-csv",
@@ -107,7 +107,7 @@ def main():
         "--csv_output_path",
         type=str,
         default=None,
-        help="Path for the per-point CSV (default: next to the run log)",
+        help="Path for the per-point CSV (default: the run folder's data/)",
     )
     parser.add_argument(
         "--data_root_test",
@@ -125,7 +125,7 @@ def main():
         "--eventnumber",
         type=int,
         default=70000,
-        help="Number of events (samples) to evaluate; also names the derived checkpoint",
+        help="The track head's training size: names its checkpoint (--max_eval_events sets the events evaluated)",
     )
     parser.add_argument(
         "--eval_batch_size",

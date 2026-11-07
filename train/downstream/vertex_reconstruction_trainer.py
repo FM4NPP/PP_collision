@@ -215,25 +215,13 @@ class DownstreamTrainer():
         with open(self.logfile, "a") as f:
             f.write("{}\n".format(log))
 
-    def parse_exp_details(self, D, partial=None, globalfile = False):
-        """
-        D: a dictionary listing parameters
-        partial: a list of columns of interest
-        """
-        
-        if globalfile:
-            if partial is None:
-                out = ','.join(['{}:{}'.format(a, b) for a,b in D.items()])
-            else:
-                out = ','.join(['{}:{}'.format(a, b) for a,b in D.items() if a in partial])
-        else:
-            out = 'Important Details:\n' + ''.join(['{}: {}\n'.format(a, b) for a,b in D.items()])
-        return out
+    def parse_exp_details(self, D):
+        """The run's parameters, one per line, for the run log."""
+        return 'Important Details:\n' + ''.join(f'{a}: {b}\n' for a, b in D.items())
 
     def launch(self, train=True):
         """Run folder, backbone (pretrained checkpoint), optimizer and loaders; train=False (the eval): the test
         loader only."""
-        print(self.root_dir, self.config, self.run_num)
         # the run folder: params.run_folder (the eval: <backbone>/<track head>/e<events>), else <config>/<run_num>
         exp_dir = os.path.join(self.root_dir, getattr(self.params, "run_folder", None) or os.path.join(self.config, self.run_num))
         self.init_exp_dir(exp_dir)
@@ -583,21 +571,15 @@ class DownstreamTrainer():
         detector = getattr(self.params, "vertex_detector", None)
         head = VertexHead.from_detector(detector, **settings) if detector else VertexHead(**settings)
         self.vertex_head = head.to(self.vertex_device).eval()
-        self.vertex_head.start_acts()       # boots while the checkpoints and data load
-
-    def _vertex_head(self, class_probs, mask_probs, points, padding_mask):
-        """VertexHead on its device (vertex_device); vertex_estimate and fit_is_valid back on the inputs' device."""
-        d = self.vertex_device
-        result = self.vertex_head(class_probs=class_probs.to(d), mask_probs=mask_probs.to(d), points=points.to(d),
-                                  padding_mask=padding_mask.to(d))
-        return {k: result[k].to(class_probs.device) for k in ("vertex_estimate", "fit_is_valid")}
+        self.vertex_head.start_acts()       # boots while the first batches run
 
     def _vertex_head_chunk(self, records):
         """
         VertexHead once over several loader batches, padded to a common size; returns each batch's
         (vertex_estimate, fit_is_valid). Each event keeps only the track slots VertexHead can fit, those at least
         min_hits real hits are assigned to (VertexHead's argmax), and the hits of the others stay unassigned: the
-        same result, without the track head's mostly empty max_gt_classes slots.
+        same result, without the track head's mostly empty max_gt_classes slots. VertexHead runs on vertex_device;
+        the results come back to the CPU.
         """
         events = []
         for r in records:
@@ -612,18 +594,19 @@ class DownstreamTrainer():
         n_hits = max(len(real) for *_, real in events)
         n_tracks = max(1, max(len(c) for c, *_ in events))
         pad = lambda t, dims, value=0.0: torch.nn.functional.pad(t, dims, value=value)  # noqa: E731
-        result = self._vertex_head(
-            class_probs=torch.stack([pad(c, (0, 0, 0, n_tracks - len(c))) for c, *_ in events]),
-            mask_probs=torch.stack([pad(m, (0, n_tracks - m.shape[1], 0, n_hits - m.shape[0])) for _, m, *_ in events]),
-            points=torch.stack([pad(p, (0, 0, 0, n_hits - len(p))) for *_, p, _ in events]),
-            padding_mask=torch.stack([pad(real, (0, n_hits - len(real)), value=False) for *_, real in events]))
+        d = self.vertex_device
+        result = self.vertex_head(
+            class_probs=torch.stack([pad(c, (0, 0, 0, n_tracks - len(c))) for c, *_ in events]).to(d),
+            mask_probs=torch.stack([pad(m, (0, n_tracks - m.shape[1], 0, n_hits - m.shape[0])) for _, m, *_ in events]).to(d),
+            points=torch.stack([pad(p, (0, 0, 0, n_hits - len(p))) for *_, p, _ in events]).to(d),
+            padding_mask=torch.stack([pad(real, (0, n_hits - len(real)), value=False) for *_, real in events]).to(d))
         sizes = [r["mask"].shape[0] for r in records]
-        return list(zip(result["vertex_estimate"].split(sizes), result["fit_is_valid"].split(sizes)))
+        return list(zip(result["vertex_estimate"].cpu().split(sizes), result["fit_is_valid"].cpu().split(sizes)))
 
     def inference(self, checkpoint_path, pretrain=True, save_csv=False, csv_output_path=None):
         """
         setup_vertexing, then run_vertexing over at most max_eval_events; appends the metrics to the run log and
-        writes the CSV (default: next to the run log).
+        writes the CSV (default: the run folder's data/).
 
         Args:
             checkpoint_path: track-head checkpoint; pretrain: backbone features (True) or raw points.
