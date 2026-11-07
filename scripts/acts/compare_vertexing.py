@@ -8,7 +8,7 @@ eval_vertex_reconstruction.py:
 
 VertexHead runs with the detector file's settings (PV and SVs). ACTS's finder as shipped (acts_vertexing.py: AMVF,
 Gaussian seeder; its first vertex as the PV) runs on the same tracks with the same errors (x track_error_scale);
-it needs the detector file's ACTS image. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
+it needs the detector file's ACTS image; "VH on ACTS" is VertexHead on the events where ACTS found a vertex. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
 Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); VertexHead's SVs against
 truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*).
 """
@@ -164,6 +164,8 @@ def main():
         if head.use_acts:
             acts_pv, n_found = acts_vertices(head, outs)
             runs.append(("ACTS AMVF", acts_pv, "", runs[0][3], None))
+            # VertexHead on the events where ACTS found a vertex: the like-for-like comparison
+            runs.append(("VH on ACTS", np.where(np.isfinite(acts_pv), vertices, np.nan), "", runs[0][3], None))
             distance = np.linalg.norm(acts_pv - vertices, axis=1)
             notes.append(f"{tracks} tracks: ACTS AMVF found {np.mean(n_found):.2f} vertices per event, none in "
                          f"{n_found.count(0)}; its first vertex - VertexHead's PV: median {np.nanmedian(distance):.4f} cm, "
