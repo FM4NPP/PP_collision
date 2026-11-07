@@ -148,7 +148,7 @@ def acts_vertices(head, outs):
     with tempfile.TemporaryDirectory() as tmp:
         for e, o in enumerate(outs):
             params = o["track_parameters"][0].double().numpy().copy()
-            params[:, :2] /= head.track_parameter_length_scale                   # d0, z0: cm -> mm
+            params[:, :2] *= vh.MM_PER_CM                                         # d0, z0: cm -> mm
             cov = o["track_covariance"][0].double().numpy() * head.track_error_scale ** 2
             keep = (o["track_weight"][0] > 0).numpy() & np.isfinite(params[:, :5]).all(1) & np.isfinite(cov).all((1, 2))
             with open(os.path.join(tmp, f"event{e:09d}-tracks.csv"), "w", newline="") as f:
@@ -167,7 +167,7 @@ def acts_vertices(head, outs):
         for e in range(len(outs)):
             with open(os.path.join(tmp, f"event{e:09d}-vertices.csv"), newline="") as f:
                 found.append([[float(r[k]) for k in "xyz"] for r in csv.DictReader(f)])
-    first = np.array([v[0] if v else [np.nan] * 3 for v in found]) * head.track_parameter_length_scale
+    first = np.array([v[0] if v else [np.nan] * 3 for v in found]) / vh.MM_PER_CM
     return first, [len(v) for v in found]
 
 

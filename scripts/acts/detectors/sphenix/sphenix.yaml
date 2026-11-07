@@ -32,7 +32,7 @@ acts:                          # use_acts is on when image (or command) is set
   material_map: null           # ACTS JSON material map, CDB key ACTSMATERIALMAP
   energy_loss: false           # energy loss in the material map's material
   max_steps: null              # ACTS's propagation step limit (null: ACTS's default)
-  threads: null                # propagation threads (null: all cores)
+  threads: null                # propagation threads (null: the CPUs the process may use)
 
 # any other VertexHead argument (VertexHead's defaults otherwise)
 vertex_head: {}

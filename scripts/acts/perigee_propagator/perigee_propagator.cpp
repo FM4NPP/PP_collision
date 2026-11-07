@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -53,7 +54,10 @@ class PerigeePropagator {
       : m_surface(Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3(reference[0], reference[1], reference[2]))),
         m_energyLoss(energyLoss),
         m_maxSteps(maxSteps),
-        m_threads(threads > 0 ? threads : std::max(1u, std::thread::hardware_concurrency())) {
+        m_threads(threads) {
+    if (threads == 0) {
+      throw std::invalid_argument("threads must be at least 1");
+    }
     // errors only: per-state warnings (e.g. a field lookup outside the map) are counted in the worker's failure summary
     auto logger = [](const char* name) { return Acts::getDefaultLogger(name, Acts::Logging::ERROR); };
     // the stepper and the navigator keep the field and the geometry alive
@@ -75,7 +79,10 @@ class PerigeePropagator {
   // ACTS failed or an input is not finite), ok (n,) and {error message: count}
   py::tuple propagate(Array position, Array direction, Array qop, Array covariance) const {
     const py::ssize_t n = qop.size();
-    if (position.size() != 3 * n || direction.size() != 3 * n || covariance.size() != 36 * n) {
+    auto shaped = [](const Array& a, const std::vector<py::ssize_t>& shape) {
+      return a.ndim() == static_cast<py::ssize_t>(shape.size()) && std::equal(shape.begin(), shape.end(), a.shape());
+    };
+    if (qop.ndim() != 1 || !shaped(position, {n, 3}) || !shaped(direction, {n, 3}) || !shaped(covariance, {n, 6, 6})) {
       throw std::invalid_argument("position, direction (n, 3), qop (n,), covariance (n, 6, 6) expected");
     }
     Array params({n, py::ssize_t{6}});
@@ -91,52 +98,71 @@ class PerigeePropagator {
     std::fill(out, out + 6 * n, std::numeric_limits<double>::quiet_NaN());
     std::fill(cov, cov + 36 * n, std::numeric_limits<double>::quiet_NaN());
     std::fill(good, good + n, false);
-    const std::size_t nThreads = std::clamp<std::size_t>(m_threads, 1, std::max<py::ssize_t>(n, 1));
+    const std::size_t nThreads = std::min<std::size_t>(m_threads, std::max<py::ssize_t>(n, 1));
     std::vector<std::map<std::string, std::size_t>> threadErrors(nThreads);
-    // states [first, last) on one thread; each state writes only its own output rows
-    auto work = [&](py::ssize_t first, py::ssize_t last, std::map<std::string, std::size_t>& errors) {
-      for (py::ssize_t i = first; i < last; ++i) {
-        const Acts::Vector3 pos(P[3 * i], P[3 * i + 1], P[3 * i + 2]);
-        const Acts::Vector3 dir(D[3 * i], D[3 * i + 1], D[3 * i + 2]);
-        const Acts::BoundMatrix startCov = Eigen::Map<const RowMatrix6>(C + 36 * i);
-        if (!startCov.allFinite() || !pos.allFinite() || !dir.allFinite() || !std::isfinite(Q[i]) ||
-            dir.norm() == 0.0) {
-          continue;
-        }
-        try {
-          const auto start = Acts::BoundTrackParameters::createCurvilinear(
-              Acts::Vector4(pos.x(), pos.y(), pos.z(), 0.0), dir.normalized(), Q[i], startCov,
-              Acts::ParticleHypothesis::pion());
-          std::string error;
-          std::optional<Acts::BoundTrackParameters> end;
-          if (m_geometryPropagator) {
-            GeometryOptions options(m_geometryContext, m_fieldContext);
-            options.actorList.get<Acts::MaterialInteractor>().energyLoss = m_energyLoss;
-            end = run(*m_geometryPropagator, options, start, error);
-          } else {
-            end = run(*m_fieldPropagator, FieldPropagator::Options<>(m_geometryContext, m_fieldContext), start, error);
-          }
-          if (!end) {
-            ++errors[error];
+    std::vector<std::exception_ptr> threadFailures(nThreads);
+    // states [first, last) on one thread; each state writes only its own output rows. An ACTS exception counts as
+    // that state's failure; any other is rethrown after the threads finish
+    auto work = [&](py::ssize_t first, py::ssize_t last, std::map<std::string, std::size_t>& errors,
+                    std::exception_ptr& failure) {
+      try {
+        for (py::ssize_t i = first; i < last; ++i) {
+          const Acts::Vector3 pos(P[3 * i], P[3 * i + 1], P[3 * i + 2]);
+          const Acts::Vector3 dir(D[3 * i], D[3 * i + 1], D[3 * i + 2]);
+          const Acts::BoundMatrix startCov = Eigen::Map<const RowMatrix6>(C + 36 * i);
+          // no track (a NaN state) is skipped; a track ACTS cannot start counts as a failure
+          if (!pos.allFinite() || !dir.allFinite() || !std::isfinite(Q[i])) {
             continue;
           }
-          // the start covariance is always transported
-          Eigen::Map<RowMatrix6>(cov + 36 * i) = end->covariance().value();
-          Eigen::Map<Acts::BoundVector>(out + 6 * i) = end->parameters();
-          good[i] = end->parameters().allFinite();
-        } catch (const std::exception& e) {
-          ++errors[e.what()];
+          if (!startCov.allFinite() || dir.norm() == 0.0) {
+            ++errors["non-finite start covariance or zero direction"];
+            continue;
+          }
+          try {
+            const auto start = Acts::BoundTrackParameters::createCurvilinear(
+                Acts::Vector4(pos.x(), pos.y(), pos.z(), 0.0), dir.normalized(), Q[i], startCov,
+                Acts::ParticleHypothesis::pion());
+            std::string error;
+            std::optional<Acts::BoundTrackParameters> end;
+            if (m_geometryPropagator) {
+              GeometryOptions options(m_geometryContext, m_fieldContext);
+              options.actorList.get<Acts::MaterialInteractor>().energyLoss = m_energyLoss;
+              end = run(*m_geometryPropagator, options, start, error);
+            } else {
+              end = run(*m_fieldPropagator, FieldPropagator::Options<>(m_geometryContext, m_fieldContext), start, error);
+            }
+            if (!end) {
+              ++errors[error];
+              continue;
+            }
+            // the start covariance is always transported
+            if (!end->parameters().allFinite() || !end->covariance().value().allFinite()) {
+              ++errors["non-finite perigee parameters or covariance"];
+              continue;
+            }
+            Eigen::Map<RowMatrix6>(cov + 36 * i) = end->covariance().value();
+            Eigen::Map<Acts::BoundVector>(out + 6 * i) = end->parameters();
+            good[i] = true;
+          } catch (const std::exception& e) {
+            ++errors[e.what()];
+          }
         }
+      } catch (...) {
+        failure = std::current_exception();
       }
     };
     {
       py::gil_scoped_release release;
-      std::vector<std::thread> pool;
+      // jthreads join when the pool goes, also when starting one throws
+      std::vector<std::jthread> pool;
       for (std::size_t t = 0; t < nThreads; ++t) {
-        pool.emplace_back(work, n * t / nThreads, n * (t + 1) / nThreads, std::ref(threadErrors[t]));
+        pool.emplace_back(work, n * t / nThreads, n * (t + 1) / nThreads, std::ref(threadErrors[t]),
+                          std::ref(threadFailures[t]));
       }
-      for (auto& thread : pool) {
-        thread.join();
+    }
+    for (const auto& failure : threadFailures) {
+      if (failure) {
+        std::rethrow_exception(failure);
       }
     }
     std::map<std::string, std::size_t> errors;

@@ -66,11 +66,6 @@ def main():
     parser.set_defaults(usepretrain=True)
     parser.add_argument("--train_batch_size", default=32, type=int, help="train batch size")
     parser.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility")
-    parser.add_argument("--feature_cache", default=None, type=str,
-                        help="Directory of precomputed frozen-backbone features "
-                             "(scripts/cache_features.py). Skips the backbone forward.")
-    parser.add_argument("--feature_cache_val", default=None, type=str,
-                        help="Feature cache for the validation split")
     args = parser.parse_args()
 
     # seed before anything touches an RNG
@@ -96,8 +91,6 @@ def main():
     params.num_embedder_layers = 0
     params.return_reg_test = True        # loaders then yield reg (truth) as a 4th element
     params.return_dict = False
-    params.feature_cache = args.feature_cache
-    params.feature_cache_val = args.feature_cache_val
 
     # Launch and train
     trainer = DownstreamTrainer(params, args)

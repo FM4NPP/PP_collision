@@ -235,12 +235,10 @@ def main():
         params.pretrained_ckpt = args.pretrained_ckpt
     elif not getattr(params, "pretrained_ckpt", None):
         sys.exit(f"config {args.config!r} has no pretrained_ckpt; add one to the YAML or pass --pretrained_ckpt")
-    params.limit_data = True
-    params.limit_size = args.eventnumber
     # the seed suffix train_track_finding.py adds
     seed_suffix = "" if args.no_seed_in_ckpt else f"_seed{args.seed}"
     pretrain_suffix = "" if args.usepretrain else "_nopretrain"
-    checkpoint_name = (f"{args.track_config}_nerf_tracking_head_d{params.limit_size}_{args.run_num}"
+    checkpoint_name = (f"{args.track_config}_nerf_tracking_head_d{args.eventnumber}_{args.run_num}"
                        f"{seed_suffix}{pretrain_suffix}_checkpoint.pth")
     if args.data_root_test:
         params.data_root_test = args.data_root_test

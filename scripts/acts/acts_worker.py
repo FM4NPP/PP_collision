@@ -6,7 +6,7 @@ streams batches:
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
 
 Config (VertexHead.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
-geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (null: all cores).
+geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (null: the CPUs this process may use).
 
 Protocol, after the line ACTS_WORKER_READY: n (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
 covariance (n, 6, 6); reply float64 params (n, 6), covariance (n, 6, 6), then ok (n,) uint8. States are
@@ -69,7 +69,7 @@ def build_propagator(config):
     propagator = acts_perigee_propagator.PerigeePropagator(
         field=field, reference=[float(v) for v in config["reference"]], geometry=geometry,
         energy_loss=bool(config["energy_loss"]), max_steps=int(config["max_steps"] or 0),
-        threads=int(config["threads"] or 0))
+        threads=int(config["threads"] if config["threads"] is not None else len(os.sched_getaffinity(0))))
     return propagator, (field, detector, geometry)
 
 

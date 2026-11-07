@@ -35,7 +35,6 @@ from fm4npp.models.linformer_gpt import LinformerGPT
 
 
 from trackinghead import *
-from cached_dataset import get_cached_data_loader
 import csv
 
 import vertexhead
@@ -332,9 +331,7 @@ class DownstreamTrainer():
                                           warmup_steps=self.params.warmup_steps)
 
         
-        # get the dataloaders (with a feature cache: the frozen backbone's features, read instead of computed)
-        self.feature_cache = getattr(self.params, 'feature_cache', None)
-        self.feature_cache_val = getattr(self.params, 'feature_cache_val', None)
+        # get the dataloaders
         if not train:
             # the eval: the test loader. get_data_loader (shared) builds the training set too; limited to its first
             # event it is not scanned (all its events otherwise)
@@ -342,27 +339,6 @@ class DownstreamTrainer():
             loader_params.limit_data, loader_params.limit_size = True, 1
             self.train_data_loader = self.train_sampler = None
             _, _, self.val_data_loader, _ = get_data_loader(loader_params, dist.is_initialized())
-        elif self.feature_cache:
-            self.train_data_loader, ds_tr = get_cached_data_loader(
-                self.feature_cache, batch_size=self.params.local_batch_size, shuffle=True,
-                num_workers=self.params.num_data_workers, limit_size=self.params.limit_size)
-            self.train_sampler = None
-            if ds_tr.embed_dim != self.params.embed_dim:
-                raise ValueError(
-                    f'feature cache width {ds_tr.embed_dim} != config embed_dim '
-                    f'{self.params.embed_dim} -- wrong cache for this config')
-            # a combined cache holds the layer-weighted sum, not each layer: the head is built with one feature layer
-            self.cache_combined = ds_tr.combine_layers
-            if self.cache_combined:
-                self.cache_layer_weights = ds_tr.layer_weights
-                print(f'[cache] layer-combined cache: head layer mixing frozen to '
-                      f'{[round(w, 4) for w in (self.cache_layer_weights or [])]}')
-            if self.feature_cache_val:
-                self.val_data_loader, _ = get_cached_data_loader(
-                    self.feature_cache_val, batch_size=self.params.local_valid_batch_size,
-                    shuffle=False, num_workers=self.params.num_data_workers)
-            else:
-                _, _, self.val_data_loader, _ = get_data_loader(self.params, dist.is_initialized())
         else:
             self.train_data_loader, self.train_sampler, self.val_data_loader, _ = get_data_loader(self.params,
                                                                                                   dist.is_initialized())
