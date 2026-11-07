@@ -748,6 +748,8 @@ class DownstreamTrainer():
         chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
         pending = []        # loader batches waiting for VertexHead (CPU copies)
         pool, job = ThreadPoolExecutor(max_workers=1), [None]
+        # VertexHead on the GPU queues on its own stream, so the main loop's syncs and copies do not wait for it
+        stream = torch.cuda.Stream(self.vertex_device) if self.vertex_device.type == "cuda" else None
 
         def finish(records):
             """Truth labels and VertexHead over these batches, then their metrics inputs and CSV rows (the background
@@ -759,7 +761,8 @@ class DownstreamTrainer():
                 r["truth"] = get_vertex_label(r["reg"], particle_id=r["label"], valid_tracks=(
                     torch.hypot(r["reg"][..., 3], r["reg"][..., 4]) < 1.0) & r["mask"])
             t1 = time.perf_counter()
-            fitted = self._vertex_head_chunk(records)
+            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                fitted = self._vertex_head_chunk(records)
             t2 = time.perf_counter()
             for r, (vertex, valid) in zip(records, fitted):
                 if save_csv:
@@ -789,7 +792,8 @@ class DownstreamTrainer():
         timing = dict.fromkeys(stages, 0.0)
         for key in vertexhead.ACTS_TIMING:
             vertexhead.ACTS_TIMING[key] = type(vertexhead.ACTS_TIMING[key])(0)
-        sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+        # the main loop's own stream only (VertexHead runs on another)
+        sync = (lambda: torch.cuda.current_stream().synchronize()) if torch.cuda.is_available() else (lambda: None)
         clock = [time.perf_counter()]
         start, n_seen = clock[0], 0
         cpu = lambda v: v.cpu() if torch.is_tensor(v) else (  # noqa: E731
