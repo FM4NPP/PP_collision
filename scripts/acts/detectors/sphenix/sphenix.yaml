@@ -33,6 +33,10 @@ acts:                          # use_acts is on when image (or command) is set
   energy_loss: false           # energy loss in the material map's material
   max_steps: null              # ACTS's propagation step limit (null: ACTS's default)
   threads: null                # propagation threads (null: the CPUs the process may use)
+  particle_pdg: 211            # tracks' particle (PDG id; its mass sets energy loss and multiple scattering in material)
+  particle_mass: null          # GeV (null: ACTS's mass for particle_pdg)
+  kalman_refit: true           # ACTS Kalman fit of each track's hits (hit_errors_cm) before the perigee propagation
+  kalman_start_covariance_scale: 100.0   # the fit's start: the hit fit's covariance at the outermost hit x this
 
 # any other VertexHead argument (VertexHead's defaults otherwise)
 vertex_head: {}

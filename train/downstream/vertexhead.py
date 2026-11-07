@@ -190,7 +190,7 @@ def _helix_from_hits(points, hit_r, track, assigned, n_tracks, Bz, min_hits, bea
             pT, theta, qop, beam_dca (closest approach of the circle to the beam line) (B, T).
             circle_centre (B, T, 2), R_s, zslope, z0 (B, T): the circle and z line z = zslope * s + z0
                 (s from _arc_length); hit_s (B, N) each hit's s on its track.
-            innermost (B, T): index of each track's innermost hit (0 for a track with none).
+            innermost, outermost (B, T): index of each track's innermost and outermost hit (0 for a track with none).
     """
     x, y, z = (points[..., k].double() for k in (1, 2, 3))
     r = hit_r.double()
@@ -226,7 +226,7 @@ def _helix_from_hits(points, hit_r, track, assigned, n_tracks, Bz, min_hits, bea
     return {
         "pT": pT, "theta": theta, "qop": q * torch.sin(theta) / pT, "beam_dca": beam_dca,
         "circle_centre": torch.where(fit_ok.unsqueeze(-1), torch.stack([xc, yc], dim=-1), nan.unsqueeze(-1)),
-        "R_s": R_s, "zslope": zslope, "z0": z0, "hit_s": s, "innermost": i_in,
+        "R_s": R_s, "zslope": zslope, "z0": z0, "hit_s": s, "innermost": i_in, "outermost": i_out,
     }
 
 def _track_covariance(s, track, assigned, n_tracks, theta, qop, s_reference, sigma_rphi, sigma_z, Bz, curvilinear,
@@ -402,17 +402,18 @@ class _ActsWorker:
                     log.write(line)
         ACTS_TIMING["start_s"] += time.perf_counter() - t0
 
-    def propagate(self, position, direction, qop, covariance):
+    def propagate(self, position, direction, qop, covariance, hit_track, hits):
         """
         States in mm (position, direction (n, 3), qop (n,), covariance (n, 6, 6)) propagated backward to the
-        perigee: parameters (n, 6), ok (n,) and covariance (n, 6, 6).
+        perigee, with the Kalman refit's hits (hits (m, 3) mm, hit_track (m,) their state's index, sorted; m = 0
+        without it): parameters (n, 6), ok (n,) and covariance (n, 6, 6).
         """
         import numpy as np
         self.wait_ready()
         t0 = time.perf_counter()
         n = len(qop)
-        self.process.stdin.write(struct.pack("<Q", n) + b"".join(
-            np.ascontiguousarray(a, "<f8").tobytes() for a in (position, direction, qop, covariance)))
+        self.process.stdin.write(struct.pack("<QQ", n, len(hit_track)) + b"".join(
+            np.ascontiguousarray(a, "<f8").tobytes() for a in (position, direction, qop, covariance, hit_track, hits)))
         self.process.stdin.flush()
         reply = self.process.stdout.read(n * 337)
         if len(reply) != n * 337:
@@ -666,7 +667,11 @@ class VertexHead(nn.Module):
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped; no
             gradient flows through ACTS: its tracks are constants for training);
             acts_image or acts_command, acts_geometry + acts_geometry_config, acts_material_map, acts_energy_loss,
-            acts_max_steps, acts_threads (propagation threads; None: the CPUs it may use) configure it.
+            acts_max_steps, acts_threads (propagation threads; None: the CPUs it may use), acts_particle_pdg and
+            acts_particle_mass (GeV; None: ACTS's mass for the PDG id; the tracks' particle, which sets energy loss and
+            multiple scattering in material) configure it. acts_kalman_refit: ACTS's Kalman fitter first refits each
+            track's hits (hit_sigma_rphi, hit_sigma_z), from the hit fit's state at the outermost hit with its
+            covariance x acts_kalman_start_covariance_scale.
         find_secondary: find SVs; refit_pv: report the PV refitted with SV tracks shared.
         sv_min_track_pv_chi2, sv_min_track_beam_significance: SV candidate cuts.
         max_pair_doca (cm): seed pairs; sv_max_track_chi2: tracks attached to a seed.
@@ -695,6 +700,10 @@ class VertexHead(nn.Module):
         acts_geometry_config: str = None,
         acts_material_map: str = None,
         acts_energy_loss: bool = False,
+        acts_particle_pdg: int = 211,
+        acts_particle_mass: float = None,
+        acts_kalman_refit: bool = True,
+        acts_kalman_start_covariance_scale: float = 100.0,
         hit_sigma_rphi: float = 0.034,
         hit_sigma_z: float = 0.1,
         track_error_scale: float = 2.5,
@@ -741,6 +750,10 @@ class VertexHead(nn.Module):
         self.acts_geometry_config = acts_geometry_config
         self.acts_material_map = acts_material_map
         self.acts_energy_loss = acts_energy_loss
+        self.acts_particle_pdg = acts_particle_pdg
+        self.acts_particle_mass = acts_particle_mass
+        self.acts_kalman_refit = acts_kalman_refit
+        self.acts_kalman_start_covariance_scale = acts_kalman_start_covariance_scale
         if (acts_geometry is None) != (acts_geometry_config is None) or ((acts_material_map or acts_energy_loss) and not acts_geometry):
             raise ValueError("acts_geometry and acts_geometry_config go together; acts_material_map and "
                              "acts_energy_loss need both")
@@ -826,6 +839,10 @@ class VertexHead(nn.Module):
             "acts_energy_loss": acts.get("energy_loss"),
             "acts_max_steps": acts.get("max_steps"),
             "acts_threads": acts.get("threads"),
+            "acts_particle_pdg": acts.get("particle_pdg"),
+            "acts_particle_mass": acts.get("particle_mass"),
+            "acts_kalman_refit": acts.get("kalman_refit"),
+            "acts_kalman_start_covariance_scale": acts.get("kalman_start_covariance_scale"),
             **(d.get("vertex_head") or {}),
         }
         unknown = sorted(set(d.get("vertex_head") or {}) - set(inspect.signature(cls.__init__).parameters))
@@ -859,7 +876,9 @@ class VertexHead(nn.Module):
                 "bz_tesla": self.Bz, "field_map": self.field_map, "field_map_kind": self.field_map_kind,
                 "max_steps": self.acts_max_steps, "threads": self.acts_threads, "geometry": self.acts_geometry,
                 "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
-                "energy_loss": self.acts_energy_loss}
+                "energy_loss": self.acts_energy_loss, "particle_pdg": self.acts_particle_pdg,
+                "particle_mass": self.acts_particle_mass, "kalman_refit": self.acts_kalman_refit,
+                "hit_sigma": [self.hit_sigma_rphi * MM_PER_CM, self.hit_sigma_z * MM_PER_CM]}
 
     def _usable(self, pT, beam_dca):
         """The track usability cuts: pT >= noise_pt_threshold and beam_dca < valid_radius (False where NaN)."""
@@ -1053,15 +1072,14 @@ class VertexHead(nn.Module):
         points=None,
         padding_mask=None,
         track_parameters=None,
-        track_weight=None,
         track_covariance=None,
     ):
         """
         Args:
-            class_probs: (B, T, 2) P(empty), P(real); optional with track_parameters.
+            class_probs: (B, T, 2) P(empty), P(real).
             mask_probs: (B, N, T); points: (B, N, 4) normalized hits; padding_mask: (B, N), True = real.
             track_parameters, track_covariance: (B, T, 6), (B, T, 6, 6) given perigee tracks instead of hits
-                (ACTS units: mm); track_weight: (B, T), default 1.
+                (ACTS units: mm).
 
         Returns:
             dict (the PV: with find_secondary, refitted with the SV tracks shared where an event has an SV and the
@@ -1078,10 +1096,10 @@ class VertexHead(nn.Module):
                 sv_n_tracks (B, K), sv_track_mask, sv_track_dca (B, K, T), displaced_mask, displaced_weight (B, T).
         """
         acts_failed = track_sigma = None
+        base_weight = class_probs[..., 1]
         if track_parameters is None:
             # track model: hits in cm (padding zeroed), hard assignment, each track's circle and z line
             hits, hit_r = _unnormalize_hits(points.masked_fill(~padding_mask.unsqueeze(-1), 0.0), self.normalization)
-            total_hit_weight = (mask_probs * padding_mask.unsqueeze(-1).to(mask_probs.dtype)).sum(dim=1)
             # each real hit goes to its most probable track slot (none if all probabilities are 0)
             n_tracks = mask_probs.shape[-1]
             assigned = padding_mask & (mask_probs.max(dim=-1).values > 0)
@@ -1102,9 +1120,11 @@ class VertexHead(nn.Module):
                 helix["hit_s"], track, assigned, n_tracks, theta, qop, s_reference, self.hit_sigma_rphi, self.hit_sigma_z,
                 track_bz, curvilinear, self.min_hits)
             if self.use_acts:
-                # ACTS propagates the helix state at the innermost hit (mm) back to the beam spot
+                # ACTS propagates the helix state at the innermost hit (mm) back to the beam spot; with the Kalman
+                # refit, ACTS first fits the hits from the state at the outermost hit
                 start_xy, t_xy = _circle_point(centre, R_s, hits[..., 1:3].gather(
-                    1, helix["innermost"].unsqueeze(-1).expand(-1, -1, 2)).double())
+                    1, helix["outermost" if self.acts_kalman_refit else "innermost"].unsqueeze(-1).expand(-1, -1, 2)
+                ).double())
                 start_s = _arc_length(start_xy[..., 0], start_xy[..., 1], centre[..., 0], centre[..., 1], R_s,
                                       self.beam_position)
                 start_z = start_s * zslope + helix["z0"]
@@ -1113,23 +1133,29 @@ class VertexHead(nn.Module):
                 to_mm = qop.new_tensor([MM_PER_CM, MM_PER_CM, 1.0, 1.0, 1.0])
                 start_covariance = qop.new_zeros(*qop.shape, 6, 6)
                 start_covariance[..., 5, 5] = 1.0
-                start_covariance[..., :5, :5] = hit_covariance(start_s, True) * to_mm[:, None] * to_mm[None, :]
+                start_covariance[..., :5, :5] = hit_covariance(start_s, True) * to_mm[:, None] * to_mm[None, :] * (
+                    self.acts_kalman_start_covariance_scale if self.acts_kalman_refit else 1.0)
                 start_covariance = start_covariance.reshape(-1, 6, 6).cpu().numpy()
+                # the refit's hits (mm): each with its state's index (event x T + slot), in order along the track
+                hit_track, hit_xyz = torch.empty(0), torch.empty(0, 3)
+                if self.acts_kalman_refit:
+                    hit_track = (torch.arange(track.shape[0], device=track.device).unsqueeze(1) * n_tracks + track)[assigned]
+                    order = torch.sort(helix["hit_s"][assigned], stable=True).indices
+                    order = order[torch.sort(hit_track[order], stable=True).indices]
+                    hit_track, hit_xyz = hit_track[order], hits[..., 1:4][assigned][order].double() * MM_PER_CM
                 acts_out = _acts_worker(self.acts_worker_command(), self.acts_worker_config()).propagate(
                     (torch.cat([start_xy, start_z.unsqueeze(-1)], dim=-1) * MM_PER_CM
                      ).reshape(-1, 3).cpu().numpy(), direction.reshape(-1, 3).cpu().numpy(),
-                    qop.reshape(-1).cpu().numpy(), start_covariance)
+                    qop.reshape(-1).cpu().numpy(), start_covariance, hit_track.cpu().numpy(), hit_xyz.cpu().numpy())
                 track_parameters = torch.from_numpy(acts_out[0]).reshape(*qop.shape, 6).to(hits.device)
                 acts_failed = self._usable(helix["pT"], helix["beam_dca"]) & ~torch.from_numpy(acts_out[1]).reshape(
                     qop.shape).to(hits.device)
                 track_covariance = torch.from_numpy(acts_out[2]).reshape(*qop.shape, 6, 6).to(hits.device)
-                track_weight = torch.ones_like(total_hit_weight)
             else:
                 # the hit fit as perigee tracks (cm); its circle comes back with the field its pT and charge came from
                 perigee, perigee_bz = _perigee_from_circle(centre, R_s, theta, helix["z0"], qop, self.beam_position), track_bz
                 covariance = hit_covariance(torch.zeros_like(theta), False)
                 track_sigma = torch.stack([covariance[..., 0, 0], covariance[..., 1, 1]], dim=-1).sqrt()
-                base_weight = class_probs[..., 1]
         if track_parameters is not None:
             perigee = track_parameters.double() / track_parameters.new_tensor(        # d0, z0, t: mm -> cm
                 [MM_PER_CM, MM_PER_CM, 1.0, 1.0, 1.0, MM_PER_CM], dtype=torch.float64)
@@ -1137,10 +1163,6 @@ class VertexHead(nn.Module):
             perigee_bz = self.Bz if self.field_map is None else _field_map(self.field_map, self.field_map_kind).bz(
                 torch.full_like(perigee[..., 1], self.beam_position[0]), torch.full_like(perigee[..., 1], self.beam_position[1]),
                 perigee[..., 1], MM_PER_CM)
-            if class_probs is None:
-                class_probs = torch.stack([torch.zeros_like(perigee[..., 0]), torch.ones_like(perigee[..., 0])],
-                                          dim=-1).to(track_parameters.dtype)
-            base_weight = class_probs[..., 1] * (1.0 if track_weight is None else track_weight)
             if track_covariance is None:
                 raise ValueError("track_parameters need their track_covariance")
             track_sigma = torch.stack([track_covariance[..., 0, 0], track_covariance[..., 1, 1]], dim=-1

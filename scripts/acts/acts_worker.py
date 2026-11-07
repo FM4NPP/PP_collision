@@ -6,10 +6,11 @@ streams batches:
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
 
 Config (VertexHead.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
-geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (null: the CPUs this process may use).
+geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (null: the CPUs this process may use),
+particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit and hit_sigma (r phi, z).
 
-Protocol, after the line ACTS_WORKER_READY: n (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
-covariance (n, 6, 6); reply float64 params (n, 6), covariance (n, 6, 6), then ok (n,) uint8. States are
+Protocol, after the line ACTS_WORKER_READY: n, m (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
+covariance (n, 6, 6), hit_track (m,), hits (m, 3) (the Kalman refit's hits); reply float64 params (n, 6), covariance (n, 6, 6), then ok (n,) uint8. States are
 propagated backward to the perigee. EOF ends it and prints a failure summary; everything else goes to stderr.
 """
 import collections
@@ -69,7 +70,9 @@ def build_propagator(config):
     propagator = acts_perigee_propagator.PerigeePropagator(
         field=field, reference=[float(v) for v in config["reference"]], geometry=geometry,
         energy_loss=bool(config["energy_loss"]), max_steps=int(config["max_steps"] or 0),
-        threads=int(config["threads"] if config["threads"] is not None else len(os.sched_getaffinity(0))))
+        threads=int(config["threads"] if config["threads"] is not None else len(os.sched_getaffinity(0))),
+        particle_pdg=int(config["particle_pdg"]), particle_mass=config["particle_mass"],
+        kalman_refit=bool(config["kalman_refit"]), hit_sigma=[float(v) for v in config["hit_sigma"]])
     return propagator, (field, detector, geometry)
 
 
@@ -90,7 +93,7 @@ def serve(config):
     out.flush()
     errors, attempted, propagated = collections.Counter(), 0, 0
     while True:
-        header = read_exact(stdin, 8)
+        header = read_exact(stdin, 16)
         if header is None:
             # at the end (VertexHead closes the worker at exit): why ACTS failed, for the dropped tracks
             print(f"ACTS worker: {propagated} of {attempted} states propagated" + ("; failures:" if errors else ""))
@@ -98,14 +101,15 @@ def serve(config):
                 print(f"  {count:7d}  {key}")
             sys.stdout.flush()
             return 0
-        (n,) = struct.unpack("<Q", header)
-        body = read_exact(stdin, n * 8 * 43)
+        n, m = struct.unpack("<QQ", header)
+        body = read_exact(stdin, n * 8 * 43 + m * 8 * 4)
         if body is None:
             return 1
         values = np.frombuffer(body, dtype="<f8")
         position, direction = values[: 3 * n].reshape(n, 3), values[3 * n: 6 * n].reshape(n, 3)
-        qop, covariance = values[6 * n: 7 * n], values[7 * n:].reshape(n, 6, 6)
-        params, cov, ok, failures = propagator.propagate(position, direction, qop, covariance)
+        qop, covariance = values[6 * n: 7 * n], values[7 * n: 43 * n].reshape(n, 6, 6)
+        hit_track, hits = values[43 * n: 43 * n + m], values[43 * n + m:].reshape(m, 3)
+        params, cov, ok, failures = propagator.propagate(position, direction, qop, covariance, hit_track, hits)
         errors.update(failures)
         attempted += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())
         propagated += int(ok.sum())
