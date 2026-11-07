@@ -10,7 +10,8 @@ VertexHead runs with the detector file's settings (PV and SVs). ACTS's finder as
 Gaussian seeder; its first vertex as the PV) runs on the same tracks with the same errors (x track_error_scale);
 it needs the detector file's ACTS image. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
 Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); VertexHead's SVs against
-truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*).
+truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*); with the Kalman refit,
+its failure rate per bin of track purity, hits, pT and |eta|.
 """
 import argparse
 import csv
@@ -72,7 +73,7 @@ def load_events(path, max_events, tracks="finder"):
     Per event: a function giving (class_probs, mask_probs, points, padding_mask) as VertexHead takes them (built on
     demand), the true vertex, per track slot whether it is a Geant secondary and its particle's truth production
     vertex, the number of primary vertices (test_truth_pv_index) and their truth positions (V, 3), ranked as
-    get_vertex_label ranks them.
+    get_vertex_label ranks them, and per track slot its purity (majority truth particle's share of its hits) and hits.
     """
     col = read_columns(path, max_events)
     nan_to = lambda name, value: np.where(np.isnan(col[name]), value, col[name]).astype(np.int64)  # noqa: E731
@@ -95,9 +96,11 @@ def load_events(path, max_events, tracks="finder"):
         # per track slot: secondary (majority truth ID < 0) and that particle's production vertex (first such hit)
         ids_kept, origin_kept = truth_id[hits][keep], origin_all[hits][keep]
         secondary, origin = np.zeros(n_slots, dtype=bool), np.full((n_slots, 3), np.nan)
+        purity, n_hits = np.zeros(n_slots), np.zeros(n_slots, dtype=np.int64)
         for t in range(n_slots):
             ids, counts = np.unique(ids_kept[slot == t], return_counts=True)
             secondary[t] = ids[counts.argmax()] < 0
+            purity[t], n_hits[t] = counts.max() / counts.sum(), counts.sum()
             origin[t] = origin_kept[np.flatnonzero((slot == t) & (ids_kept == ids[counts.argmax()]))[0]]
 
         def inputs(hits=hits, keep=keep, slot=slot, n_slots=n_slots):
@@ -109,13 +112,14 @@ def load_events(path, max_events, tracks="finder"):
                     torch.ones(1, len(hits), dtype=torch.bool))
         n_pv = int(np.nanmax(pv_index[hits], initial=-1)) + 1
         truth_pvs = np.array([origin_all[hits][pv_index[hits] == k].mean(axis=0) for k in range(n_pv)]).reshape(-1, 3)
-        events.append((inputs, true_vertex[hits[0]], secondary, origin, n_pv, truth_pvs))
+        events.append((inputs, true_vertex[hits[0]], secondary, origin, n_pv, truth_pvs, purity, n_hits))
     return events
 
 
 TRACK_KEYS = ("track_parameters", "track_covariance", "track_weight", "track_quality_mask", "track_sigma",
               "track_position", "track_direction", "track_vertex_weight", "track_chi2", "track_dca",
-              "track_closest_approach_point", "track_primary_vertex", "displaced_mask", "displaced_weight", "acts_failed")
+              "track_closest_approach_point", "track_primary_vertex", "displaced_mask", "displaced_weight", "acts_failed",
+              "acts_refit_failed")
 
 
 def run_chunk(head, inputs):
@@ -204,6 +208,29 @@ def sv_stats(outs, events, origin_tolerance):
             f"{str(sv_true) if residual else '':>8s} {f'{np.median(residual):.3f}' if residual else '':>8s}")
 
 
+REFIT_BINS = {"purity": (0.7, 0.9, 1.0), "hits": (15, 30, 45), "pT GeV": (0.3, 0.5, 1.0), "|eta|": (0.5, 1.0)}
+
+
+def refit_rows(tracks, outs, events):
+    """The refit table's rows: the Kalman refit's failure rate among the hit fit's usable tracks, per bin of purity,
+    hits, pT and |eta| (failed % / tracks; a bin's lower edge, inclusive)."""
+    values = {k: [] for k in ("failed", *REFIT_BINS)}
+    for o, e in zip(outs, events):
+        failed = o["acts_refit_failed"][0].numpy()
+        keep = o["track_quality_mask"][0].numpy() | failed
+        theta, qop = o["track_parameters"][0, :, 3].double().numpy(), o["track_parameters"][0, :, 4].double().numpy()
+        for key, v in zip(values, (failed, e[6], e[7], np.sin(theta) / np.abs(qop), np.abs(np.log(np.tan(theta / 2))))):
+            values[key].append(v[keep])
+    values = {k: np.concatenate(v) for k, v in values.items()}
+    rows = [f"{tracks:7s} {'all':8s} {values['failed'].mean():6.1%} / {len(values['failed'])}"]
+    for key, edges in REFIT_BINS.items():
+        b = np.digitize(np.nan_to_num(values[key], nan=0.0), edges)
+        cells = [f"{lo:>5}: {values['failed'][b == k].mean() if (b == k).any() else np.nan:6.1%} / {(b == k).sum():<6d}"
+                 for k, lo in enumerate((0, *edges))]
+        rows.append(f"{tracks:7s} {key:8s} " + "  ".join(cells))
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", required=True)
@@ -216,7 +243,7 @@ def main():
 
     head = vh.VertexHead.from_detector(args.detector, find_secondary=True).eval()
     head.tracks.start_acts()       # boots while the CSV loads
-    pv_rows, axis_rows, sv_rows, notes = [], [], [], []
+    pv_rows, axis_rows, sv_rows, refit, notes = [], [], [], [], []
     timing = dict.fromkeys(("reading the CSV", "VertexHead", "ACTS AMVF"), 0.0)
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
         t0 = time.perf_counter()
@@ -274,6 +301,8 @@ def main():
                            f"{'' if ms is None else f'{ms:7.1f}':>7s}")
             axis_rows.append(f"{label} " + " ".join(f"{x:7.4f}" for x in axes))
         sv_rows.append(f"{tracks:7s} {sv_stats(outs, events, args.origin_tolerance)}")
+        if "acts_refit_failed" in outs[0]:
+            refit += refit_rows(tracks, outs, events)
 
     head_row = f"{'tracks':7s} {'vertexing':12s}"
     print(f"\n{head_row} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} {'chi2/ndf':>8s} {'dropped':>7s} "
@@ -284,6 +313,9 @@ def main():
     print(f"\n{'tracks':7s} {'cands':>6s} {'sec. found':>11s} {'eff':>5s} {'pure':>5s} {'SVs':>5s} {'sec. tracks':>12s} "
           f"{'all-sec':>7s} {'true SVs':>8s} {'residual':>8s}   (VertexHead's SVs against truth; residual cm)",
           *sv_rows, sep="\n")
+    if refit:
+        print(f"\n{'tracks':7s} {'bin':8s} refit failed % / tracks, per bin (lower edge)   (the hit fit's usable "
+              "tracks; purity: the majority truth particle's share of a track's hits)", *refit, sep="\n")
     if notes:
         print("", *notes, sep="\n")
     print("\ntime: " + ", ".join(f"{name} {seconds:.1f} s" for name, seconds in timing.items()))

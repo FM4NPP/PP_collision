@@ -99,7 +99,7 @@ class VertexHead(nn.Module):
                 track_quality_mask, track_sigma (B, T, 2) d0, z0 errors (cm) x track_error_scale, track_vertex_weight
                 (B, T) each track's annealing weight in the PV fit, track_chi2, track_dca (B, T),
                 track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS;
-                acts_refit_failed (B, T) with the Kalman refit: propagated from the hit fit's state (refit failed);
+                acts_refit_failed (B, T) with the Kalman refit: usable by the hit fit, propagated from its state (refit failed);
                 track_covariance (B, T, 6, 6): the ACTS perigee covariance (mm), with use_acts (x
                 acts_kalman_fallback_covariance_scale where the refit failed) or as given.
                 With find_secondary: sv_estimate (B, K, 3), sv_is_valid, sv_chi2, sv_chi2_per_dof, sv_displacement,

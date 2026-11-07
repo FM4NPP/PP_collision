@@ -637,7 +637,7 @@ class TrackBuilder(nn.Module):
         if acts_failed is not None:
             outputs["acts_failed"] = acts_failed
         if refit_failed is not None:
-            outputs["acts_refit_failed"] = refit_failed
+            outputs["acts_refit_failed"] = refit_failed & self._usable(helix["pT"], helix["beam_dca"])
         if track_covariance is not None:
             outputs["track_covariance"] = track_covariance
         return {**outputs, "_helix": params["helix"], "_pT": params["pT"], "_beam_dca": params["beam_dca"], "_bad": bad}
