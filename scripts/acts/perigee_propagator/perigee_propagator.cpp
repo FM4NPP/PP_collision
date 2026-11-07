@@ -1,9 +1,9 @@
 // acts_perigee_propagator: ACTS propagation of track states backward to a perigee surface, with covariance, for
 // acts_worker.py; the one call ACTS's Python bindings lack. Takes the field and geometry objects the bindings
 // build. Without a geometry: field only (VoidNavigator); with one: navigated, with material (MaterialInteractor).
-// With the Kalman refit: each track's hits are first fitted by ACTS's Kalman fitter (each hit an (r phi, z)
-// measurement on its own cylinder, DirectNavigator, field only: no TPC gas material) outward from the track's
-// state just inside its innermost hit; the smoothed state at the innermost hit is then propagated to the perigee.
+// With the Kalman refit: each track's hits are first fitted by ACTS's Kalman fitter (each hit a measurement on
+// its own plane, through the hit and normal to the hit fit's direction there, so the track crosses it once;
+// DirectNavigator, field only: no TPC gas material) outward from the track's state just before its innermost hit; the smoothed state at the innermost hit is then propagated to the perigee.
 // States are split across threads (the propagator is const and keeps its state per call). Tracks are singly charged
 // particles of one hypothesis (PDG id, mass), which sets the energy loss and multiple scattering in material.
 // Units mm, GeV, e.
@@ -30,8 +30,8 @@
 #include <Acts/Propagator/Propagator.hpp>
 #include <Acts/Propagator/StandardAborters.hpp>
 #include <Acts/Propagator/VoidNavigator.hpp>
-#include <Acts/Surfaces/CylinderSurface.hpp>
 #include <Acts/Surfaces/PerigeeSurface.hpp>
+#include <Acts/Surfaces/PlaneSurface.hpp>
 #include <Acts/TrackFitting/GainMatrixSmoother.hpp>
 #include <Acts/TrackFitting/GainMatrixUpdater.hpp>
 #include <Acts/TrackFitting/KalmanFitter.hpp>
@@ -60,11 +60,10 @@ namespace py = pybind11;
 using Array = py::array_t<double, py::array::c_style | py::array::forcecast>;
 using RowMatrix6 = Eigen::Matrix<double, 6, 6, Eigen::RowMajor>;
 
-// the Kalman refit: a hit's cylinder is unbounded in z (mm); the fit starts this far (mm) before the innermost hit
-constexpr double kHitCylinderHalfZ = 1e6;
+// the Kalman refit starts this far (mm) before the innermost hit
 constexpr double kKalmanStartOffset = 10.0;
 
-// one hit as a Kalman fit measurement: (r phi, z) = (0, z) on its own cylinder, rotated so the hit is at phi = 0
+// one hit as a Kalman fit measurement: (0, 0) on its own plane, with its (r phi, z) errors seen on that plane
 struct HitLink {
   const Acts::Surface* surface;
   Acts::Vector2 value;
@@ -121,12 +120,13 @@ class PerigeePropagator {
       m_kalman.emplace(KalmanPropagator(Acts::EigenStepper<>(field), Acts::DirectNavigator(logger("DirectNavigator")),
                                         logger("KalmanPropagator")),
                        logger("KalmanFitter"));
-      m_hitCovariance = Acts::Vector2(hitSigma[0] * hitSigma[0], hitSigma[1] * hitSigma[1]).asDiagonal();
+      m_hitSigma = hitSigma;
     }
   }
 
   // position, direction (n, 3), q/p (n,) and covariance (n, 6, 6) (curvilinear, in the track's direction of
-  // travel; at the innermost hit) and the hits (m, 3) with their state's index hit_track (m,)
+  // travel; at the innermost hit) and the hits (m, 6: position, the hit fit's direction there) with their state's
+  // index hit_track (m,)
   // (sorted by it, each track's hits in order along it; none without the refit) -> perigee parameters (d0, z0, phi,
   // theta, q/p, t) (n, 6), their covariance (n, 6, 6) (both NaN where ACTS failed or an input is not finite),
   // ok (n,) and {error message: count}
@@ -137,9 +137,9 @@ class PerigeePropagator {
       return a.ndim() == static_cast<py::ssize_t>(shape.size()) && std::equal(shape.begin(), shape.end(), a.shape());
     };
     if (qop.ndim() != 1 || !shaped(position, {n, 3}) || !shaped(direction, {n, 3}) || !shaped(covariance, {n, 6, 6}) ||
-        hitTrack.ndim() != 1 || !shaped(hits, {m, 3})) {
+        hitTrack.ndim() != 1 || !shaped(hits, {m, 6})) {
       throw std::invalid_argument(
-          "position, direction (n, 3), qop (n,), covariance (n, 6, 6), hit_track (m,), hits (m, 3) expected");
+          "position, direction (n, 3), qop (n,), covariance (n, 6, 6), hit_track (m,), hits (m, 6) expected");
     }
     // each state's hits: [hitBegin[i], hitBegin[i + 1])
     const double* T = hitTrack.data();
@@ -191,7 +191,7 @@ class PerigeePropagator {
                 Acts::Vector4(at.x(), at.y(), at.z(), 0.0), dir.normalized(), Q[i], startCov, m_particle);
             std::string error;
             const std::optional<Acts::BoundTrackParameters> start =
-                m_kalman ? refit(state, H + 3 * hitBegin[i], hitBegin[i + 1] - hitBegin[i], error) : state;
+                m_kalman ? refit(state, H + 6 * hitBegin[i], hitBegin[i + 1] - hitBegin[i], error) : state;
             if (!start) {
               ++errors[error];
               continue;
@@ -256,17 +256,30 @@ class PerigeePropagator {
       error = "Kalman refit: no hits";
       return std::nullopt;
     }
-    std::vector<std::shared_ptr<Acts::CylinderSurface>> surfaces;
+    std::vector<std::shared_ptr<Acts::PlaneSurface>> surfaces;
     std::vector<const Acts::Surface*> sequence;
     std::vector<Acts::SourceLink> links;
     for (py::ssize_t j = 0; j < count; ++j) {
-      const Acts::Vector3 hit(hits[3 * j], hits[3 * j + 1], hits[3 * j + 2]);
+      const double* h = hits + 6 * j;
+      const Acts::Vector3 hit(h[0], h[1], h[2]);
+      const Acts::Vector3 normal = Acts::Vector3(h[3], h[4], h[5]).normalized();
+      // plane axes: u horizontal (z x normal), v = normal x u
+      const Acts::Vector3 u = Acts::Vector3::UnitZ().cross(normal).normalized();
       Acts::Transform3 transform = Acts::Transform3::Identity();
-      transform.rotate(Acts::AngleAxis3(std::atan2(hit.y(), hit.x()), Acts::Vector3::UnitZ()));
-      surfaces.push_back(Acts::Surface::makeShared<Acts::CylinderSurface>(transform, hit.head<2>().norm(),
-                                                                          kHitCylinderHalfZ));
+      transform.linear().col(0) = u;
+      transform.linear().col(1) = normal.cross(u);
+      transform.linear().col(2) = normal;
+      transform.translation() = hit;
+      surfaces.push_back(Acts::Surface::makeShared<Acts::PlaneSurface>(transform));
+      // the hit's errors along phi and z, projected onto the plane (along the track: first order)
+      const Acts::Vector3 ePhi = Acts::Vector3(-hit.y(), hit.x(), 0.0).normalized();
+      Eigen::Matrix<double, 3, 2> axes;
+      axes << transform.linear().col(0), transform.linear().col(1);
+      const Acts::SquareMatrix<3> spread = m_hitSigma[0] * m_hitSigma[0] * ePhi * ePhi.transpose() +
+                                           m_hitSigma[1] * m_hitSigma[1] * Acts::Vector3::UnitZ() *
+                                               Acts::Vector3::UnitZ().transpose();
       sequence.push_back(surfaces.back().get());
-      links.emplace_back(HitLink{surfaces.back().get(), Acts::Vector2(0.0, hit.z()), m_hitCovariance});
+      links.emplace_back(HitLink{surfaces.back().get(), Acts::Vector2::Zero(), axes.transpose() * spread * axes});
     }
     Acts::KalmanFitterExtensions<Acts::VectorMultiTrajectory> extensions;
     extensions.surfaceAccessor.connect<&hitSurface>();
@@ -336,7 +349,7 @@ class PerigeePropagator {
   Acts::CalibrationContext m_calibrationContext{};
   Acts::GainMatrixUpdater m_updater;
   Acts::GainMatrixSmoother m_smoother;
-  Acts::SquareMatrix<2> m_hitCovariance = Acts::SquareMatrix<2>::Zero();
+  std::array<double, 2> m_hitSigma{};
   Acts::ParticleHypothesis m_particle;
   std::shared_ptr<Acts::PerigeeSurface> m_surface;
   bool m_energyLoss;

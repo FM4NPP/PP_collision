@@ -405,7 +405,8 @@ class _ActsWorker:
     def propagate(self, position, direction, qop, covariance, hit_track, hits):
         """
         States in mm (position, direction (n, 3), qop (n,), covariance (n, 6, 6)) propagated backward to the
-        perigee, with the Kalman refit's hits (hits (m, 3) mm, hit_track (m,) their state's index, sorted; m = 0
+        perigee, with the Kalman refit's hits (hits (m, 6): position mm, the hit fit's direction there; hit_track (m,)
+        their state's index, sorted; m = 0
         without it): parameters (n, 6), ok (n,) and covariance (n, 6, 6).
         """
         import numpy as np
@@ -1135,13 +1136,19 @@ class VertexHead(nn.Module):
                 start_covariance[..., :5, :5] = hit_covariance(start_s, True) * to_mm[:, None] * to_mm[None, :] * (
                     self.acts_kalman_start_covariance_scale if self.acts_kalman_refit else 1.0)
                 start_covariance = start_covariance.reshape(-1, 6, 6).cpu().numpy()
-                # the refit's hits (mm): each with its state's index (event x T + slot), in order along the track
-                hit_track, hit_xyz = torch.empty(0), torch.empty(0, 3)
+                # the refit's hits: position (mm) and the helix direction there, each with its state's index
+                # (event x T + slot), in order along the track
+                hit_track, hit_xyz = torch.empty(0), torch.empty(0, 6)
                 if self.acts_kalman_refit:
                     hit_track = (torch.arange(track.shape[0], device=track.device).unsqueeze(1) * n_tracks + track)[assigned]
                     order = torch.sort(helix["hit_s"][assigned], stable=True).indices
                     order = order[torch.sort(hit_track[order], stable=True).indices]
-                    hit_track, hit_xyz = hit_track[order], hits[..., 1:4][assigned][order].double() * MM_PER_CM
+                    _, hit_t = _circle_point(centre.gather(1, track.unsqueeze(-1).expand(-1, -1, 2)), R_s.gather(1, track),
+                                             hits[..., 1:3].double())
+                    hit_theta = theta.gather(1, track).unsqueeze(-1)
+                    hit_xyz = torch.cat([hits[..., 1:4].double() * MM_PER_CM, torch.sin(hit_theta) * hit_t,
+                                         torch.cos(hit_theta)], dim=-1)[assigned][order]
+                    hit_track = hit_track[order]
                 acts_out = _acts_worker(self.acts_worker_command(), self.acts_worker_config()).propagate(
                     (torch.cat([start_xy, start_z.unsqueeze(-1)], dim=-1) * MM_PER_CM
                      ).reshape(-1, 3).cpu().numpy(), direction.reshape(-1, 3).cpu().numpy(),

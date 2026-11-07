@@ -10,7 +10,7 @@ geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (nu
 particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit and hit_sigma (r phi, z).
 
 Protocol, after the line ACTS_WORKER_READY: n, m (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
-covariance (n, 6, 6), hit_track (m,), hits (m, 3) (the Kalman refit's hits); reply float64 params (n, 6), covariance (n, 6, 6), then ok (n,) uint8. States are
+covariance (n, 6, 6), hit_track (m,), hits (m, 6) (the Kalman refit's hits: position, direction); reply float64 params (n, 6), covariance (n, 6, 6), then ok (n,) uint8. States are
 propagated backward to the perigee. EOF ends it and prints a failure summary; everything else goes to stderr.
 """
 import collections
@@ -102,13 +102,13 @@ def serve(config):
             sys.stdout.flush()
             return 0
         n, m = struct.unpack("<QQ", header)
-        body = read_exact(stdin, n * 8 * 43 + m * 8 * 4)
+        body = read_exact(stdin, n * 8 * 43 + m * 8 * 7)
         if body is None:
             return 1
         values = np.frombuffer(body, dtype="<f8")
         position, direction = values[: 3 * n].reshape(n, 3), values[3 * n: 6 * n].reshape(n, 3)
         qop, covariance = values[6 * n: 7 * n], values[7 * n: 43 * n].reshape(n, 6, 6)
-        hit_track, hits = values[43 * n: 43 * n + m], values[43 * n + m:].reshape(m, 3)
+        hit_track, hits = values[43 * n: 43 * n + m], values[43 * n + m:].reshape(m, 6)
         params, cov, ok, failures = propagator.propagate(position, direction, qop, covariance, hit_track, hits)
         errors.update(failures)
         attempted += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())
