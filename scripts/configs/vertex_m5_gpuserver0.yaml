@@ -24,5 +24,5 @@ root_dir: ~/vertex_eval        # runs in <backbone>/<track head>/e<events>/: dat
 
 # VertexHead: field, ACTS inputs and fit settings
 detector: sphenix_gpuserver0.yaml   # site detector file (scripts/run/vertexing.sh setup makes it)
-vertex_device: cuda           # VertexHead runs beside the backbone; on the GPU it is busy 11.5 against 26 ms/event
-vertex_chunk_events: 128      # on the CPU (Python-lock contention), same results (1000 events, 2026-11-06)
+vertex_device: cuda           # VertexHead's device (it runs beside the backbone)
+vertex_chunk_events: 128      # events per VertexHead call

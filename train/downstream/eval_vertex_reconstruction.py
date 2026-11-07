@@ -15,10 +15,8 @@ logs/vertex_eval_<N>.log (parameters, metrics) and metrics/vertex_eval_<N>.json 
 import os
 import sys
 import argparse
-import gc
 import json
 
-import torch
 
 # make sure the FM4NPP modules can be imported
 sys.path.append('../..')
@@ -89,7 +87,7 @@ def main():
         "--no_seed_in_ckpt",
         action="store_true",
         default=False,
-        help="Use a checkpoint name without the _seed<N> suffix (pre-B8 checkpoints)",
+        help="Use a checkpoint name without the _seed<N> suffix (older checkpoints)",
     )
     parser.add_argument(
         "--save_csv",
@@ -240,7 +238,7 @@ def main():
         sys.exit(f"config {args.config!r} has no pretrained_ckpt; add one to the YAML or pass --pretrained_ckpt")
     params.limit_data = True
     params.limit_size = args.eventnumber
-    # [FIX B8] mirror the seed suffix used by train_track_finding.py
+    # the seed suffix train_track_finding.py adds
     seed_suffix = "" if args.no_seed_in_ckpt else f"_seed{args.seed}"
     pretrain_suffix = "" if args.usepretrain else "_nopretrain"
     checkpoint_name = (f"{args.track_config}_nerf_tracking_head_d{params.limit_size}_{args.run_num}"
@@ -296,10 +294,6 @@ def main():
     if trainer.world_rank == 0 and not args.no_output:
         save_results(result, trainer, params, args, checkpoint_path)
     trainer.cleanup()
-
-    # Free GPU memory
-    torch.cuda.empty_cache()
-    gc.collect()
 
 
 def save_results(result, trainer, params, args, checkpoint_path):

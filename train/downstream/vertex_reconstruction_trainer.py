@@ -9,27 +9,19 @@ and test_* truth columns.
 """
 
 import numpy as np
-from sklearn.metrics import adjusted_rand_score
 import copy
 import os, sys, time
 import inspect
 import torch
 
-import torch.nn as nn
 import torch.nn.init as init
-import torch.nn.functional as F
-import gc, torch, torch.distributed as dist
+import gc, torch.distributed as dist
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 
-from torch.utils.data import Dataset
 from torch.nn.parallel import DistributedDataParallel
 
 from tqdm import tqdm 
-from ruamel.yaml import YAML
-import torch.optim as optim
-from torch.optim import lr_scheduler
-from collections import OrderedDict
 from cosine_annealing_warmup import CosineAnnealingWarmupRestarts # pip install 'git+https://github.com/katsura-jp/pytorch-cosine-annealing-with-warmup'
 
 sys.path.append('../..')
@@ -37,15 +29,11 @@ sys.path.append('../..')
 from fm4npp.utils import *
 from fm4npp.datasets.dataset import *
 from fm4npp.models.mambagpt import MambaGPT, Mamba1GPT
-from fm4npp.models.embed import *
-from fm4npp.models.rmsnorm import RMSNorm
-from fm4npp.models.mamba2 import Mamba2
 from fm4npp.models.longformer_gpt import LongformerGPT
 from fm4npp.models.linformer_gpt import LinformerGPT
 
 
 from trackinghead import *
-from loss import *
 from cached_dataset import get_cached_data_loader
 import csv
 
@@ -142,8 +130,7 @@ def per_point_columns(first_event, grouped, label, reg, mask, class_probs, mask_
 class DownstreamTrainer():
 
     # ------------------------------------------------------------------------------------------
-    # Infrastructure: verbatim copy of track_finding_trainer.DownstreamTrainer (everything except
-    # inference, train and the epoch loops). Bug fixes there must be repeated here.
+    # Infrastructure as in the other downstream trainers (track_finding_trainer, point_classification_trainer)
     # ------------------------------------------------------------------------------------------
 
     def _find_available_gpu(self, max_memory_threshold=1000):
@@ -242,26 +229,6 @@ class DownstreamTrainer():
         else:
             out = 'Important Details:\n' + ''.join(['{}: {}\n'.format(a, b) for a,b in D.items()])
         return out
-
-    def get_bin_index(self, seq_length):
-        """Find the appropriate bin for a given sequence length."""
-        for i in range(len(self.bins) - 1):
-            if self.bins[i] <= seq_length < self.bins[i + 1]:
-                return i
-        return len(self.bins) - 2  # Assign to last bin if out of range
-
-    def update_moving_average(self, bin_idx, loss_value):
-        """Update exponential moving average of loss per bin."""
-        self.loss_moving_avg[bin_idx] = (
-            self.smoothing_factor * self.loss_moving_avg[bin_idx] +
-            (1 - self.smoothing_factor) * loss_value
-        )
-
-    def compute_inverse_loss_weights(self):
-        """Compute inverse loss weights for each bin."""
-        weights = {i: 1 / (self.loss_moving_avg[i] + self.epsilon) for i in self.loss_moving_avg}
-        total_weight = sum(weights.values())
-        return {i: weights[i] / total_weight for i in weights}  # Normalize weights
 
     def launch(self, train=True):
         """Run folder, backbone (pretrained checkpoint), optimizer and loaders; train=False (the eval): the test
@@ -395,11 +362,7 @@ class DownstreamTrainer():
                                           warmup_steps=self.params.warmup_steps)
 
         
-        # get the dataloaders
-        # [B27] With a feature cache the frozen backbone forward and the CPU preprocessing
-        # are both skipped. Measured on one GB10 at batch 32: backbone 786 ms/batch (~45% of
-        # step time) and dataloading 379 ms (~22%). For the 175M model this is the difference
-        # between ~48 min/epoch and ~8 min/epoch.
+        # get the dataloaders (with a feature cache: the frozen backbone's features, read instead of computed)
         self.feature_cache = getattr(self.params, 'feature_cache', None)
         self.feature_cache_val = getattr(self.params, 'feature_cache_val', None)
         if not train:
@@ -418,10 +381,7 @@ class DownstreamTrainer():
                 raise ValueError(
                     f'feature cache width {ds_tr.embed_dim} != config embed_dim '
                     f'{self.params.embed_dim} -- wrong cache for this config')
-            # [B28] A combined cache stores the softmax-weighted sum over layers rather than
-            # the stack, which is 12x smaller (3,072 vs 36,864 bytes/point at width 1536 --
-            # the difference between 185 GB and 2.17 TB for the 70k split). The head must be
-            # told, so it builds with num_feature_layers=1 instead of 12.
+            # a combined cache holds the layer-weighted sum, not each layer: the head is built with one feature layer
             self.cache_combined = ds_tr.combine_layers
             if self.cache_combined:
                 self.cache_layer_weights = ds_tr.layer_weights
@@ -436,11 +396,6 @@ class DownstreamTrainer():
         else:
             self.train_data_loader, self.train_sampler, self.val_data_loader, _ = get_data_loader(self.params,
                                                                                                   dist.is_initialized())
-
-        # set loss functions
-        self.loss_func = nn.MSELoss(reduction='none')
-        self.centroid_loss_func = nn.MSELoss(reduction='none')
-        self.loss_func_eval = nn.MSELoss(reduction='none')
 
         # checkpointing
         self.iters = 0
@@ -473,16 +428,10 @@ class DownstreamTrainer():
 
         # 
         #  training
-        #self.train()
 
 
     def cleanup(self):
-        # 1) remove hooks
-        for hook_list in ("fwd_hooks", "bwd_hooks"):
-            for h in getattr(self, hook_list, []):
-                h.remove()
-
-        # 2) break references to big objects
+        # 1) break references to big objects
         for obj in ("model", "down_model",
                     "optimizer", "down_optimizer",
                     "scheduler", "down_scheduler",
@@ -490,11 +439,11 @@ class DownstreamTrainer():
             if hasattr(self, obj):
                 delattr(self, obj)
 
-        # 3) empty CUDA cache and run GC
+        # 2) empty CUDA cache and run GC
         torch.cuda.empty_cache()
         gc.collect()
 
-        # 4) tear down DDP if we set it up
+        # 3) tear down DDP if we set it up
         if dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
@@ -522,9 +471,6 @@ class DownstreamTrainer():
             checkpoint['lora_optimizer_state_dict'] = self.lora_optimizer.state_dict()
 
         torch.save(checkpoint, os.path.join(self.params.checkpoint_dir, filename))
-
-        msg = f"Saved {'best ' if is_best else ''}checkpoint at epoch {epoch} with loss {loss:.4f}"
-        #print(msg) if self.log_to_screen else None
 
     def load_checkpoint(self, checkpoint_path, inference=False):
         """Load checkpoint with proper device mapping and DDP handling.
@@ -574,40 +520,10 @@ class DownstreamTrainer():
     
 
 
-    def report_loss(self, loss_, dist):
-        step_loss = torch.zeros((1), dtype=torch.float32, device=self.device)
-        step_loss += loss_.detach()
-
-        if dist.is_initialized():
-            dist.all_reduce(step_loss)
-            loss_log = float(step_loss.item()/dist.get_world_size())
-        else:
-            loss_log = step_loss.item()
-        return loss_log
-
-    def set_portion_condition(self, tmask, portion = 0.2):
-        """tmask: a mask showing effective (i.e., non-padding area) region as 1"""
-        total = tmask.sum(-1)
-        condidx = torch.ceil(total * portion).long()        
-        index_tensor = torch.arange(tmask.size(1)).expand(tmask.size(0), -1).to(tmask.device)  # Shape (B, N)
-        newmask = (index_tensor < condidx.unsqueeze(1)).float()
-        return newmask.bool()
-
-
-    
-            
     def restore_checkpoint(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         new_state_dict = {k.replace('module.', ''): v for k, v in checkpoint['model_state'].items()}
-        #try:
-            #self.model.load_state_dict(checkpoint['model_state'])
         self.model.load_state_dict(new_state_dict)
-        #except:
-        #    new_state_dict = OrderedDict()
-        #    for key, val in checkpoint['model_state'].items():
-        #        name = key[7:]
-        #        new_state_dict[name] = val 
-        #    self.model.load_state_dict(new_state_dict)
 
         self.iters = checkpoint['iters']
         if self.train_data_loader is not None:     # the eval builds no train loader
