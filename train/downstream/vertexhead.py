@@ -655,6 +655,8 @@ class VertexHead(nn.Module):
             the adaptive fit (ACTS's defaults).
         density_seed: the adaptive fit's first weights from compatibility with the track-density seed on the beam line
             (ACTS's Gaussian seeder), not the all-track fit; seed_d0_significance, seed_z0_significance: its cuts.
+        seed_z_window, seed_z_window_softness (cm): the PV fit's track weights x sigmoid((window - |z0 - z_seed|) /
+            softness), a soft form of ACTS AMVF's 1 mm z preselection (sharper x-y, softer z); None: off.
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped);
             acts_image or acts_command, acts_geometry + acts_geometry_config, acts_material_map, acts_energy_loss,
             acts_max_steps configure it.
@@ -699,6 +701,8 @@ class VertexHead(nn.Module):
         density_seed: bool = True,
         seed_d0_significance: float = 3.5,
         seed_z0_significance: float = 12.0,
+        seed_z_window: float = None,
+        seed_z_window_softness: float = 0.02,
         sv_min_track_pv_chi2: float = 9.0,
         sv_min_track_beam_significance: float = 0.0,
         sv_max_track_chi2: float = 9.0,
@@ -743,6 +747,8 @@ class VertexHead(nn.Module):
         self.density_seed = density_seed
         self.seed_d0_significance = seed_d0_significance
         self.seed_z0_significance = seed_z0_significance
+        self.seed_z_window = seed_z_window
+        self.seed_z_window_softness = seed_z_window_softness
         self.sv_min_track_pv_chi2 = sv_min_track_pv_chi2
         self.sv_min_track_beam_significance = sv_min_track_beam_significance
         self.sv_max_track_chi2 = sv_max_track_chi2
@@ -917,9 +923,10 @@ class VertexHead(nn.Module):
                     break
         return fit, vertex_weight
 
-    def _find_secondary_vertices(self, pv_fit, track_position, track_direction, track_weight, params):
+    def _find_secondary_vertices(self, pv_fit, track_position, track_direction, track_weight, params, pv_weight=None):
         """
-        SV finding after the PV fit: the sv_* outputs, displaced_mask, displaced_weight and, with an SV, pv_refit.
+        SV finding after the PV fit: the sv_* outputs, displaced_mask, displaced_weight and, with an SV, pv_refit
+        (with pv_weight, the PV fit's weights; default track_weight).
         """
         n_events, n_tracks = track_weight.shape
         K = self.max_sv_per_event
@@ -1026,8 +1033,8 @@ class VertexHead(nn.Module):
             competing = torch.where(result["sv_track_mask"], sv_track_chi2.nan_to_num(nan=float("inf")),
                                     float("inf")).transpose(1, 2)
             result["pv_refit"], result["pv_refit_vertex_weight"] = self._fit_adaptive(
-                track_position, track_direction, track_weight, params, competing_chi2=competing,
-                start=pv_fit["vertex_estimate"])
+                track_position, track_direction, track_weight if pv_weight is None else pv_weight, params,
+                competing_chi2=competing, start=pv_fit["vertex_estimate"])
         return result
 
     def forward(
@@ -1191,7 +1198,13 @@ class VertexHead(nn.Module):
             z = _density_seed(d0, z0, params["track_sigma"], track_weight, self.seed_d0_significance,
                               self.seed_z0_significance).to(dtype)
             seed = torch.stack([torch.full_like(z, self.beam_position[0]), torch.full_like(z, self.beam_position[1]), z], -1)
-        fit, vertex_weight = self._fit_adaptive(track_position, track_direction, track_weight, params, seed=seed)
+        # the PV fit's weights: with a z window, faded by each track's z0 distance from the seed (events without a
+        # seed: unchanged); SV finding keeps track_weight
+        pv_weight = track_weight
+        if seed is not None and self.seed_z_window is not None:
+            fade = torch.sigmoid((self.seed_z_window - (z0.to(dtype) - seed[:, 2:]).abs()) / self.seed_z_window_softness)
+            pv_weight = track_weight * torch.where(torch.isfinite(seed[:, 2:]), fade.nan_to_num(0.0), 1.0)
+        fit, vertex_weight = self._fit_adaptive(track_position, track_direction, pv_weight, params, seed=seed)
 
         result = {
             "track_parameters": perigee.to(dtype),
@@ -1215,7 +1228,7 @@ class VertexHead(nn.Module):
                         bad.unsqueeze(-1), float("nan"))}
 
         if self.find_secondary:
-            secondary = self._find_secondary_vertices(fit, track_position, track_direction, track_weight, params)
+            secondary = self._find_secondary_vertices(fit, track_position, track_direction, track_weight, params, pv_weight)
             refit = secondary.pop("pv_refit", None)
             refit_vertex_weight = secondary.pop("pv_refit_vertex_weight", None)
             secondary["sv_track_dca"] = secondary["sv_track_dca"].masked_fill(bad.unsqueeze(1), float("nan"))
