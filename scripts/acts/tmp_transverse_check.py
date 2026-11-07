@@ -8,8 +8,9 @@ compare_vertexing (finder tracks):
 1. Correlations in the ACTS track covariance VertexHead's metric leaves out: d0-phi, d0-z0, z0-theta.
 2. On the events where ACTS finds a vertex, per axis: VertexHead, ACTS AMVF, and VertexHead seeded at ACTS's
    vertex (its first annealing weights from compatibility with it), and ACTS AMVF given only the (d0, z0) block and
-   the variances (what VertexHead's metric uses). Seeded VertexHead matching AMVF transversely
-   -> the gap is association (which tracks), not the metric.
+   the variances (what VertexHead's metric uses).
+3. VertexHead seeded at ACTS's vertex with ACTS AMVF's track preselection (|z0 - z_seed| < 1 mm, significance < 5):
+   matching AMVF transversely -> the gap is the hard preselection.
 """
 import argparse
 import os
@@ -65,13 +66,33 @@ def main():
                 seeded[e] = head(*event[0]())["vertex_estimate"][0].double().numpy()
     head._fit_adaptive = fit_adaptive
 
+    # 3. as 2, with ACTS AMVF's track preselection at the seed: |z0 - z_seed| < 1 mm (tracksMaxZinterval) and
+    #    impact-parameter significance < 5 (chi2 < 25, tracksMaxSignificance)
+    preselected = np.full_like(acts_pv, np.nan)
+
+    def fit_preselected(track_position, track_direction, track_weight, params, **k):
+        if k.get("seed") is not None:
+            k["seed"] = seed.to(track_position.dtype)
+            chi2 = cv.vh._track_compatibility(k["seed"], track_position, track_direction, params["track_sigma"])
+            near = (track_position[..., 2] - k["seed"][:, None, 2]).abs() < 0.1
+            track_weight = track_weight * (near & (chi2 < 25)).to(track_weight.dtype)
+        return fit_adaptive(track_position, track_direction, track_weight, params, **k)
+    with torch.no_grad():
+        for e, event in enumerate(events):
+            if np.isfinite(acts_pv[e]).all():
+                seed = torch.tensor(acts_pv[e][None])
+                head._fit_adaptive = fit_preselected
+                preselected[e] = head(*event[0]())["vertex_estimate"][0].double().numpy()
+    head._fit_adaptive = fit_adaptive
+
     on_acts = np.isfinite(acts_pv).all(axis=1)
     vertices = np.array([o["vertex_estimate"][0].double().numpy() for o in outs])
     print(f"\n{'ACTS events, finder tracks':28s} {'events':>6s} {'median':>7s} {'90%':>7s} {'<1cm':>6s} {'xy med':>7s} "
           f"{'|z| med':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (cm)")
     for name, v in (("VertexHead", np.where(on_acts[:, None], vertices, np.nan)), ("ACTS AMVF", acts_pv),
                     ("VertexHead seeded at ACTS", seeded),
-                    ("ACTS AMVF, no correlations", np.where(on_acts[:, None], acts_reduced, np.nan))):
+                    ("ACTS AMVF, no correlations", np.where(on_acts[:, None], acts_reduced, np.nan)),
+                    ("VH seeded + ACTS preselection", preselected)):
         (n, m, _, p90, within), axes = cv.pv_stats(v, events)
         print(f"{name:28s} {n:6d} {m:7.4f} {p90:7.4f} {within:6.1%} {axes[0]:7.4f} {axes[2]:7.4f} {axes[7]:7.4f} "
               f"{axes[8]:7.4f} {axes[9]:7.4f}")
