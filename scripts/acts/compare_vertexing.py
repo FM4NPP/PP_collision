@@ -11,7 +11,8 @@ Gaussian seeder; its first vertex as the PV) runs on the same tracks with the sa
 it needs the detector file's ACTS image. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
 Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); VertexHead's SVs against
 truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*); with the Kalman refit,
-its failure rate per bin of track purity, hits, pT and |eta|.
+its failure rate per bin of track purity, hits, pT and |eta|. VH AMVF evts / VH no AMVF: VertexHead on the events
+where AMVF found a vertex / found none.
 """
 import argparse
 import csv
@@ -270,6 +271,10 @@ def main():
             acts_pv, n_found = acts_vertices(head, outs)
             timing["ACTS AMVF"] += time.perf_counter() - t0
             runs.append(("ACTS AMVF", acts_pv, "", runs[0][3], None))
+            # VertexHead on the events where AMVF found a vertex (same events as its row) and on the rest
+            found = np.isfinite(acts_pv).all(axis=1, keepdims=True)
+            runs += [("VH AMVF evts", np.where(found, vertices, np.nan), "", runs[0][3], None),
+                     ("VH no AMVF", np.where(found, np.nan, vertices), "", runs[0][3], None)]
             distance = np.linalg.norm(acts_pv - vertices, axis=1)
             notes.append(f"{tracks} tracks: ACTS AMVF found {np.mean(n_found):.2f} vertices per event, none in "
                          f"{n_found.count(0)}; its first vertex - VertexHead's PV: median {np.nanmedian(distance):.4f} cm, "
