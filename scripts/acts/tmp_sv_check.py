@@ -44,9 +44,11 @@ def main():
         return find(pv_fit, track_position, track_direction, track_weight, params)
     head._find_secondary_vertices = capture
 
-    displacement, r_xy, seed_error, fit_error, found_error, n_tracks = [], [], [], [], [], []
+    displacement, r_xy, seed_error, fit_error, found_error, n_tracks, primary, event_index = [], [], [], [], [], [], [], []
+    n_events = 0
     with torch.no_grad():
         for inputs, truth, secondary, origin in cv.load_events(args.csv, args.max_events, "truth"):
+            n_events += 1
             out = head(*inputs)
             usable = out["track_quality_mask"][0].numpy() & np.isfinite(origin).all(axis=1)
             displaced = usable & (np.linalg.norm(origin - truth, axis=1) > args.tolerance)
@@ -58,6 +60,8 @@ def main():
                 if len(group) < 2:
                     continue
                 true_sv = np.median(origin[group], axis=0)
+                primary.append(not secondary[group].any())
+                event_index.append(n_events - 1)
                 displacement.append(np.linalg.norm(true_sv - truth))
                 r_xy.append(np.hypot(*true_sv[:2]))
                 n_tracks.append(len(group))
@@ -99,6 +103,20 @@ def main():
             print(f"  displacement {lo:>2}-{hi:<4} cm: {sel.sum():3d} SVs; seed error median "
                   f"{np.median(np.array(seed_error)[sel]):.3f}, fit error median {np.nanmedian(np.array(fit_error)[sel]):.3f}, "
                   f"found within 1 cm {(found_error[sel] < 1).sum()}")
+
+    # beam-line vertices (other collisions?) against vertices displaced from the beam line (decays?)
+    r_xy, primary, fit_error = np.array(r_xy), np.array(primary), np.array(fit_error)
+    print(f"\n{n_events} events")
+    for name, sel in (("on the beam line (r_xy < 0.1 cm)", r_xy < 0.1), ("off the beam line (r_xy >= 0.1 cm)", r_xy >= 0.1)):
+        if not sel.any():
+            continue
+        per_event = np.bincount(np.array(event_index)[sel], minlength=n_events)
+        print(f"  {name}: {sel.sum()} groups, all-primary tracks in {primary[sel].sum()}; per event "
+              f"{np.bincount(per_event).tolist()} (0, 1, 2, ...)")
+        quantiles("    displacement from the PV", displacement[sel])
+        quantiles("    transverse radius", r_xy[sel])
+        quantiles("    helix fit error, exactly its tracks", fit_error[sel])
+        print(f"    found within 1 cm: {(found_error[sel] < 1).sum()}")
 
 
 if __name__ == "__main__":
