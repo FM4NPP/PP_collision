@@ -180,7 +180,6 @@ class DownstreamTrainer():
             self.device = torch.device('cpu')
         
         self.params = params
-        self.use_lora = False
         self.use_amp = bool(getattr(self.params, 'use_amp', True))
         print("running on rank {} with world size {}".format(self.world_rank, self.world_size))
 
@@ -396,21 +395,6 @@ class DownstreamTrainer():
         self.restore_checkpoint(self.params.pretrained_ckpt)
         self.resumed = True
 
-        # LoRA: apply low-rank adapters to frozen backbone
-        if getattr(self.params, 'use_lora', False):
-            from fm4npp.models.lora import apply_lora_to_model, get_lora_params
-            target_modules = getattr(self.params, 'lora_target_modules', 'in_proj,out_proj,lin_B,lin_C').split(',')
-            lora_rank = getattr(self.params, 'lora_rank', 8)
-            lora_alpha = getattr(self.params, 'lora_alpha', 16)
-            n_lora = apply_lora_to_model(self.model, target_modules, lora_rank, lora_alpha)
-            self.use_lora = True
-            self.lora_optimizer = torch.optim.AdamW(
-                get_lora_params(self.model), lr=self.params.max_lr, weight_decay=0.01
-            )
-            total_backbone = sum(p.numel() for p in self.model.parameters())
-            trainable_backbone = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            print(f"LoRA applied: {n_lora} adapter params ({trainable_backbone}/{total_backbone} trainable in backbone)")
-
         self.startEpoch = 0
         self.epoch = self.startEpoch
         self.logs = {}
@@ -421,9 +405,9 @@ class DownstreamTrainer():
 
     def cleanup(self):
         # 1) break references to big objects
-        for obj in ("model", "down_model",
-                    "optimizer", "down_optimizer",
-                    "scheduler", "down_scheduler",
+        for obj in ("model", "down_model", "vertex_head",
+                    "optimizer", "vertex_optimizer",
+                    "scheduler", "vertex_scheduler",
                     "train_data_loader", "val_data_loader"):
             if hasattr(self, obj):
                 delattr(self, obj)
@@ -438,76 +422,33 @@ class DownstreamTrainer():
             dist.destroy_process_group()
         print("Cleanup complete. All resources released.")
 
+    # VertexHead's optimizer and scheduler (made by training) and their keys in a checkpoint
+    _TRAINING_STATE = (("optimizer_state_dict", "vertex_optimizer"), ("scheduler_state_dict", "vertex_scheduler"))
+
     def _save_checkpoint(self, filename, epoch, is_best, loss):
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.down_model.state_dict(),
-            'optimizer_state_dict': self.down_optimizer.state_dict(),
-            'scheduler_state_dict': self.down_scheduler.state_dict(),
-            'best_loss': self.best_loss,
-            'current_loss': loss,
-            'params': vars(self.params)  # Save all hyperparameters
-        }
-
-        # Handle DistributedDataParallel wrapper
-        if isinstance(self.down_model, torch.nn.parallel.DistributedDataParallel):
-            checkpoint['model_state_dict'] = self.down_model.module.state_dict()
-
-        if self.use_lora:
-            lora_state = {k: v for k, v in self.model.state_dict().items()
-                          if 'lora_A' in k or 'lora_B' in k}
-            checkpoint['lora_state_dict'] = lora_state
-            checkpoint['lora_optimizer_state_dict'] = self.lora_optimizer.state_dict()
-
+        """VertexHead's weights (its learnable parts; the backbone and track head stay frozen) and, once training has
+        made them, its optimizer and scheduler, with the run's params, to params.checkpoint_dir/filename."""
+        head = getattr(self.vertex_head, "module", self.vertex_head)          # DDP-wrapped or not
+        checkpoint = {"epoch": epoch, "model_state_dict": head.state_dict(), "best_loss": getattr(self, "best_loss", None),
+                      "current_loss": loss, "is_best": is_best, "params": vars(self.params)}
+        for key, name in self._TRAINING_STATE:
+            if getattr(self, name, None) is not None:
+                checkpoint[key] = getattr(self, name).state_dict()
         torch.save(checkpoint, os.path.join(self.params.checkpoint_dir, filename))
 
     def load_checkpoint(self, checkpoint_path, inference=False):
-        """Load checkpoint with proper device mapping and DDP handling.
-           If inference=True, only loads the model weights."""
-
-        # 1. Get proper device string
-        if isinstance(self.device, int):
-            device_str = f'cuda:{self.device}' if torch.cuda.is_available() else 'cpu'
-        else:
-            device_str = str(self.device)
-
-        # 2. Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=device_str, weights_only=False)
-
-        # 3. Handle DDP keys
-        state_dict = checkpoint['model_state_dict']
-        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-        # 4. Load model weights
-        if isinstance(self.down_model, torch.nn.parallel.DistributedDataParallel):
-            self.down_model.module.load_state_dict(new_state_dict, strict=False)
-        else:
-            self.down_model.load_state_dict(new_state_dict, strict=False)
-
-        # Load LoRA weights if present
-        if self.use_lora and 'lora_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['lora_state_dict'], strict=False)
-
-        # 5. If not inference mode, load optimizer/scheduler states
+        """VertexHead's weights from a _save_checkpoint file (strict: VertexHead's settings must match); without
+        inference also its optimizer and scheduler where training made them, the next epoch and the best loss."""
+        checkpoint, state = self._load_checkpoint_state(checkpoint_path, "model_state_dict")
+        getattr(self.vertex_head, "module", self.vertex_head).load_state_dict(state)
         if not inference:
-            self.down_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if self.down_scheduler is not None:
-                self.down_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-            if self.use_lora and 'lora_optimizer_state_dict' in checkpoint:
-                self.lora_optimizer.load_state_dict(checkpoint['lora_optimizer_state_dict'])
-
-            self.startEpoch = checkpoint.get('epoch', 0) + 1
-            self.best_loss = checkpoint.get('best_loss', float('inf'))
-
-        # 6. Log info
+            for key, name in self._TRAINING_STATE:
+                if getattr(self, name, None) is not None and key in checkpoint:
+                    getattr(self, name).load_state_dict(checkpoint[key])
+            self.startEpoch = checkpoint.get("epoch", 0) + 1
+            self.best_loss = checkpoint.get("best_loss") or float("inf")
         if self.log_to_screen:
             print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-
-
-
-    
-
 
     @staticmethod
     def _load_checkpoint_state(path, key):
@@ -527,20 +468,19 @@ class DownstreamTrainer():
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     # ------------------------------------------------------------------------------------------
-    # Machine-learning hooks (phase 2). Same names and signatures as the existing trainers'
-    # task-specific methods; VertexHead has no trainable parameters yet, so they are not implemented.
-    # launch() above already builds the train loader, optimizer, scheduler and LoRA, and
-    # _save_checkpoint / load_checkpoint save and load self.down_model, as the existing trainers do.
+    # Training (ML phase): the same names and signatures as the other trainers' methods. VertexHead's learnable
+    # parts (learn_weights) train with the backbone and track head frozen; launch() builds the train loader, and
+    # _save_checkpoint / load_checkpoint hold VertexHead and its optimizer and scheduler. The loss is to be written.
     # ------------------------------------------------------------------------------------------
 
     def train(self, pretrain=True, train_from_checkpoint=False, checkpoint_path=None):
-        raise NotImplementedError("VertexHead has no trainable parameters yet (phase 2)")
+        raise NotImplementedError("VertexHead training is not written yet (ML phase)")
 
     def downstream_end_to_end_one_epoch(self, pretrain=False):
-        raise NotImplementedError("VertexHead has no trainable parameters yet (phase 2)")
+        raise NotImplementedError("VertexHead training is not written yet (ML phase)")
 
     def validate_end_to_end_one_epoch(self, pretrain=False):
-        raise NotImplementedError("VertexHead has no trainable parameters yet (phase 2)")
+        raise NotImplementedError("VertexHead training is not written yet (ML phase)")
 
     # ------------------------------------------------------------------------------------------
     # VertexHead evaluation

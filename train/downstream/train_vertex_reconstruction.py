@@ -1,31 +1,16 @@
 #!/usr/bin/env python3
 """
-Vertex reconstruction training (phase 2), laid out like train_track_finding.py. VertexHead has no
-trainable parameters yet, so train() raises NotImplementedError; evaluate with
-eval_vertex_reconstruction.py. Artifacts: {config}_nerf_vertex_head_d{N}_{run}_seed{seed}.
+Vertex reconstruction training (ML phase), laid out like train_track_finding.py: VertexHead's learnable parts
+(learn_weights) with the backbone and track head frozen. The training loop is not written yet, so this script stops
+first; evaluate with eval_vertex_reconstruction.py. Artifacts: {config}_nerf_vertex_head_d{N}_{run}_seed{seed}.
 """
 import os
 import sys
 
-# TEMPORARY -- remove when phase 2 gives this script a real train(). Until the downstream
-# trainers were aligned with track/point, this file was the vertex *evaluation* script; stop
-# anyone still running it that way here, before the slow imports, instead of failing later
-# on an unknown flag or train()'s NotImplementedError.
+# until the training loop exists: stop before the slow imports
 if __name__ == "__main__":
-    sys.exit(
-        "train_vertex_reconstruction.py no longer evaluates vertices; it is reserved for phase-2\n"
-        "training, which does not exist yet. To run vertex reconstruction use:\n\n"
-        "    python eval_vertex_reconstruction.py --root_dir <out/> [--checkpoint <head.pth>]\n\n"
-        "Flags renamed to match eval_track_finding.py:\n"
-        "    --track_ckpt         -> --checkpoint\n"
-        "    --track_run_num      -> --run_num  (also names the run directory)\n"
-        "    --no-pretrain-track  -> --no-pretrain\n"
-        "    --max_events         -> --max_eval_events  (default now 20000)\n"
-        "    --save_csv           -> on by default; --no-csv to turn it off\n"
-        "Outputs now go to --root_dir, named after the log file\n"
-        "({track_config}_eval_vertex_head_d...log, _per_point_data.csv, _metrics.json, _results.npz).\n"
-        "See eval_vertex_reconstruction.py --help."
-    )
+    sys.exit("VertexHead training is not written yet (ML phase). To evaluate:\n\n"
+             "    scripts/run/vertexing.sh eval   (or python eval_vertex_reconstruction.py --run_config <file>)")
 
 import argparse
 import gc

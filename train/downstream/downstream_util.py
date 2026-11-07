@@ -81,57 +81,27 @@ def get_weakdecaylabel(mid):
         "weak_decay_class": weak_decay_class,  # B X N tensor with weak decay labels (1 for K0, 0 otherwise)
     }
 
-def get_vertex_label(reg, valid_tracks=None, valid_radius_cm=1.0, z_cut_cm=None, particle_id=None, tolerance_cm=1e-3,
-                     min_particles=2):
+def get_vertex_label(reg, valid_tracks, particle_id, tolerance_cm=1e-3, min_particles=2):
     """
-    Ground-truth vertices for VertexHead, per event. With particle_id: every primary vertex (an origin shared by
-    >= min_particles primary particles, truth ID >= 0; pileup gives several), ranked by particle count; the PV is
-    the first (no primary vertex: the origin most particles share). Without: the PV is the mean origin over the
-    valid hits, which lands between vertices when an event has more than one.
+    Ground-truth vertices for VertexHead, per event: every primary vertex (an origin shared by >= min_particles
+    primary particles, truth ID >= 0; pileup gives several), ranked by particle count; the PV is the first (without
+    a primary vertex: the origin most particles share).
 
     Args:
-        reg: (B, N, 8) - per-hit regression target tensor (same columns as get_trackinfo_noiselabel)
-        valid_tracks: (B, N) bool/int, optional - if None, recomputed exactly like
-            get_trackinfo_noiselabel: vtx_r = sqrt(vtx_x^2 + vtx_y^2) < valid_radius_cm
-            (NOTE: transverse-only cut, same as the original)
-        valid_radius_cm: transverse radius cut used when valid_tracks is None
-        z_cut_cm: optional float - if set, ALSO requires |vtx_z| < z_cut_cm
-        particle_id: (B, N) truth particle of each hit (seg_target; < 0: Geant secondary)
-        tolerance_cm: origins closer than this are one vertex; min_particles: particles making a primary vertex
+        reg: (B, N, 8) per-hit truth (the particle's production vertex vtx_x, vtx_y, vtx_z in columns 3-5, cm).
+        valid_tracks: (B, N) bool, the hits that count (e.g. real hits of particles starting near the beam line).
+        particle_id: (B, N) each hit's truth particle (seg_target; < 0: Geant secondary).
+        tolerance_cm: origins closer than this are one vertex; min_particles: particles making a primary vertex.
 
     Returns:
-        vertex_target: (B, 3) - the PV; the regression target for VertexHead
-        vertex_valid: (B,) bool - whether the event had >=1 valid hit (events with none should be excluded from
-            the loss, not trained toward a meaningless zero-vector target)
-        n_valid: (B,) long - how many hits contributed, for logging/debugging class imbalance
-        with particle_id also: primary_vertices (B, V, 3) (NaN padding), primary_vertex_particles (B, V),
-            n_primary_vertices (B,), hit_vertex (B, N) the rank of each hit's particle's primary vertex (-1: none)
+        vertex_target (B, 3) the PV (0 without valid hits); vertex_valid (B,) the event has a valid hit;
+        primary_vertices (B, V, 3) (NaN padding), primary_vertex_particles (B, V), n_primary_vertices (B,);
+        hit_vertex (B, N) the rank of each hit's particle's primary vertex (-1: none).
     """
-    vtx_x = reg[..., 3]
-    vtx_y = reg[..., 4]
-    vtx_z = reg[..., 5]
-
-    if valid_tracks is None:
-        vtx_r = torch.sqrt(vtx_x ** 2 + vtx_y ** 2)
-        valid_tracks = vtx_r < valid_radius_cm  # (B, N)
-        if z_cut_cm is not None:
-            valid_tracks = valid_tracks & (vtx_z.abs() < z_cut_cm)
-
-    valid_f = valid_tracks.float()  # (B, N)
-    n_valid = valid_f.sum(dim=-1)  # (B,)
-    counts = n_valid.clamp(min=1)  # avoid div-by-zero; masked out via vertex_valid anyway
-
-    vx = (vtx_x * valid_f).sum(dim=-1) / counts
-    vy = (vtx_y * valid_f).sum(dim=-1) / counts
-    vz = (vtx_z * valid_f).sum(dim=-1) / counts
-    vertex = torch.stack([vx, vy, vz], dim=-1)
-
-    result = {"vertex_target": vertex, "vertex_valid": n_valid > 0, "n_valid": n_valid.long()}
-    if particle_id is None:
-        return result
-
     device = reg.device
     particle_id, valid_tracks = particle_id.to(device), valid_tracks.to(device)
+    vertex = reg.new_zeros(reg.shape[0], 3)
+    result = {"vertex_target": vertex, "vertex_valid": valid_tracks.bool().any(dim=-1)}
     hit_vertex = torch.full(valid_tracks.shape, -1, dtype=torch.long, device=device)
     found = []
     for b in range(reg.shape[0]):
