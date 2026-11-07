@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import gc, torch, torch.distributed as dist
 from torch.amp import autocast
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 
 from torch.utils.data import Dataset
 from torch.nn.parallel import DistributedDataParallel
@@ -658,11 +659,11 @@ class DownstreamTrainer():
         self.vertex_head.start_acts()       # boots while the checkpoints and data load
 
     def _vertex_head(self, class_probs, mask_probs, points, padding_mask):
-        """VertexHead on its device (vertex_device); its tensor outputs back on the trainer's device."""
+        """VertexHead on its device (vertex_device); its tensor outputs back on the inputs' device."""
         d = self.vertex_device
         result = self.vertex_head(class_probs=class_probs.to(d), mask_probs=mask_probs.to(d), points=points.to(d),
                                   padding_mask=padding_mask.to(d))
-        move = lambda v: v.to(self.device) if torch.is_tensor(v) else (  # noqa: E731
+        move = lambda v: v.to(class_probs.device) if torch.is_tensor(v) else (  # noqa: E731
             {k: move(x) for k, x in v.items()} if isinstance(v, dict) else v)
         return {k: move(v) for k, v in result.items()}
 
@@ -729,28 +730,30 @@ class DownstreamTrainer():
     @torch.no_grad()
     def run_vertexing(self, pretrain=True, max_events=None, save_csv=False):
         """
-        Backbone and track head per loader batch; VertexHead per vertex_chunk_events events (default 32).
+        Backbone and track head per loader batch; VertexHead per vertex_chunk_events events (default 32), with the
+        metrics inputs and CSV rows, in a background thread on CPU copies while the GPU runs the next batches.
 
         Args:
             pretrain: backbone features (True) or raw points; max_events: limit (None: all); save_csv: build the CSV.
 
         Returns:
             dict: metrics (incl. time_<stage>_ms_per_event), vertex_estimate, vertex_target (n, 3), fit_is_valid (n,),
-            timing (seconds per stage), per_point (with save_csv).
+            timing (seconds busy per stage; the vertex_head and csv stages overlap the others), per_point (with
+            save_csv).
         """
         self.model.eval()
         amp = torch.cuda.is_available() and self.use_amp
         est, tgt, ok, per_point = [], [], [], []
         chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
-        pending = []        # loader batches waiting for VertexHead
+        pending = []        # loader batches waiting for VertexHead (CPU copies)
+        pool, job = ThreadPoolExecutor(max_workers=1), [None]
 
-        def flush():
-            """VertexHead over the pending batches, then their metrics inputs and CSV rows."""
-            if not pending:
-                return
-            fitted = self._vertex_head_chunk(pending)
-            lap("vertex_head")
-            for r, (vertex, valid) in zip(pending, fitted):
+        def finish(records):
+            """VertexHead over these batches, then their metrics inputs and CSV rows (the background thread)."""
+            t0 = time.perf_counter()
+            fitted = self._vertex_head_chunk(records)
+            t1 = time.perf_counter()
+            for r, (vertex, valid) in zip(records, fitted):
                 if save_csv:
                     truth_vertex = r["truth"]["vertex_target"].masked_fill(~r["truth"]["vertex_valid"][:, None],
                                                                            float("nan"))
@@ -760,14 +763,28 @@ class DownstreamTrainer():
                 est.append(vertex)
                 tgt.append(r["truth"]["vertex_target"])
                 ok.append(valid & r["truth"]["vertex_valid"])
-            pending.clear()
-            lap("truth_and_csv")
+            timing["vertex_head"] += t1 - t0
+            timing["csv"] += time.perf_counter() - t1
 
-        timing = dict.fromkeys(("data", "backbone", "track_head", "vertex_head", "truth_and_csv"), 0.0)
+        def flush():
+            """Hands the pending batches to the background thread once it has finished the previous chunk."""
+            if job[0] is not None:
+                job[0].result()
+                job[0] = None
+                lap("waiting")
+            if pending:
+                job[0] = pool.submit(finish, list(pending))
+                pending.clear()
+
+        stages = ("data", "backbone", "track_head", "truth", "waiting", "vertex_head", "csv")
+        timing = dict.fromkeys(stages, 0.0)
         for key in vertexhead.ACTS_TIMING:
             vertexhead.ACTS_TIMING[key] = type(vertexhead.ACTS_TIMING[key])(0)
         sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
         clock = [time.perf_counter()]
+        start, n_seen = clock[0], 0
+        cpu = lambda v: v.cpu() if torch.is_tensor(v) else (  # noqa: E731
+            {k: cpu(x) for k, x in v.items()} if isinstance(v, dict) else v)
 
         def lap(stage):
             sync()
@@ -799,16 +816,19 @@ class DownstreamTrainer():
             # origin shared by the most particles
             truth = get_vertex_label(reg, valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask,
                                      particle_id=label)
-            pending.append({"step": step, "grouped": grouped, "label": label, "reg": reg, "mask": mask, "truth": truth,
-                            "class_probs": out["class_probs"], "mask_probs": out["mask_probs"]})
-            lap("truth_and_csv")
-            n_seen = sum(len(x) for x in est) + sum(r["mask"].shape[0] for r in pending)
+            pending.append(cpu({"step": step, "grouped": grouped, "label": label, "reg": reg, "mask": mask,
+                                "truth": truth, "class_probs": out["class_probs"], "mask_probs": out["mask_probs"]}))
+            lap("truth")
+            n_seen += b
             last = bool(max_events) and n_seen >= max_events
             if last or sum(r["mask"].shape[0] for r in pending) >= chunk_events:
                 flush()
             if last:
                 break
         flush()              # the loader ended with a partial chunk
+        flush()              # and waits for it
+        pool.shutdown()
+        timing["wall"] = wall = time.perf_counter() - start
 
         est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)
         metrics = compute_vertex_metrics(est, tgt, ok)
@@ -820,11 +840,11 @@ class DownstreamTrainer():
         if self.log_to_screen:
             print("[vertex] " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
                                           for k, v in metrics.items() if not k.startswith("time_")))
-            total = sum(timing[k] for k in ("data", "backbone", "track_head", "vertex_head", "truth_and_csv"))
-            print(f"[vertex] time over {len(ok)} events: {total:.1f} s ({total / n_events * 1e3:.1f} ms/event)")
-            for k in ("data", "backbone", "track_head", "vertex_head", "truth_and_csv"):
+            print(f"[vertex] time over {len(ok)} events: {wall:.1f} s ({wall / n_events * 1e3:.1f} ms/event); busy "
+                  f"time per stage (vertex_head and csv run alongside the others; waiting: for them)")
+            for k in stages:
                 print(f"[vertex]   {k:14s} {timing[k]:8.2f} s  {timing[k] / n_events * 1e3:8.2f} ms/event  "
-                      f"{timing[k] / max(total, 1e-12):6.1%}")
+                      f"{timing[k] / max(wall, 1e-12):6.1%}")
             if timing["acts_start"] or timing["acts_propagate"]:
                 print(f"[vertex]     of which ACTS: worker start {timing['acts_start']:.2f} s, propagation "
                       f"{timing['acts_propagate']:.2f} s ({vertexhead.ACTS_TIMING['states']} track states)")

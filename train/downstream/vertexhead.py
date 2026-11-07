@@ -670,7 +670,7 @@ class VertexHead(nn.Module):
             weight x pT^2.
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped);
             acts_image or acts_command, acts_geometry + acts_geometry_config, acts_material_map, acts_energy_loss,
-            acts_max_steps configure it.
+            acts_max_steps, acts_threads (propagation threads; None: all cores) configure it.
         track_parameter_length_scale: cm per length unit of forward's track_parameters (ACTS mm: 0.1).
         find_secondary: find SVs; refit_pv: report the PV refitted with SV tracks shared.
         sv_min_track_pv_chi2, sv_min_track_beam_significance: SV candidate cuts.
@@ -697,6 +697,7 @@ class VertexHead(nn.Module):
         field_map: str = None,
         field_map_kind: str = "xyz",
         acts_max_steps: int = None,
+        acts_threads: int = None,
         acts_geometry: str = None,
         acts_geometry_config: str = None,
         acts_material_map: str = None,
@@ -744,6 +745,7 @@ class VertexHead(nn.Module):
         self.field_map = field_map
         self.field_map_kind = field_map_kind
         self.acts_max_steps = acts_max_steps
+        self.acts_threads = acts_threads
         self.acts_geometry = acts_geometry
         self.acts_geometry_config = acts_geometry_config
         self.acts_material_map = acts_material_map
@@ -830,6 +832,7 @@ class VertexHead(nn.Module):
             "acts_material_map": resolve(acts.get("material_map")),
             "acts_energy_loss": acts.get("energy_loss", True),
             "acts_max_steps": acts.get("max_steps"),
+            "acts_threads": acts.get("threads"),
             **(d.get("vertex_head") or {}),
         }
         unknown = sorted(set(d.get("vertex_head") or {}) - set(inspect.signature(cls.__init__).parameters))
@@ -864,7 +867,7 @@ class VertexHead(nn.Module):
         return {"reference": [self.beam_position[0] / self.track_parameter_length_scale,
                               self.beam_position[1] / self.track_parameter_length_scale, 0.0],
                 "bz_tesla": self.Bz, "field_map": self.field_map, "field_map_kind": self.field_map_kind,
-                "max_steps": self.acts_max_steps, "geometry": self.acts_geometry,
+                "max_steps": self.acts_max_steps, "threads": self.acts_threads, "geometry": self.acts_geometry,
                 "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
                 "energy_loss": self.acts_energy_loss}
 

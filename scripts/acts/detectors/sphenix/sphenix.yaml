@@ -32,6 +32,7 @@ acts:                          # use_acts is on when image (or command) is set
   material_map: null           # ACTS JSON material map, CDB key ACTSMATERIALMAP
   energy_loss: false           # neutral to slightly worse on the 100 test events (2026-11-04)
   max_steps: null              # ACTS's propagation step limit (null: ACTS's default)
+  threads: null                # propagation threads (null: all cores)
 
 # any other VertexHead argument (VertexHead's defaults otherwise; with ACTS and the material map the PV median was
 # 0.234 cm on 1000 test events, 0.247 cm with the own hit fit)

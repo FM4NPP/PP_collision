@@ -1,6 +1,7 @@
 // acts_perigee_propagator: ACTS propagation of track states backward to a perigee surface, with covariance, for
 // acts_worker.py; the one call ACTS's Python bindings lack. Takes the field and geometry objects the bindings
 // build. Without a geometry: field only (VoidNavigator); with one: navigated, with material (MaterialInteractor).
+// States are split across threads (the propagator is const and keeps its state per call).
 // Units mm, GeV, e.
 #include <Acts/Definitions/Algebra.hpp>
 #include <Acts/Definitions/Direction.hpp>
@@ -33,6 +34,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace py = pybind11;
 using Array = py::array_t<double, py::array::c_style | py::array::forcecast>;
@@ -45,12 +48,14 @@ class PerigeePropagator {
   using GeometryOptions = GeometryPropagator::Options<Acts::ActorList<Acts::MaterialInteractor, Acts::EndOfWorldReached>>;
 
   PerigeePropagator(std::shared_ptr<Acts::MagneticFieldProvider> field, std::array<double, 3> reference,
-                    std::shared_ptr<Acts::TrackingGeometry> geometry, bool energyLoss, std::size_t maxSteps)
+                    std::shared_ptr<Acts::TrackingGeometry> geometry, bool energyLoss, std::size_t maxSteps,
+                    std::size_t threads)
       : m_field(std::move(field)),
         m_geometry(std::move(geometry)),
         m_surface(Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3(reference[0], reference[1], reference[2]))),
         m_energyLoss(energyLoss),
-        m_maxSteps(maxSteps) {
+        m_maxSteps(maxSteps),
+        m_threads(threads > 0 ? threads : std::max(1u, std::thread::hardware_concurrency())) {
     // errors only: per-state warnings (e.g. a field lookup outside the map) are counted in the worker's failure summary
     auto logger = [](const char* name) { return Acts::getDefaultLogger(name, Acts::Logging::ERROR); };
     if (m_geometry) {
@@ -87,10 +92,11 @@ class PerigeePropagator {
     std::fill(out, out + 6 * n, std::numeric_limits<double>::quiet_NaN());
     std::fill(cov, cov + 36 * n, std::numeric_limits<double>::quiet_NaN());
     std::fill(good, good + n, false);
-    std::map<std::string, std::size_t> errors;
-    {
-      py::gil_scoped_release release;
-      for (py::ssize_t i = 0; i < n; ++i) {
+    const std::size_t nThreads = std::clamp<std::size_t>(m_threads, 1, std::max<py::ssize_t>(n, 1));
+    std::vector<std::map<std::string, std::size_t>> threadErrors(nThreads);
+    // states [first, last) on one thread; each state writes only its own output rows
+    auto work = [&](py::ssize_t first, py::ssize_t last, std::map<std::string, std::size_t>& errors) {
+      for (py::ssize_t i = first; i < last; ++i) {
         const Acts::Vector3 pos(P[3 * i], P[3 * i + 1], P[3 * i + 2]);
         const Acts::Vector3 dir(D[3 * i], D[3 * i + 1], D[3 * i + 2]);
         const Acts::BoundMatrix startCov = Eigen::Map<const RowMatrix6>(C + 36 * i);
@@ -123,6 +129,22 @@ class PerigeePropagator {
         } catch (const std::exception& e) {
           ++errors[e.what()];
         }
+      }
+    };
+    {
+      py::gil_scoped_release release;
+      std::vector<std::thread> pool;
+      for (std::size_t t = 0; t < nThreads; ++t) {
+        pool.emplace_back(work, n * t / nThreads, n * (t + 1) / nThreads, std::ref(threadErrors[t]));
+      }
+      for (auto& thread : pool) {
+        thread.join();
+      }
+    }
+    std::map<std::string, std::size_t> errors;
+    for (const auto& counts : threadErrors) {
+      for (const auto& [message, count] : counts) {
+        errors[message] += count;
       }
     }
     return py::make_tuple(params, covOut, ok, errors);
@@ -157,6 +179,7 @@ class PerigeePropagator {
   std::shared_ptr<Acts::PerigeeSurface> m_surface;
   bool m_energyLoss;
   std::size_t m_maxSteps;
+  std::size_t m_threads;
 };
 
 PYBIND11_MODULE(acts_perigee_propagator, m) {
@@ -164,9 +187,9 @@ PYBIND11_MODULE(acts_perigee_propagator, m) {
   py::module_::import("acts");  // registers TrackingGeometry and MagneticFieldProvider with pybind11
   py::class_<PerigeePropagator>(m, "PerigeePropagator")
       .def(py::init<std::shared_ptr<Acts::MagneticFieldProvider>, std::array<double, 3>,
-                    std::shared_ptr<Acts::TrackingGeometry>, bool, std::size_t>(),
+                    std::shared_ptr<Acts::TrackingGeometry>, bool, std::size_t, std::size_t>(),
            py::arg("field"), py::arg("reference"), py::arg("geometry") = py::none(), py::arg("energy_loss") = true,
-           py::arg("max_steps") = 0)
+           py::arg("max_steps") = 0, py::arg("threads") = 0)
       .def("propagate", &PerigeePropagator::propagate, py::arg("position"), py::arg("direction"), py::arg("qop"),
            py::arg("covariance"));
 }
