@@ -899,9 +899,10 @@ class VertexHead(nn.Module):
                             start=fit["vertex_estimate"], single_step=True)
             valid = new["fit_is_valid"]
             dx = (new["vertex_estimate"] - fit["vertex_estimate"]).nan_to_num().unsqueeze(-1)
-            relative_shift = (dx * torch.linalg.solve(new["vertex_covariance"].nan_to_num(nan=0.0)
-                                                      + (~valid).view(-1, 1, 1) * torch.eye(3, dtype=dx.dtype, device=dx.device), dx)
-                              ).sum(dim=(-2, -1))
+            # a singular covariance (rare) gives no shift measure: not converged (max iterations still apply)
+            shift, singular = torch.linalg.solve_ex(new["vertex_covariance"].nan_to_num(nan=0.0)
+                                                    + (~valid).view(-1, 1, 1) * torch.eye(3, dtype=dx.dtype, device=dx.device), dx)
+            relative_shift = torch.where(singular == 0, (dx * shift).sum(dim=(-2, -1)), torch.inf)
             update = valid & ~done
             fit = {k: torch.where(update.view(-1, *[1] * (v.dim() - 1)), v, fit[k]) for k, v in new.items()}
             # anneal after each update; after the last temperature each event stops once its shift is small
@@ -983,9 +984,11 @@ class VertexHead(nn.Module):
 
             # significance of the SV-PV distance, with both vertex covariances
             d = (fit["vertex_estimate"] - pv_position[event]).nan_to_num().unsqueeze(-1)
-            both = ((fit["vertex_covariance"] + pv_fit["vertex_covariance"][event]).nan_to_num(nan=0.0)
+            # (an invalid PV fit has no covariance: the SV's alone; a singular sum, rare: not far enough)
+            both = (fit["vertex_covariance"].nan_to_num(nan=0.0) + pv_fit["vertex_covariance"][event].nan_to_num(nan=0.0)
                     + (~fit["fit_is_valid"]).view(-1, 1, 1) * torch.eye(3, dtype=dtype, device=device))
-            far_enough = (d * torch.linalg.solve(both, d)).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2
+            solved, singular = torch.linalg.solve_ex(both, d)
+            far_enough = (singular == 0) & ((d * solved).sum(dim=(-2, -1)) >= self.sv_min_displacement_significance ** 2)
             is_ok = (fit["fit_is_valid"] & (n_used >= self.min_sv_tracks) & far_enough
                      & (chi2_per_dof.nan_to_num(nan=float("inf")) <= self.max_sv_chi2_per_dof))
 
