@@ -81,10 +81,13 @@ def get_weakdecaylabel(mid):
         "weak_decay_class": weak_decay_class,  # B X N tensor with weak decay labels (1 for K0, 0 otherwise)
     }
 
-def get_vertex_label(reg, valid_tracks=None, valid_radius_cm=1.0, z_cut_cm=None):
+def get_vertex_label(reg, valid_tracks=None, valid_radius_cm=1.0, z_cut_cm=None, particle_id=None, tolerance_cm=1e-3,
+                     min_particles=2):
     """
-    Ground-truth vertex position for VertexHead: mean (vtx_x, vtx_y, vtx_z)
-    over hits/tracks near the origin, aggregated per event.
+    Ground-truth vertices for VertexHead, per event. With particle_id: every primary vertex (an origin shared by
+    >= min_particles primary particles, truth ID >= 0; pileup gives several), ranked by particle count; the PV is
+    the first (no primary vertex: the origin most particles share). Without: the PV is the mean origin over the
+    valid hits, which lands between vertices when an event has more than one.
 
     Args:
         reg: (B, N, 8) - per-hit regression target tensor (same columns as get_trackinfo_noiselabel)
@@ -93,14 +96,16 @@ def get_vertex_label(reg, valid_tracks=None, valid_radius_cm=1.0, z_cut_cm=None)
             (NOTE: transverse-only cut, same as the original)
         valid_radius_cm: transverse radius cut used when valid_tracks is None
         z_cut_cm: optional float - if set, ALSO requires |vtx_z| < z_cut_cm
+        particle_id: (B, N) truth particle of each hit (seg_target; < 0: Geant secondary)
+        tolerance_cm: origins closer than this are one vertex; min_particles: particles making a primary vertex
 
     Returns:
-        vertex_target: (B, 3) - mean (vtx_x, vtx_y, vtx_z) over hits/tracks flagged valid
-            for that event; the regression target for VertexHead
-        vertex_valid: (B,) bool - whether the event had >=1 valid hit to average (events
-            with none should be excluded from the loss, not trained toward a meaningless
-            zero-vector target)
+        vertex_target: (B, 3) - the PV; the regression target for VertexHead
+        vertex_valid: (B,) bool - whether the event had >=1 valid hit (events with none should be excluded from
+            the loss, not trained toward a meaningless zero-vector target)
         n_valid: (B,) long - how many hits contributed, for logging/debugging class imbalance
+        with particle_id also: primary_vertices (B, V, 3) (NaN padding), primary_vertex_particles (B, V),
+            n_primary_vertices (B,), hit_vertex (B, N) the rank of each hit's particle's primary vertex (-1: none)
     """
     vtx_x = reg[..., 3]
     vtx_y = reg[..., 4]
@@ -119,12 +124,48 @@ def get_vertex_label(reg, valid_tracks=None, valid_radius_cm=1.0, z_cut_cm=None)
     vx = (vtx_x * valid_f).sum(dim=-1) / counts
     vy = (vtx_y * valid_f).sum(dim=-1) / counts
     vz = (vtx_z * valid_f).sum(dim=-1) / counts
+    vertex = torch.stack([vx, vy, vz], dim=-1)
 
-    return {
-        "vertex_target": torch.stack([vx, vy, vz], dim=-1),  # (B, 3)
-        "vertex_valid": n_valid > 0,  # (B,)
-        "n_valid": n_valid.long(),  # (B,)
-    }
+    result = {"vertex_target": vertex, "vertex_valid": n_valid > 0, "n_valid": n_valid.long()}
+    if particle_id is None:
+        return result
+
+    device = reg.device
+    hit_vertex = torch.full(valid_tracks.shape, -1, dtype=torch.long, device=device)
+    found = []
+    for b in range(reg.shape[0]):
+        hits = valid_tracks[b].bool().nonzero(as_tuple=True)[0]
+        if not len(hits):
+            found.append((reg.new_zeros(0, 3), torch.zeros(0, dtype=torch.long, device=device)))
+            continue
+        # one origin per particle (its first valid hit); particles with the same origin form a vertex
+        ids, position = particle_id[b, hits], torch.arange(len(hits), device=device)
+        unique_ids, inverse = torch.unique(ids, return_inverse=True)
+        first = torch.full((len(unique_ids),), len(hits), device=device).scatter_reduce(0, inverse, position, "amin")
+        origins = reg[b, hits[first], 3:6]
+        _, cluster, size = torch.unique(torch.round(origins / tolerance_cm), dim=0, return_inverse=True,
+                                        return_counts=True)
+        # primary vertices: >= min_particles primary particles, most first (ties: the stored order)
+        primary = unique_ids >= 0
+        n_primary = torch.zeros_like(size).scatter_add(0, cluster, primary.long())
+        order = [c for c in n_primary.argsort(descending=True, stable=True).tolist() if n_primary[c] >= min_particles]
+        rank = torch.full_like(size, -1)
+        rank[order] = torch.arange(len(order), device=device)
+        hit_vertex[b, hits] = torch.where(primary, rank[cluster], -1)[inverse]
+        vertices = (torch.stack([origins[(cluster == c) & primary].mean(dim=0) for c in order]) if order
+                    else reg.new_zeros(0, 3))
+        # the PV: the first primary vertex; without one, the origin most particles share
+        vertex[b] = vertices[0] if order else origins[cluster == size.argmax()].mean(dim=0)
+        found.append((vertices, n_primary[order]))
+
+    n_vertices = max([1] + [len(v) for v, _ in found])
+    primary_vertices = reg.new_full((reg.shape[0], n_vertices, 3), float("nan"))
+    primary_vertex_particles = torch.zeros(reg.shape[0], n_vertices, dtype=torch.long, device=device)
+    for b, (vertices, particles) in enumerate(found):
+        primary_vertices[b, :len(vertices)] = vertices
+        primary_vertex_particles[b, :len(vertices)] = particles
+    return {**result, "primary_vertices": primary_vertices, "primary_vertex_particles": primary_vertex_particles,
+            "n_primary_vertices": torch.tensor([len(v) for v, _ in found], device=device), "hit_vertex": hit_vertex}
     
 def get_silicon_tpc_match_mask(
     features,

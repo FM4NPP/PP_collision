@@ -64,9 +64,10 @@ PER_POINT_COLUMNS = ("batch_idx", "point_idx", "E_norm", "eta_norm", "phi_norm",
 # the reconstructed PV, cm
 RECO_COLUMNS = ("reco_vtx_x", "reco_vtx_y", "reco_vtx_z")
 
-# TESTING ONLY: the truth PV (get_vertex_label) and reconstructed - truth, cm; NaN where undefined
+# TESTING ONLY: the truth PV (get_vertex_label) and reconstructed - truth, cm, NaN where undefined; the rank of
+# the hit's particle's primary vertex (0: the PV, 1, 2...: pileup; -1: none)
 TEST_COLUMNS = ("test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z",
-                "test_residual_x", "test_residual_y", "test_residual_z", "test_residual_3d")
+                "test_residual_x", "test_residual_y", "test_residual_z", "test_residual_3d", "test_truth_pv_index")
 
 CSV_COLUMNS = PER_POINT_COLUMNS + RECO_COLUMNS + TEST_COLUMNS
 
@@ -93,14 +94,14 @@ def write_per_point_csv(columns, path):
             writer.writerow(["" if v != v else v for v in row])    # v != v only for NaN
 
 
-def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, vertex, truth_vertex):
+def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, vertex, truth_vertex, hit_vertex):
     """
     One batch of the per-point CSV.
 
     Args:
         step: written as batch_idx; grouped: (B, N, 4); label: (B, N) truth track ID; reg: (B, N, 8) truth;
         mask: (B, N) real hits; class_probs, mask_probs: raw track-head outputs; vertex: (B, 3) reconstructed PV;
-        truth_vertex: (B, 3), NaN where undefined.
+        truth_vertex: (B, 3), NaN where undefined; hit_vertex: (B, N) the hit's primary-vertex rank (get_vertex_label).
 
     Returns:
         dict column -> 1-D array (CSV_COLUMNS), one entry per real hit.
@@ -132,6 +133,7 @@ def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, 
         columns[f"test_truth_vtx_{axis}"] = col(truth_vertex[:, k])
         columns[f"test_residual_{axis}"] = col(residual[:, k])
     columns["test_residual_3d"] = col(residual.norm(dim=-1))
+    columns["test_truth_pv_index"] = hit_vertex.to(mask.device)[b, n].cpu().numpy()
     return {k: columns[k] for k in CSV_COLUMNS}
 
 
@@ -735,7 +737,8 @@ class DownstreamTrainer():
                     truth_vertex = r["truth"]["vertex_target"].masked_fill(~r["truth"]["vertex_valid"][:, None],
                                                                            float("nan"))
                     per_point.append(per_point_columns(r["step"], r["grouped"], r["label"], r["reg"], r["mask"],
-                                                       r["class_probs"], r["mask_probs"], vertex, truth_vertex))
+                                                       r["class_probs"], r["mask_probs"], vertex, truth_vertex,
+                                                       r["truth"]["hit_vertex"]))
                 est.append(vertex)
                 tgt.append(r["truth"]["vertex_target"])
                 ok.append(valid & r["truth"]["vertex_valid"])
@@ -774,8 +777,10 @@ class DownstreamTrainer():
                     out = self.down_model(grouped, feature=None)
                 lap("track_head")
 
-            # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them
-            truth = get_vertex_label(reg, valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask)
+            # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them. The truth PV: the
+            # origin shared by the most particles
+            truth = get_vertex_label(reg, valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask,
+                                     particle_id=label)
             pending.append({"step": step, "grouped": grouped, "label": label, "reg": reg, "mask": mask, "truth": truth,
                             "class_probs": out["class_probs"], "mask_probs": out["mask_probs"]})
             lap("truth_and_csv")
