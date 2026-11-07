@@ -10,6 +10,7 @@ and test_* truth columns.
 
 import numpy as np
 import copy
+import json
 import os, sys, time
 import inspect
 import torch
@@ -508,10 +509,15 @@ class DownstreamTrainer():
     
 
 
+    @staticmethod
+    def _load_checkpoint_state(path, key):
+        """A checkpoint (on the CPU) and its key's state dict without DDP's "module." prefixes."""
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        return checkpoint, {k.replace("module.", ""): v for k, v in checkpoint[key].items()}
+
     def restore_checkpoint(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        new_state_dict = {k.replace('module.', ''): v for k, v in checkpoint['model_state'].items()}
-        self.model.load_state_dict(new_state_dict)
+        checkpoint, state = self._load_checkpoint_state(checkpoint_path, "model_state")
+        self.model.load_state_dict(state)
 
         self.iters = checkpoint['iters']
         if self.train_data_loader is not None:     # the eval builds no train loader
@@ -553,11 +559,8 @@ class DownstreamTrainer():
             num_prototypes=self.params.max_gt_classes,
             embed_method=getattr(self.params, "embed_method", "add")).to(self.device)
 
-        sd = torch.load(track_ckpt, map_location="cpu", weights_only=False)["model_state_dict"]
-        sd = {k.replace("module.", ""): v for k, v in sd.items()}
-
         # strict, unlike load_checkpoint(): a mismatched checkpoint raises instead of half-loading
-        self.down_model.load_state_dict(sd)
+        self.down_model.load_state_dict(self._load_checkpoint_state(track_ckpt, "model_state_dict")[1])
         self.down_model.eval()
 
         # VertexHead arguments set in params as vertex_<argument>; vertex_bz is the field (Bz)
@@ -603,10 +606,11 @@ class DownstreamTrainer():
         sizes = [r["mask"].shape[0] for r in records]
         return list(zip(result["vertex_estimate"].cpu().split(sizes), result["fit_is_valid"].cpu().split(sizes)))
 
-    def inference(self, checkpoint_path, pretrain=True, save_csv=False, csv_output_path=None):
+    def inference(self, checkpoint_path, max_events=None, pretrain=True, save_csv=False, csv_output_path=None):
         """
-        setup_vertexing, then run_vertexing over at most max_eval_events; appends the metrics to the run log and
-        writes the CSV (default: the run folder's data/).
+        setup_vertexing, then run_vertexing over at most max_events (None: all); appends the metrics to the run log
+        and writes the CSV (default: the run folder's data/) and the metrics JSON (metrics/: inputs, VertexHead's
+        fit settings, metrics), unless no_output.
 
         Args:
             checkpoint_path: track-head checkpoint; pretrain: backbone features (True) or raw points.
@@ -616,14 +620,20 @@ class DownstreamTrainer():
             raise RuntimeError("the vertex eval runs in one process (its metrics are not gathered across ranks): "
                                "run it with python, not torchrun")
         self.setup_vertexing(checkpoint_path)
-        result = self.run_vertexing(pretrain=pretrain, max_events=getattr(self, "max_eval_events", 20000),
-                                    save_csv=save_csv)
+        result = self.run_vertexing(pretrain=pretrain, max_events=max_events, save_csv=save_csv)
         if self.world_rank == 0:
             write_metrics_log(result["metrics"], self.logfile)
             if save_csv:
                 result["csv_output_path"] = csv_output_path or self.csv_path
                 write_per_point_csv(result["per_point"], result["csv_output_path"])
                 print(f"[vertex] wrote {result['csv_output_path']} ({len(result['per_point']['batch_idx'])} points)")
+            if not getattr(self.params, "no_output", False):
+                with open(self.metrics_path, "w") as f:
+                    json.dump({"config": self.config, "yaml_config": os.path.abspath(self.params._yaml_filename),
+                               "pretrained_ckpt": self.params.pretrained_ckpt, "track_ckpt": os.path.abspath(checkpoint_path),
+                               "track_fit_config": self.vertex_head.track_fit_config(), "max_eval_events": max_events,
+                               "metrics": result["metrics"]}, f, indent=2)
+                print(f"[vertex] wrote {self.logfile}\n[vertex] wrote {self.metrics_path}")
         return result
 
     def _layer_features(self, pre_embed):

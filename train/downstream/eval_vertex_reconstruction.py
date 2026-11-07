@@ -15,7 +15,6 @@ logs/vertex_eval_<N>.log (parameters, metrics) and metrics/vertex_eval_<N>.json 
 import os
 import sys
 import argparse
-import json
 
 
 # make sure the FM4NPP modules can be imported
@@ -272,7 +271,6 @@ def main():
 
     # Launch and run inference
     trainer = DownstreamTrainer(params, args)
-    trainer.max_eval_events = args.max_eval_events
     if args.combine_weights:
         w = [float(x) for x in args.combine_weights.split(',')]
         if len(w) != int(params.num_layers_backbone):
@@ -285,33 +283,14 @@ def main():
         trainer.eval_combine_weights = w       # so the backbone stack is collapsed the same way
         print(f'[eval] layer-combined head: {[round(x,4) for x in w]}')
     trainer.launch(train=False)
-    result = trainer.inference(
+    trainer.inference(
         checkpoint_path=checkpoint_path,
+        max_events=args.max_eval_events,
         pretrain=args.usepretrain,
         save_csv=args.save_csv,
         csv_output_path=args.csv_output_path,
     )
-    if trainer.world_rank == 0 and not args.no_output:
-        save_results(result, trainer, params, args, checkpoint_path)
     trainer.cleanup()
-
-
-def save_results(result, trainer, params, args, checkpoint_path):
-    """
-    Write the run's metrics JSON (metrics/): inputs, VertexHead's fit settings and the metrics.
-    """
-    json_path = trainer.metrics_path
-    with open(json_path, "w") as f:
-        json.dump({
-            "config": args.config,
-            "yaml_config": os.path.abspath(args.yaml_config),
-            "pretrained_ckpt": params.pretrained_ckpt,
-            "track_ckpt": os.path.abspath(checkpoint_path),
-            "track_fit_config": trainer.vertex_head.track_fit_config(),
-            "max_eval_events": args.max_eval_events,
-            "metrics": result["metrics"],
-        }, f, indent=2)
-    print(f"[vertex] wrote {trainer.logfile}\n[vertex] wrote {json_path}")
 
 
 if __name__ == "__main__":
