@@ -90,7 +90,7 @@ def acts_vertices(head, outs):
         if command[:2] == ["singularity", "exec"]:
             command = [*command[:2], "--bind", tmp, *command[2:]]
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "acts_vertexing.py")
-        field = ["--field_map", head.acts_field_map, "--field_map_kind", head.acts_field_map_kind] if head.acts_field_map else []
+        field = ["--field_map", head.field_map, "--field_map_kind", head.field_map_kind] if head.field_map else []
         subprocess.run([*command, script, tmp, "--bz_tesla", str(head.Bz), *field], check=True)
         found = []
         for e in range(len(outs)):

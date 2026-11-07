@@ -198,7 +198,7 @@ def _track_position_from_hits(points, hit_r, mask_probs, padding_mask):
     return track_position, total_hit_weight, is_assigned
 
 def _helix_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4, scaling_factor=100.0,
-                     valid_radius=1.0, min_hits=3, beam_position=(0.0, 0.0)):
+                     valid_radius=1.0, min_hits=3, beam_position=(0.0, 0.0), field=None):
     """
     Each track's helix (circle and z line) and quality labels from its assigned hits.
 
@@ -208,7 +208,8 @@ def _helix_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4, sca
     Args:
         points, hit_r, is_assigned: as from _track_position_from_hits.
         noise_pt_threshold: GeV; lower fitted pT -> not usable.
-        Bz: Tesla; scaling_factor: converts metres to the units of points.
+        Bz: Tesla (its sign gives the charge); field: (B, T) each track's |Bz| for its pT (a field map), else |Bz|.
+        scaling_factor: converts metres to the units of points.
         valid_radius: cm; the circle must pass within this of the beam line to be usable.
         min_hits: fewer assigned hits -> not fitted.
         beam_position: (x, y) of the beam line, cm; arc length and beam_dca are measured from it.
@@ -245,7 +246,8 @@ def _helix_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4, sca
     ux, uy = (xc - xin) / radius, (yc - yin) / radius
     sin_phi, cos_phi = sign_Rs * ux, -sign_Rs * uy
     q = sign_Rs * (1.0 if Bz >= 0 else -1.0)
-    pT = 0.299792458 * abs(Bz) * radius / scaling_factor     # pT [GeV] = c [1e9 m/s] * B [T] * R [m]
+    # pT [GeV] = c [1e9 m/s] * B [T] * R [m]; B: each track's field (map) or the uniform |Bz|
+    pT = 0.299792458 * (abs(Bz) if field is None else field) * radius / scaling_factor
     # cot(theta) = dz/ds, the arc-length slope
     theta = torch.atan2(torch.ones_like(zslope), zslope)
     dx, dy = xc - beam_position[0], yc - beam_position[1]
@@ -273,13 +275,13 @@ def _track_covariance(s, track, assigned, n_tracks, theta, qop, s_reference, sig
     Args:
         s: (B, N) hit arc lengths (_arc_length); track, assigned: as in _line_fit.
         theta, qop: (B, T) the helix; s_reference: (B, T) where the covariance is wanted.
-        sigma_rphi, sigma_z: per-hit errors (units of s).
+        sigma_rphi, sigma_z: per-hit errors (units of s); Bz: T, or (B, T) per track (a field map).
         curvilinear: l1 is curvilinear loc1 instead of z0.
 
     Returns:
         (B, T, 5, 5); NaN with too few hits or a singular system.
     """
-    c = 0.299792458 * Bz / scaling_factor
+    c = 0.299792458 * (Bz.gather(1, track) if torch.is_tensor(Bz) else Bz) / scaling_factor
     sin_t, cos_t = (f(theta).gather(1, track) for f in (torch.sin, torch.cos))
     ds = (s - s_reference.gather(1, track)).masked_fill(~assigned, 0.0)
     k_qop = c / sin_t                                               # dk / d(q/p)
@@ -335,15 +337,63 @@ def _perigee_from_circle(circle_centre, R_s, zslope, z0, qop, beam_position=(0.0
 
 def _circle_from_perigee(perigee, Bz, scaling_factor=100.0, beam_position=(0.0, 0.0)):
     """
-    Inverse of _perigee_from_circle: circle_centre, R_s, zslope, z0, pT (GeV), beam_dca = |d0|.
+    Inverse of _perigee_from_circle: circle_centre, R_s, zslope, z0, pT (GeV), beam_dca = |d0|. Bz: T, or (B, T)
+    each track's field at its perigee (a field map).
     """
     d0, z0, phi, theta, qop = perigee[..., :5].unbind(-1)
     sin_phi, cos_phi = torch.sin(phi), torch.cos(phi)
     pT = torch.sin(theta) / qop.abs()
-    R_s = torch.sign(qop) * (1.0 if Bz >= 0 else -1.0) * pT * scaling_factor / (0.299792458 * abs(Bz))
+    if torch.is_tensor(Bz):
+        R_s = torch.sign(qop) * torch.sign(Bz) * pT * scaling_factor / (0.299792458 * Bz.abs())
+    else:
+        R_s = torch.sign(qop) * (1.0 if Bz >= 0 else -1.0) * pT * scaling_factor / (0.299792458 * abs(Bz))
     pca_x, pca_y = beam_position[0] - d0 * sin_phi, beam_position[1] + d0 * cos_phi
     circle_centre = torch.stack([pca_x + R_s * sin_phi, pca_y - R_s * cos_phi], dim=-1)
     return circle_centre, R_s, torch.cos(theta) / torch.sin(theta), z0, pT, d0.abs()
+
+# ------------------------------------------------------------------------------------------------
+# Field map: the ACTS text map the detector file names (field.map), for VertexHead's own track maths
+# ------------------------------------------------------------------------------------------------
+
+_FIELD_MAPS = {}
+
+class _FieldMap:
+    """
+    Bz of an ACTS text field map (columns x y z Bx By Bz, or r z Br Bz; mm and T; a full regular grid, as
+    convert_field_map.py writes it), interpolated (trilinear, or bilinear for rz) and clamped to the grid.
+    """
+    def __init__(self, path, kind="xyz"):
+        import numpy as np
+        table = np.loadtxt(path, comments="#")
+        # the stored order, slowest axis first: xyz (x, y, z); rz (z, r)
+        columns, bz = ((0, 1, 2), 5) if kind == "xyz" else ((1, 0), 3)
+        axes = [np.unique(table[:, c]) for c in columns]
+        self.kind = kind
+        self.axes = [(float(a[0]), float(a[1] - a[0]), len(a)) for a in axes]
+        self.values = torch.from_numpy(table[:, bz].reshape(*(len(a) for a in axes)).copy())
+
+    def bz(self, x, y, z, mm_per_unit=10.0):
+        """Bz (T) at points x, y, z (any shape, in units with mm_per_unit mm each); NaN coordinates count as 0."""
+        x, y, z = (c.double().nan_to_num() * mm_per_unit for c in (x, y, z))
+        coordinates = (x, y, z) if self.kind == "xyz" else (z, torch.hypot(x, y))
+        values = self.values.to(x.device)
+        lower, fraction = [], []
+        for c, (start, step, n) in zip(coordinates, self.axes):
+            t = ((c - start) / step).clamp(0, n - 1 - 1e-9)
+            lower.append(t.floor().long())
+            fraction.append(t - t.floor())
+        result = torch.zeros_like(x)
+        for corner in range(2 ** len(lower)):
+            bits = [(corner >> d) & 1 for d in range(len(lower))]
+            weight = math.prod(f if b else 1 - f for f, b in zip(fraction, bits))
+            result = result + weight * values[tuple(i + b for i, b in zip(lower, bits))]
+        return result
+
+def _field_map(path, kind):
+    """The field map at path, loaded once per process."""
+    if (path, kind) not in _FIELD_MAPS:
+        _FIELD_MAPS[(path, kind)] = _FieldMap(path, kind)
+    return _FIELD_MAPS[(path, kind)]
 
 # ------------------------------------------------------------------------------------------------
 # ACTS worker (use_acts): one persistent process per configuration, in the ACTS container (scripts/acts)
@@ -594,7 +644,8 @@ class VertexHead(nn.Module):
     Args:
         learn_weights: learnable per-track weight network and soft pT / beam-line gates (start at the plain fit);
             weight_hidden_dim, gate_width_pt (GeV), gate_width_r (cm) configure them.
-        Bz: field, T; scaling_factor: metres to the units of points (100: cm).
+        Bz: uniform field, T; field_map (+ _kind): ACTS text field map (mm, T) instead, for ACTS and the tracks' pT
+            (Bz at their hits, and at the perigee for ACTS tracks); scaling_factor: metres to the units of points.
         noise_pt_threshold (GeV), valid_radius (cm), min_hits: track usability cuts.
         beam_position: (x, y), cm; normalization: the dataset's hit normalization (TPC_NORMALIZATION).
         hit_sigma_rphi, hit_sigma_z: per-hit errors for the track covariance, cm.
@@ -605,8 +656,8 @@ class VertexHead(nn.Module):
         density_seed: the adaptive fit's first weights from compatibility with the track-density seed on the beam line
             (ACTS's Gaussian seeder), not the all-track fit; seed_d0_significance, seed_z0_significance: its cuts.
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped);
-            acts_image or acts_command, acts_field_map (+ _kind), acts_geometry + acts_geometry_config,
-            acts_material_map, acts_energy_loss, acts_max_steps configure it.
+            acts_image or acts_command, acts_geometry + acts_geometry_config, acts_material_map, acts_energy_loss,
+            acts_max_steps configure it.
         track_parameter_length_scale: cm per length unit of forward's track_parameters (ACTS mm: 0.1).
         find_secondary: find SVs; refit_pv: report the PV refitted with SV tracks shared.
         sv_min_track_pv_chi2, sv_min_track_beam_significance: SV candidate cuts.
@@ -630,8 +681,8 @@ class VertexHead(nn.Module):
         use_acts: bool = False,
         acts_image: str = None,
         acts_command: list = None,
-        acts_field_map: str = None,
-        acts_field_map_kind: str = "xyz",
+        field_map: str = None,
+        field_map_kind: str = "xyz",
         acts_max_steps: int = None,
         acts_geometry: str = None,
         acts_geometry_config: str = None,
@@ -672,8 +723,8 @@ class VertexHead(nn.Module):
         self.use_acts = use_acts
         self.acts_image = acts_image
         self.acts_command = acts_command
-        self.acts_field_map = acts_field_map
-        self.acts_field_map_kind = acts_field_map_kind
+        self.field_map = field_map
+        self.field_map_kind = field_map_kind
         self.acts_max_steps = acts_max_steps
         self.acts_geometry = acts_geometry
         self.acts_geometry_config = acts_geometry_config
@@ -749,8 +800,8 @@ class VertexHead(nn.Module):
             "use_acts": bool(acts.get("image") or acts.get("command")),
             "acts_image": resolve(acts.get("image")),
             "acts_command": acts.get("command"),
-            "acts_field_map": resolve(field.get("map")),
-            "acts_field_map_kind": field.get("map_kind", "xyz"),
+            "field_map": resolve(field.get("map")),
+            "field_map_kind": field.get("map_kind", "xyz"),
             "acts_geometry": resolve(acts.get("geometry")),
             "acts_geometry_config": resolve(acts.get("geometry_config")),
             "acts_material_map": resolve(acts.get("material_map")),
@@ -773,7 +824,7 @@ class VertexHead(nn.Module):
             return list(self.acts_command)
         if not self.acts_image:
             raise ValueError("use_acts needs acts_image (the ACTS container, scripts/acts) or acts_command")
-        inputs = [ACTS_WORKER_SCRIPT, self.acts_field_map, self.acts_geometry, self.acts_geometry_config,
+        inputs = [ACTS_WORKER_SCRIPT, self.field_map, self.acts_geometry, self.acts_geometry_config,
                   self.acts_material_map]
         binds = sorted({os.path.dirname(os.path.abspath(p)) for p in inputs if p})
         return ["singularity", "exec", *(["--bind", ",".join(binds)] if binds else []), self.acts_image, "acts-python"]
@@ -784,7 +835,7 @@ class VertexHead(nn.Module):
         """
         return {"reference": [self.beam_position[0] / self.track_parameter_length_scale,
                               self.beam_position[1] / self.track_parameter_length_scale, 0.0],
-                "bz_tesla": self.Bz, "field_map": self.acts_field_map, "field_map_kind": self.acts_field_map_kind,
+                "bz_tesla": self.Bz, "field_map": self.field_map, "field_map_kind": self.field_map_kind,
                 "max_steps": self.acts_max_steps, "geometry": self.acts_geometry,
                 "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
                 "energy_loss": self.acts_energy_loss}
@@ -1009,9 +1060,18 @@ class VertexHead(nn.Module):
             # track model: hits in cm (padding zeroed), hard assignment, each track's circle and z line
             hits, hit_r = _unnormalize_hits(points.masked_fill(~padding_mask.unsqueeze(-1), 0.0), self.normalization)
             innermost_hit, total_hit_weight, is_assigned = _track_position_from_hits(hits, hit_r, mask_probs, padding_mask)
+            # with a field map: each track's Bz, the mean over its hits (signed; tracks without hits: Bz)
+            track_bz = self.Bz
+            if self.field_map is not None:
+                hit_bz = _field_map(self.field_map, self.field_map_kind).bz(
+                    hits[..., 1], hits[..., 2], hits[..., 3], 1000.0 / self.scaling_factor)
+                n_hits = is_assigned.sum(dim=1)
+                track_bz = torch.where(n_hits > 0, (is_assigned * hit_bz.unsqueeze(-1)).sum(dim=1) / n_hits.clamp(min=1),
+                                       float(self.Bz))
             params = _helix_from_hits(hits, hit_r, is_assigned, self.noise_pt_threshold, Bz=self.Bz,
                                       scaling_factor=self.scaling_factor, valid_radius=self.valid_radius,
-                                      min_hits=self.min_hits, beam_position=self.beam_position)
+                                      min_hits=self.min_hits, beam_position=self.beam_position,
+                                      field=track_bz.abs() if torch.is_tensor(track_bz) else None)
             # the helix fit runs in the dtype of the hits
             params.update({k: params[k].to(hits.dtype) for k in ("theta", "circle_centre", "R_s", "zslope", "z0")})
             theta = params["theta"].double()
@@ -1024,7 +1084,7 @@ class VertexHead(nn.Module):
             fit_theta = torch.atan2(torch.ones_like(theta), params["zslope"].double())
             hit_covariance = lambda s_reference, curvilinear: _track_covariance(  # noqa: E731
                 hit_s, hit_track, hit_assigned, R_s.shape[-1], fit_theta, q * torch.sin(fit_theta) / params["pT"],
-                s_reference, self.hit_sigma_rphi, self.hit_sigma_z, self.Bz, self.scaling_factor, curvilinear,
+                s_reference, self.hit_sigma_rphi, self.hit_sigma_z, track_bz, self.scaling_factor, curvilinear,
                 self.min_hits)
             if self.use_acts:
                 # ACTS propagates the helix state at the innermost hit (mm) back to the beam spot
@@ -1064,8 +1124,12 @@ class VertexHead(nn.Module):
             perigee = track_parameters.double().clone()
             perigee[..., [0, 1, 5]] = perigee[..., [0, 1, 5]] * self.track_parameter_length_scale
             fit_ok = torch.isfinite(perigee[..., :5]).all(dim=-1)
+            # with a field map: Bz at each track's perigee (beam line, z0)
+            perigee_bz = self.Bz if self.field_map is None else _field_map(self.field_map, self.field_map_kind).bz(
+                torch.full_like(perigee[..., 1], self.beam_position[0]), torch.full_like(perigee[..., 1], self.beam_position[1]),
+                perigee[..., 1], 1000.0 / self.scaling_factor)
             circle_centre, R_s, zslope, z0, pT, beam_dca = _circle_from_perigee(
-                perigee, self.Bz, self.scaling_factor, self.beam_position)
+                perigee, perigee_bz, self.scaling_factor, self.beam_position)
             dtype = track_parameters.dtype
             params = {"circle_centre": circle_centre.to(dtype), "R_s": R_s.to(dtype), "zslope": zslope.to(dtype),
                       "z0": z0.to(dtype), "pT": pT, "beam_dca": beam_dca, "fit_ok": fit_ok,
