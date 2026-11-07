@@ -34,8 +34,9 @@ TRACK_COLUMNS = ["trackId", *PARAMS, *(f"var_{a}" for a in PARAMS),
 
 def load_events(path, max_events, tracks="finder"):
     """
-    Per event: (class_probs, mask_probs, points, padding_mask) as VertexHead takes them, the true vertex and, per
-    track slot, whether it is a Geant secondary and its particle's truth production vertex.
+    Per event: (class_probs, mask_probs, points, padding_mask) as VertexHead takes them, the true vertex, per
+    track slot whether it is a Geant secondary and its particle's truth production vertex, and the number of
+    primary vertices (test_truth_pv_index; NaN in older CSVs).
     """
     with open(path, newline="") as f:
         rows = list(csv.reader(f))
@@ -47,6 +48,7 @@ def load_events(path, max_events, tracks="finder"):
     points = np.stack([num(k) for k in ("E_norm", "eta_norm", "phi_norm", "r_norm")], axis=1)
     true_vertex = np.stack([num(f"test_truth_vtx_{a}") for a in "xyz"], axis=1)
     origin_all = np.stack([num(f"vtx_{a}") for a in "xyz"], axis=1)
+    pv_index = num("test_truth_pv_index") if "test_truth_pv_index" in col else None
     events = []
     for e in np.unique(event)[:max_events]:
         hits = np.flatnonzero(event == e)
@@ -68,7 +70,8 @@ def load_events(path, max_events, tracks="finder"):
             origin[t] = origin_kept[np.flatnonzero((slot == t) & (ids_kept == ids[counts.argmax()]))[0]]
         inputs = (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
                   torch.ones(1, len(hits), dtype=torch.bool))
-        events.append((inputs, true_vertex[hits[0]], secondary, origin))
+        n_pv = np.nanmax(pv_index[hits], initial=-1) + 1 if "test_truth_pv_index" in col else np.nan
+        events.append((inputs, true_vertex[hits[0]], secondary, origin, n_pv))
     return events
 
 
@@ -117,7 +120,7 @@ def sv_stats(outs, events, origin_tolerance):
     """The SV table's numbers for VertexHead's SVs."""
     n_sec = n_cand = n_cand_sec = n_sv = sv_tracks = sv_tracks_sec = sv_all_sec = sv_true = 0
     residual = []
-    for o, (_, truth, sec, origin) in zip(outs, events):
+    for o, (_, truth, sec, origin, _) in zip(outs, events):
         usable, cand = o["track_quality_mask"][0].numpy(), o["displaced_mask"][0].numpy()
         n_sec += int((sec & usable).sum()); n_cand += int(cand.sum()); n_cand_sec += int((cand & sec).sum())
         for k in np.flatnonzero(o["sv_is_valid"][0].numpy()):
@@ -170,6 +173,14 @@ def main():
             notes.append(f"{tracks} tracks: ACTS AMVF found {np.mean(n_found):.2f} vertices per event, none in "
                          f"{n_found.count(0)}; its first vertex - VertexHead's PV: median {np.nanmedian(distance):.4f} cm, "
                          f"90% {np.nanpercentile(distance, 90):.4f} cm")
+        n_pv = np.array([e[4] for e in events])
+        if np.isfinite(n_pv).all():
+            error = np.linalg.norm(vertices - np.array([e[1] for e in events]), axis=1)
+            text = lambda sel: (f"median {np.nanmedian(error[sel]):.4f}, 90% {np.nanpercentile(error[sel], 90):.4f} cm"  # noqa: E731
+                                if np.isfinite(error[sel]).any() else "-")
+            notes.append(f"{tracks} tracks: {(n_pv >= 2).sum()} of {len(n_pv)} events have >= 2 primary vertices "
+                         f"(pileup; most {int(n_pv.max())}); VertexHead's PV error with pileup {text(n_pv >= 2)}, "
+                         f"without {text(n_pv < 2)}")
         for name, run_vertices, run_chi2, dropped, ms in runs:
             label = f"{tracks:7s} {name:12s}"
             (n, m, p68, p90, within), axes = pv_stats(run_vertices, events)

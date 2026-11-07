@@ -3,7 +3,7 @@
 #   scripts/run/vertexing.sh setup [options]      ACTS image (if missing) and module; writes or updates the site
 #                                                 detector file
 #   scripts/run/vertexing.sh eval [options]       eval_vertex_reconstruction.py with the run config
-#   scripts/run/vertexing.sh compare [options]    VertexHead vs ACTS's vertex finder on the run's newest CSV
+#   scripts/run/vertexing.sh compare [options]    VertexHead vs ACTS's vertex finder on the newest CSV in root_dir
 # setup options: --geometry, --geometry_config, --material_map <file> (ACTS inputs, must exist);
 # --field_map <file> (a ROOT map, converted into the detector folder and then used by every site file, or an ACTS
 # text map; with --field_kind xyz|rz, --field_rescale <factor>); --set <section.key>=<value> for any other detector-file setting (e.g.
@@ -17,14 +17,14 @@ RUN_CONFIG=$(realpath "${RUN_CONFIG:-$REPO/scripts/configs/vertex_m5_gpuserver0.
 COMMAND=${1:-}
 shift || true
 
-# the run config's detector file and run folder (paths relative to the config, ~ expanded)
-{ read -r DETECTOR; read -r RUN_DIR; } < <(python - "$RUN_CONFIG" <<'EOF' | tr -d '\r'
+# the run config's detector file and output folder (paths relative to the config, ~ expanded)
+{ read -r DETECTOR; read -r ROOT_DIR; } < <(python - "$RUN_CONFIG" <<'EOF' | tr -d '\r'
 import os, sys, yaml
 path = sys.argv[1]
 run = yaml.safe_load(open(path))
 where = lambda p: os.path.join(os.path.dirname(path), os.path.expanduser(p))  # noqa: E731
 print(where(run["detector"]))
-print(os.path.join(where(run["root_dir"]), str(run["config"]), str(run["run_num"])))
+print(where(run["root_dir"]))
 EOF
 )
 
@@ -105,8 +105,10 @@ EOF
         python eval_vertex_reconstruction.py --run_config "$RUN_CONFIG" "$@"
         ;;
     compare)
-        csv=$(ls -t "$RUN_DIR"/*_per_point_data.csv 2> /dev/null | head -1)
-        [[ -n "$csv" ]] || { echo "no per-point CSV in $RUN_DIR: run 'eval' first" >&2; exit 1; }
+        # the newest eval output under root_dir (<backbone>/<track head>/e<events>/); --csv <file> overrides it
+        csv=$(find "$ROOT_DIR" -name '*_per_point_data.csv' -printf '%T@ %p\n' 2> /dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+        [[ -n "$csv" ]] || { echo "no per-point CSV under $ROOT_DIR: run 'eval' first" >&2; exit 1; }
+        echo "comparing on $csv"
         python "$REPO/scripts/acts/compare_vertexing.py" --csv "$csv" --detector "$DETECTOR" --tracks both "$@"
         ;;
     *)

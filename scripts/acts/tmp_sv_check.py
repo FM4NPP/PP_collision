@@ -47,7 +47,7 @@ def main():
     displacement, r_xy, seed_error, fit_error, found_error, n_tracks, primary, event_index = [], [], [], [], [], [], [], []
     n_events, beam_line = 0, []
     with torch.no_grad():
-        for inputs, truth, secondary, origin in cv.load_events(args.csv, args.max_events, "truth"):
+        for inputs, truth, secondary, origin, _ in cv.load_events(args.csv, args.max_events, "truth"):
             n_events += 1
             out = head(*inputs)
             usable = out["track_quality_mask"][0].numpy() & np.isfinite(origin).all(axis=1)

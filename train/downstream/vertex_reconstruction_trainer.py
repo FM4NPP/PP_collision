@@ -199,18 +199,23 @@ class DownstreamTrainer():
         
     def init_exp_dir(self, exp_dir):
         """
-        Run folder exp_dir with a new performance<N>.log (parameters, then metrics); no files with no_output.
+        Run folder exp_dir with a new logs/vertex_eval_<N>.log (parameters, then metrics); its per-point CSV goes
+        to data/ (csv_path), its metrics JSON to metrics/ (metrics_path). No files with no_output.
         """
         self.params['experiment_dir'] = os.path.abspath(exp_dir)
         if getattr(self.params, "no_output", False):
-            self.logfile = os.devnull
+            self.logfile = self.csv_path = self.metrics_path = os.devnull
             return
-        idx = 0
+        logs, idx = os.path.join(exp_dir, "logs"), 0
         if self.world_rank == 0:
-            os.makedirs(exp_dir, exist_ok=True)
-            while os.path.exists(os.path.join(exp_dir, f'performance{idx}.log')):
+            os.makedirs(logs, exist_ok=True)
+            os.makedirs(os.path.join(exp_dir, "data"), exist_ok=True)
+            os.makedirs(os.path.join(exp_dir, "metrics"), exist_ok=True)
+            while os.path.exists(os.path.join(logs, f'vertex_eval_{idx}.log')):
                 idx += 1
-        self.logfile = os.path.join(exp_dir, f'performance{idx}.log')
+        self.logfile = os.path.join(logs, f'vertex_eval_{idx}.log')
+        self.csv_path = os.path.join(exp_dir, "data", f'vertex_eval_{idx}_per_point_data.csv')
+        self.metrics_path = os.path.join(exp_dir, "metrics", f'vertex_eval_{idx}.json')
         if self.world_rank == 0:
             with open(self.logfile, 'w') as f:
                 f.write('Initialized at: {}\n'.format(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))))
@@ -258,7 +263,8 @@ class DownstreamTrainer():
 
     def launch(self):
         print(self.root_dir, self.config, self.run_num)
-        exp_dir = os.path.join(*[self.root_dir, self.config, self.run_num])
+        # the run folder: params.run_folder (the eval: <backbone>/<track head>/e<events>), else <config>/<run_num>
+        exp_dir = os.path.join(self.root_dir, getattr(self.params, "run_folder", None) or os.path.join(self.config, self.run_num))
         self.init_exp_dir(exp_dir)
 
         self.params['global_batch_size'] = self.params.batch_size
@@ -692,7 +698,7 @@ class DownstreamTrainer():
         if self.world_rank == 0:
             write_metrics_log(result["metrics"], self.logfile)
             if save_csv:
-                result["csv_output_path"] = csv_output_path or self.logfile.replace(".log", "_per_point_data.csv")
+                result["csv_output_path"] = csv_output_path or self.csv_path
                 write_per_point_csv(result["per_point"], result["csv_output_path"])
                 print(f"[vertex] wrote {result['csv_output_path']} ({len(result['per_point']['batch_idx'])} points)")
         return result
