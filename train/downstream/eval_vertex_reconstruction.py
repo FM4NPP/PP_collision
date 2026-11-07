@@ -232,7 +232,7 @@ def main():
     # Prepare hyperparameters
     params = YParams(os.path.abspath(args.yaml_config), args.config)
     if args.pretrained_ckpt:
-        params.pretrained_ckpt = args.pretrained_ckpt
+        params["pretrained_ckpt"] = args.pretrained_ckpt
     elif not getattr(params, "pretrained_ckpt", None):
         sys.exit(f"config {args.config!r} has no pretrained_ckpt; add one to the YAML or pass --pretrained_ckpt")
     # the seed suffix train_track_finding.py adds
@@ -241,7 +241,7 @@ def main():
     checkpoint_name = (f"{args.track_config}_nerf_tracking_head_d{args.eventnumber}_{args.run_num}"
                        f"{seed_suffix}{pretrain_suffix}_checkpoint.pth")
     if args.data_root_test:
-        params.data_root_test = args.data_root_test
+        params["data_root_test"] = args.data_root_test
     checkpoint_path = (args.checkpoint if args.checkpoint
                        else os.path.join(args.checkpoint_dir or params.checkpoint_dir, checkpoint_name))
     # the run folder: <backbone checkpoint>/<track-head checkpoint>/e<events> (outputs vertex_eval_<N>.*)

@@ -1,16 +1,17 @@
 """
 acts_worker.py: ACTS computing perigee parameters and covariances for track states, inside the ACTS image with
-the module from build_images.sh (perigee_propagator/build/install). VertexHead(use_acts=True) starts it once and
+the module from build_images.sh (perigee_propagator/build/install). VertexHead (TrackBuilder, use_acts) starts it once and
 streams batches:
 
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
 
-Config (VertexHead.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
+Config (TrackBuilder.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
 geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (null: the CPUs this process may use),
 particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit, kalman_start_covariance_scale and hit_sigma (r phi, z).
 
 Protocol, after the line ACTS_WORKER_READY: n, m (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
-covariance (n, 6, 6), hit_track (m,), hits (m, 6) (the Kalman refit's hits: position, direction); reply float64 params (n, 6), covariance (n, 6, 6), then ok (n,) uint8. States are
+covariance (n, 6, 6), hit_track (m,), hits (m, 6) (the Kalman refit's hits: position, direction); reply float64
+params (n, 6), covariance (n, 6, 6), then ok (n,) and refitted (n,) uint8. States are
 propagated backward to the perigee. EOF ends it and prints a failure summary; everything else goes to stderr.
 """
 import collections
@@ -111,11 +112,12 @@ def serve(config):
         position, direction = values[: 3 * n].reshape(n, 3), values[3 * n: 6 * n].reshape(n, 3)
         qop, covariance = values[6 * n: 7 * n], values[7 * n: 43 * n].reshape(n, 6, 6)
         hit_track, hits = values[43 * n: 43 * n + m], values[43 * n + m:].reshape(m, 6)
-        params, cov, ok, failures = propagator.propagate(position, direction, qop, covariance, hit_track, hits)
+        params, cov, ok, refitted, failures = propagator.propagate(position, direction, qop, covariance, hit_track, hits)
         errors.update(failures)
         attempted += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())
         propagated += int(ok.sum())
-        out.write(params.astype("<f8").tobytes() + cov.astype("<f8").tobytes() + ok.astype(np.uint8).tobytes())
+        out.write(params.astype("<f8").tobytes() + cov.astype("<f8").tobytes() + ok.astype(np.uint8).tobytes()
+                  + refitted.astype(np.uint8).tobytes())
         out.flush()
 
 

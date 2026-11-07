@@ -37,8 +37,8 @@ from fm4npp.models.linformer_gpt import LinformerGPT
 from trackinghead import *
 import csv
 
-import vertexhead
-from vertexhead import VertexHead
+import vertexing
+from vertexing import VertexHead
 from downstream_util import get_vertex_label
 from loss import compute_vertex_metrics, assign_points_to_masks
 
@@ -463,7 +463,7 @@ class DownstreamTrainer():
         self.down_model.eval()
 
         # VertexHead arguments set in params as vertex_<argument>
-        names = set(inspect.signature(VertexHead.__init__).parameters) - {"self"}
+        names = VertexHead.setting_names()
         settings = {name: getattr(self.params, "vertex_" + name) for name in names
                     if getattr(self.params, "vertex_" + name, None) is not None}
         # VertexHead's device (vertex_device, e.g. cuda or cpu; default: the trainer's)
@@ -471,7 +471,7 @@ class DownstreamTrainer():
         detector = getattr(self.params, "vertex_detector", None)
         head = VertexHead.from_detector(detector, **settings) if detector else VertexHead(**settings)
         self.vertex_head = head.to(self.vertex_device).eval()
-        self.vertex_head.start_acts()       # boots while the first batches run
+        self.vertex_head.tracks.start_acts()       # boots while the first batches run
 
     def _vertex_head_chunk(self, records):
         """
@@ -487,7 +487,7 @@ class DownstreamTrainer():
                 probs, real = r["mask_probs"][e].float(), r["mask"][e]
                 assigned = real & (probs.max(dim=-1).values > 0)
                 best = probs.argmax(dim=-1)
-                keep = torch.bincount(best[assigned], minlength=probs.shape[-1]) >= self.vertex_head.min_hits
+                keep = torch.bincount(best[assigned], minlength=probs.shape[-1]) >= self.vertex_head.tracks.min_hits
                 slots = keep.nonzero(as_tuple=True)[0]
                 probs = probs * keep[best].unsqueeze(-1)    # hits on the other slots: unassigned
                 events.append((r["class_probs"][e, slots].float(), probs[:, slots], r["grouped"][e], real))
@@ -528,7 +528,7 @@ class DownstreamTrainer():
                 with open(self.metrics_path, "w") as f:
                     json.dump({"config": self.config, "yaml_config": os.path.abspath(self.params._yaml_filename),
                                "pretrained_ckpt": self.params.pretrained_ckpt, "track_ckpt": os.path.abspath(checkpoint_path),
-                               "track_fit_config": self.vertex_head.track_fit_config(), "max_eval_events": max_events,
+                               "track_fit_config": self.vertex_head.tracks.track_fit_config(), "max_eval_events": max_events,
                                "metrics": result["metrics"]}, f, indent=2)
                 print(f"[vertex] wrote {self.logfile}\n[vertex] wrote {self.metrics_path}")
         return result
@@ -574,7 +574,7 @@ class DownstreamTrainer():
             """Truth labels and VertexHead over these batches, then their metrics inputs and CSV rows (the background
             thread)."""
             t0 = time.perf_counter()
-            beam = self.vertex_head.beam_position
+            beam = self.vertex_head.tracks.beam_position
             for r in records:
                 # hits whose particle starts within truth_radius of the beam line (padded rows excluded: their zeros
                 # would pass); the truth PV: the origin shared by the most particles
@@ -610,7 +610,7 @@ class DownstreamTrainer():
 
         stages = ("data", "backbone", "track_head", "to_cpu", "waiting", "truth", "vertex_head", "csv")
         timing = dict.fromkeys(stages, 0.0)
-        vertexhead.ACTS_TIMING.update(start_s=0.0, propagate_s=0.0, states=0)
+        vertexing.ACTS_TIMING.update(start_s=0.0, propagate_s=0.0, states=0)
         # the main loop's own stream only (VertexHead runs on another)
         sync = torch.cuda.current_stream().synchronize if torch.cuda.is_available() else (lambda: None)
         clock = [time.perf_counter()]
@@ -661,8 +661,8 @@ class DownstreamTrainer():
         est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)
         metrics = compute_vertex_metrics(est, tgt, ok)
         metrics.update(n_events=len(ok), fit_valid_rate=ok.float().mean().item())
-        timing["acts_start"] = vertexhead.ACTS_TIMING["start_s"]
-        timing["acts_propagate"] = vertexhead.ACTS_TIMING["propagate_s"]
+        timing["acts_start"] = vertexing.ACTS_TIMING["start_s"]
+        timing["acts_propagate"] = vertexing.ACTS_TIMING["propagate_s"]
         n_events = max(len(ok), 1)
         metrics.update({f"time_{k}_ms_per_event": v / n_events * 1e3 for k, v in timing.items()})
         if self.log_to_screen:
@@ -675,7 +675,7 @@ class DownstreamTrainer():
                       f"{timing[k] / max(wall, 1e-12):6.1%}")
             if timing["acts_start"] or timing["acts_propagate"]:
                 print(f"[vertex]     of which ACTS: worker start {timing['acts_start']:.2f} s, propagation "
-                      f"{timing['acts_propagate']:.2f} s ({vertexhead.ACTS_TIMING['states']} track states)")
+                      f"{timing['acts_propagate']:.2f} s ({vertexing.ACTS_TIMING['states']} track states)")
         output = {"metrics": metrics, "vertex_estimate": est.cpu(), "vertex_target": tgt.cpu(),
                   "fit_is_valid": ok.cpu(), "timing": timing}
         if save_csv:

@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                                 "train", "downstream"))
-import vertexhead as vh  # noqa: E402
+import vertexing as vh  # noqa: E402
 
 PARAMS = ("d0", "z0", "phi", "theta", "qop")
 TRACK_COLUMNS = ["trackId", *PARAMS, *(f"var_{a}" for a in PARAMS),
@@ -149,20 +149,20 @@ def acts_vertices(head, outs):
         for e, o in enumerate(outs):
             params = o["track_parameters"][0].double().numpy().copy()
             params[:, :2] *= vh.MM_PER_CM                                         # d0, z0: cm -> mm
-            cov = o["track_covariance"][0].double().numpy() * head.track_error_scale ** 2
+            cov = o["track_covariance"][0].double().numpy() * head.tracks.track_error_scale ** 2
             keep = (o["track_weight"][0] > 0).numpy() & np.isfinite(params[:, :5]).all(1) & np.isfinite(cov).all((1, 2))
             with open(os.path.join(tmp, f"event{e:09d}-tracks.csv"), "w", newline="") as f:
                 writer = csv.writer(f, lineterminator="\n")   # LF only: ACTS keeps a CR in the last column
                 writer.writerow(TRACK_COLUMNS)
                 for i, (p, c) in enumerate(zip(params[keep], cov[keep])):
                     writer.writerow([i, *p[:5], *np.diag(c)[:5], *(c[a, b] for a in range(5) for b in range(5) if a != b)])
-        command = head.acts_worker_command()
+        command = head.tracks.acts_worker_command()
         if command[:2] == ["singularity", "exec"]:
             command = [*command[:2], "--bind", tmp, *command[2:]]
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "acts_vertexing.py")
-        field = ["--field_map", head.field_map, "--field_map_kind", head.field_map_kind] if head.field_map else []
-        beamspot = [str(v) for v in head.acts_worker_config()["reference"]]       # the perigee reference, mm
-        subprocess.run([*command, script, tmp, "--bz_tesla", str(head.Bz), *field, "--beamspot", *beamspot], check=True)
+        field = ["--field_map", head.tracks.field_map, "--field_map_kind", head.tracks.field_map_kind] if head.tracks.field_map else []
+        beamspot = [str(v) for v in head.tracks.acts_worker_config()["reference"]]       # the perigee reference, mm
+        subprocess.run([*command, script, tmp, "--bz_tesla", str(head.tracks.Bz), *field, "--beamspot", *beamspot], check=True)
         found = []
         for e in range(len(outs)):
             with open(os.path.join(tmp, f"event{e:09d}-vertices.csv"), newline="") as f:
@@ -215,7 +215,7 @@ def main():
     args = parser.parse_args()
 
     head = vh.VertexHead.from_detector(args.detector, find_secondary=True).eval()
-    head.start_acts()       # boots while the CSV loads
+    head.tracks.start_acts()       # boots while the CSV loads
     pv_rows, axis_rows, sv_rows, notes = [], [], [], []
     timing = dict.fromkeys(("reading the CSV", "VertexHead", "ACTS AMVF"), 0.0)
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
@@ -238,7 +238,7 @@ def main():
         vertices = np.array([o["vertex_estimate"][0].double().numpy() for o in outs])
         runs = [("VertexHead", vertices, f"{np.median(chi2):8.2f}" if chi2 else "",
                  sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)]
-        if head.use_acts:
+        if head.tracks.use_acts:
             t0 = time.perf_counter()
             acts_pv, n_found = acts_vertices(head, outs)
             timing["ACTS AMVF"] += time.perf_counter() - t0

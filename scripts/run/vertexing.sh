@@ -17,8 +17,9 @@ RUN_CONFIG=$(realpath "${RUN_CONFIG:-$REPO/scripts/configs/vertex_m5_gpuserver0.
 COMMAND=${1:-}
 shift || true
 
-# the run config's detector file and output folder (paths relative to the config, ~ expanded)
-{ read -r DETECTOR; read -r ROOT_DIR; } < <(python - "$RUN_CONFIG" <<'EOF' | tr -d '\r'
+# setup and compare: the run config's detector file and output folder (paths relative to the config, ~ expanded)
+if [[ $COMMAND == setup || $COMMAND == compare ]]; then
+    { read -r DETECTOR; read -r ROOT_DIR; } < <(python - "$RUN_CONFIG" <<'EOF' | tr -d '\r'
 import os, sys, yaml
 path = sys.argv[1]
 run = yaml.safe_load(open(path))
@@ -26,7 +27,8 @@ where = lambda p: os.path.join(os.path.dirname(path), os.path.expanduser(p))  # 
 print(where(run["detector"]))
 print(where(run["root_dir"]))
 EOF
-)
+    )
+fi
 
 case "$COMMAND" in
     setup)

@@ -1,4 +1,4 @@
-# sPHENIX TPC detector description for VertexHead.from_detector (train/downstream/vertexhead.py) and its ACTS
+# sPHENIX TPC detector description for VertexHead.from_detector (train/downstream/vertexing/model.py) and its ACTS
 # worker. Relative paths are relative to this file; VertexHead binds the ACTS input directories into the
 # container. A site's copy (scripts/run/vertexing.sh setup writes one into scripts/configs/) holds its ACTS paths;
 # for another detector, copy this folder and fill in the same keys (README: Adding a detector).
@@ -37,6 +37,7 @@ acts:                          # use_acts is on when image (or command) is set
   particle_mass: null          # GeV (null: ACTS's mass for particle_pdg)
   kalman_refit: true           # ACTS Kalman fit of each track's hits (hit_errors_cm) before the perigee propagation
   kalman_start_covariance_scale: 100.0   # the fit's start: the hit fit's covariance at the innermost hit x this
+  kalman_fallback_covariance_scale: 100.0   # where the refit fails: the hit fit's track, its covariance x this
 
 # any other VertexHead argument (VertexHead's defaults otherwise)
 vertex_head: {}

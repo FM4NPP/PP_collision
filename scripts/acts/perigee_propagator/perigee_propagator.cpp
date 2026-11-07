@@ -132,7 +132,7 @@ class PerigeePropagator {
   // index hit_track (m,)
   // (sorted by it, each track's hits in order along it; none without the refit) -> perigee parameters (d0, z0, phi,
   // theta, q/p, t) (n, 6), their covariance (n, 6, 6) (both NaN where ACTS failed or an input is not finite),
-  // ok (n,) and {error message: count}
+  // ok (n,), refitted (n,) (the Kalman refit succeeded) and {error message: count}
   py::tuple propagate(Array position, Array direction, Array qop, Array covariance, Array hitTrack, Array hits) const {
     const py::ssize_t n = qop.size();
     const py::ssize_t m = hitTrack.size();
@@ -158,6 +158,7 @@ class PerigeePropagator {
     Array params({n, py::ssize_t{6}});
     Array covOut({n, py::ssize_t{6}, py::ssize_t{6}});
     py::array_t<bool> ok(n);
+    py::array_t<bool> refittedOut(n);
     const double* P = position.data();
     const double* D = direction.data();
     const double* Q = qop.data();
@@ -165,9 +166,11 @@ class PerigeePropagator {
     double* out = params.mutable_data();
     double* cov = covOut.mutable_data();
     bool* good = ok.mutable_data();
+    bool* fitted = refittedOut.mutable_data();
     std::fill(out, out + 6 * n, std::numeric_limits<double>::quiet_NaN());
     std::fill(cov, cov + 36 * n, std::numeric_limits<double>::quiet_NaN());
     std::fill(good, good + n, false);
+    std::fill(fitted, fitted + n, false);
     const std::size_t nThreads = std::min<std::size_t>(m_threads, std::max<py::ssize_t>(n, 1));
     std::vector<std::map<std::string, std::size_t>> threadErrors(nThreads);
     std::vector<std::exception_ptr> threadFailures(nThreads);
@@ -200,6 +203,7 @@ class PerigeePropagator {
                                     H + 6 * hitBegin[i], hitBegin[i + 1] - hitBegin[i], error);
               if (refitted) {
                 start = std::move(refitted);
+                fitted[i] = true;
               } else {
                 ++errors["Kalman refit failed (hit fit used): " + error];
               }
@@ -252,7 +256,7 @@ class PerigeePropagator {
         errors[message] += count;
       }
     }
-    return py::make_tuple(params, covOut, ok, errors);
+    return py::make_tuple(params, covOut, ok, refittedOut, errors);
   }
 
  private:
