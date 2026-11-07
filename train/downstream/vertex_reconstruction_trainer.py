@@ -655,6 +655,7 @@ class DownstreamTrainer():
         detector = getattr(self.params, "vertex_detector", None)
         head = VertexHead.from_detector(detector, **settings) if detector else VertexHead(**settings)
         self.vertex_head = head.to(self.vertex_device).eval()
+        self.vertex_head.start_acts()       # boots while the checkpoints and data load
 
     def _vertex_head(self, class_probs, mask_probs, points, padding_mask):
         """VertexHead on its device (vertex_device); its tensor outputs back on the trainer's device."""

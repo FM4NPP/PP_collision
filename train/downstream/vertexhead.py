@@ -407,20 +407,26 @@ ACTS_TIMING = {"start_s": 0.0, "propagate_s": 0.0, "states": 0}
 
 class _ActsWorker:
     """
-    One persistent ACTS worker process (scripts/acts/acts_worker.py).
+    One persistent ACTS worker process (scripts/acts/acts_worker.py), started in the background; the first
+    propagate waits until it is ready.
     """
     def __init__(self, command, config):
-        t0 = time.perf_counter()
+        self.command = command
+        self.ready = False
         self.process = subprocess.Popen(list(command) + [ACTS_WORKER_SCRIPT, json.dumps(config)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        while True:                     # start-up output (e.g. ACTS's setup) until the ready line
+
+    def wait_ready(self):
+        """Waits for the worker's ready line (its start-up output passed to stderr); the wait counts as start time."""
+        t0 = time.perf_counter()
+        while not self.ready:           # start-up output (e.g. ACTS's setup) until the ready line
             line = self.process.stdout.readline()
             if not line:
                 raise RuntimeError(f"ACTS worker exited during start-up (code {self.process.wait()}): "
-                                   f"{' '.join(command)}; its error output is above")
-            if line.strip() == b"ACTS_WORKER_READY":
-                break
-            sys.stderr.write(line.decode(errors="replace"))
+                                   f"{' '.join(self.command)}; its error output is above")
+            self.ready = line.strip() == b"ACTS_WORKER_READY"
+            if not self.ready:
+                sys.stderr.write(line.decode(errors="replace"))
         ACTS_TIMING["start_s"] += time.perf_counter() - t0
 
     def propagate(self, position, direction, qop, covariance):
@@ -429,6 +435,7 @@ class _ActsWorker:
         perigee: parameters (n, 6), ok (n,) and covariance (n, 6, 6).
         """
         import numpy as np
+        self.wait_ready()
         t0 = time.perf_counter()
         n = len(qop)
         self.process.stdin.write(struct.pack("<Q", n) + b"".join(
@@ -831,6 +838,11 @@ class VertexHead(nn.Module):
                              "2026-11-05 simplification: vertex_weighting and adaptive_fit, as the covariance-weighted "
                              "adaptive fit is now the only fit)")
         return cls(**{**kwargs, **overrides})
+
+    def start_acts(self):
+        """Starts the ACTS worker in the background (with use_acts), so it is ready by the first forward pass."""
+        if self.use_acts:
+            _acts_worker(self.acts_worker_command(), self.acts_worker_config())
 
     def acts_worker_command(self):
         """

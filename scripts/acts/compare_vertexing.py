@@ -218,6 +218,7 @@ def main():
     args = parser.parse_args()
 
     head = vh.VertexHead.from_detector(args.detector, find_secondary=True).eval()
+    head.start_acts()       # boots while the CSV loads
     pv_rows, axis_rows, sv_rows, notes = [], [], [], []
     timing = dict.fromkeys(("reading the CSV", "VertexHead", "ACTS AMVF"), 0.0)
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
