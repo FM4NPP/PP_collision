@@ -23,7 +23,7 @@ from torch.amp import autocast
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel
 
 from tqdm import tqdm 
@@ -727,6 +727,17 @@ class DownstreamTrainer():
             return feature
         return torch.einsum("lbnd,l->bnd", feature, feature.new_tensor(weights)).unsqueeze(0)
 
+    def _length_sorted_loader(self, max_events=None):
+        """The test loader over its first max_events events (all: None), batched by number of points: the same events
+        with less padding."""
+        loader, dataset = self.val_data_loader, self.val_data_loader.dataset
+        if not hasattr(dataset, "seqlens") or len(dataset.seqlens) != len(dataset) or dist.is_initialized():
+            raise ValueError("length_sorted_batches needs the plain (unchunked, single-process) test dataset")
+        n = min(max_events or len(dataset), len(dataset))
+        order = sorted(range(n), key=lambda i: dataset.seqlens[i])
+        return DataLoader(dataset, batch_sampler=[order[k:k + loader.batch_size] for k in range(0, n, loader.batch_size)],
+                          num_workers=loader.num_workers, pin_memory=loader.pin_memory, collate_fn=loader.collate_fn)
+
     @torch.no_grad()
     def run_vertexing(self, pretrain=True, max_events=None, save_csv=False):
         """
@@ -805,7 +816,9 @@ class DownstreamTrainer():
             timing[stage] += now - clock[0]
             clock[0] = now
 
-        for step, batch in enumerate(tqdm(self.val_data_loader)):
+        loader = (self._length_sorted_loader(max_events) if getattr(self.params, "length_sorted_batches", False)
+                  else self.val_data_loader)
+        for step, batch in enumerate(tqdm(loader)):
             if len(batch) != 4:
                 raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
                                    "set params.return_reg_test = True before launch()")

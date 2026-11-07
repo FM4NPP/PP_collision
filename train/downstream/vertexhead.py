@@ -18,6 +18,7 @@ import math
 import os
 import struct
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -408,25 +409,41 @@ ACTS_TIMING = {"start_s": 0.0, "propagate_s": 0.0, "states": 0}
 class _ActsWorker:
     """
     One persistent ACTS worker process (scripts/acts/acts_worker.py), started in the background; the first
-    propagate waits until it is ready.
+    propagate waits until it is ready. Its output (ROOT's and ACTS's start-up messages) goes to a log file, not
+    the terminal: its failure summary is printed at close, the log's end with an error.
     """
     def __init__(self, command, config):
         self.command = command
         self.ready = False
-        self.process = subprocess.Popen(list(command) + [ACTS_WORKER_SCRIPT, json.dumps(config)],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        fd, self.log_path = tempfile.mkstemp(prefix="acts_worker_", suffix=".log")
+        os.close(fd)
+        with open(self.log_path, "ab") as log:      # appending: the worker's writes never overwrite each other
+            self.process = subprocess.Popen(list(command) + [ACTS_WORKER_SCRIPT, json.dumps(config)],
+                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+
+    def log(self, lines=None):
+        """The worker's output so far (its last lines with lines)."""
+        with open(self.log_path, errors="replace") as f:
+            text = f.read().splitlines()
+        return "\n".join(text[-lines:] if lines else text)
+
+    def failure(self, what):
+        """RuntimeError for a worker that stopped, with the end of its output (the log is kept)."""
+        self.keep_log = True
+        return RuntimeError(f"ACTS worker {what} (code {self.process.wait()}): {' '.join(self.command)}; the end of "
+                            f"its output ({self.log_path}):\n{self.log(40)}")
 
     def wait_ready(self):
-        """Waits for the worker's ready line (its start-up output passed to stderr); the wait counts as start time."""
+        """Waits for the worker's ready line; the wait counts as start time."""
         t0 = time.perf_counter()
-        while not self.ready:           # start-up output (e.g. ACTS's setup) until the ready line
+        while not self.ready:           # start-up output on stdout (e.g. ACTS's setup) until the ready line
             line = self.process.stdout.readline()
             if not line:
-                raise RuntimeError(f"ACTS worker exited during start-up (code {self.process.wait()}): "
-                                   f"{' '.join(self.command)}; its error output is above")
+                raise self.failure("exited during start-up")
             self.ready = line.strip() == b"ACTS_WORKER_READY"
             if not self.ready:
-                sys.stderr.write(line.decode(errors="replace"))
+                with open(self.log_path, "ab") as log:
+                    log.write(line)
         ACTS_TIMING["start_s"] += time.perf_counter() - t0
 
     def propagate(self, position, direction, qop, covariance):
@@ -443,7 +460,7 @@ class _ActsWorker:
         self.process.stdin.flush()
         reply = self.process.stdout.read(n * 337)
         if len(reply) != n * 337:
-            raise RuntimeError(f"ACTS worker stopped (code {self.process.poll()}); its error output is above")
+            raise self.failure("stopped")
         ACTS_TIMING["propagate_s"] += time.perf_counter() - t0
         ACTS_TIMING["states"] += n
         return (np.frombuffer(reply[: n * 48], "<f8").reshape(n, 6).copy(),
@@ -451,9 +468,18 @@ class _ActsWorker:
                 np.frombuffer(reply[n * 48: n * 336], "<f8").reshape(n, 6, 6).copy())
 
     def close(self):
+        """Ends the worker and prints its failure summary (the lines from "ACTS worker:" on)."""
         if self.process.poll() is None:
             self.process.stdin.close()
             self.process.wait(timeout=30)
+        if not os.path.exists(self.log_path):       # closed before
+            return
+        text = self.log().splitlines()
+        start = next((i for i, line in enumerate(text) if line.startswith("ACTS worker:")), len(text))
+        if start < len(text):
+            sys.stderr.write("\n".join(text[start:]) + "\n")
+        if not getattr(self, "keep_log", False):
+            os.remove(self.log_path)
 
 def _acts_worker(command, config):
     """

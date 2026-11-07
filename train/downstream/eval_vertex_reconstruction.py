@@ -6,7 +6,8 @@ Evaluate VertexHead after a trained track-finding head. Run from train/downstrea
     python eval_vertex_reconstruction.py --root_dir out/ --checkpoint <head.pth> [--no-csv]
 
 Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
---checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events.
+--checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events. Speed:
+--eval_batch_size, --length_sorted_batches, --no-use_amp (full precision).
 Outputs in <root_dir>/<backbone checkpoint>/<track-head checkpoint>/e<events>/: data/vertex_eval_<N>_per_point_data.csv,
 logs/vertex_eval_<N>.log (parameters, metrics) and metrics/vertex_eval_<N>.json (inputs, fit settings, metrics).
 --no_output writes nothing.
@@ -188,6 +189,18 @@ def main():
              "the backbone and track head still run per loader batch",
     )
     parser.add_argument(
+        "--use_amp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="bf16 autocast for the backbone and track head (default: on; --no-use_amp: full precision)",
+    )
+    parser.add_argument(
+        "--length_sorted_batches",
+        action="store_true",
+        help="Batch the evaluated events by their number of points (less padding; the same events, in a "
+             "different order)",
+    )
+    parser.add_argument(
         "--vertex_device",
         type=str,
         default=None,
@@ -262,6 +275,9 @@ def main():
         params.vertex_chunk_events = args.vertex_chunk_events
     if args.vertex_device is not None:
         params.vertex_device = args.vertex_device
+    if args.use_amp is not None:
+        params.use_amp = args.use_amp
+    params.length_sorted_batches = args.length_sorted_batches
     if args.detector is not None:
         params.vertex_detector = os.path.abspath(args.detector)
 
