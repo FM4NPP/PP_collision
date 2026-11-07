@@ -163,7 +163,7 @@ def main():
         "--bz",
         type=float,
         default=None,
-        help="Solenoid field, Tesla (default: YAML vertex_bz, else the detector file's, else 1.4)",
+        help="Solenoid field, Tesla (default: YAML vertex_Bz, else the detector file's, else 1.4)",
     )
     parser.add_argument(
         "--detector",
@@ -260,7 +260,7 @@ def main():
     params.return_dict = False           # the trainer unpacks tuples, like track_finding_trainer
     # the run's settings, through params[...] so the run log records them (None: the model YAML's or the default)
     for key, value in (("batch_size", args.eval_batch_size), ("valid_batch_size", args.eval_batch_size),
-                       ("vertex_bz", args.bz), ("vertex_chunk_events", args.vertex_chunk_events),
+                       ("vertex_Bz", args.bz), ("vertex_chunk_events", args.vertex_chunk_events),
                        ("vertex_device", args.vertex_device),
                        ("vertex_detector", args.detector and os.path.abspath(args.detector)),
                        ("truth_radius", args.truth_radius), ("no_output", args.no_output)):

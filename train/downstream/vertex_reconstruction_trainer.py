@@ -134,16 +134,6 @@ class DownstreamTrainer():
     # Infrastructure as in the other downstream trainers (track_finding_trainer, point_classification_trainer)
     # ------------------------------------------------------------------------------------------
 
-    def _find_available_gpu(self, max_memory_threshold=1000):
-        '''Find the first GPU with memory usage below a threshold (in MB).'''
-        for gpu_id in range(torch.cuda.device_count()):
-            allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2  # Convert to MB
-            if allocated < max_memory_threshold:
-                return gpu_id
-        return None 
-
-
-    """ trainer class """
     def __init__(self, params, args):
         
         ''' init vars for distributed training (ddp) and logging'''
@@ -169,15 +159,7 @@ class DownstreamTrainer():
             torch.backends.cudnn.benchmark = True
 
         self.log_to_screen = (self.world_rank==0)
-        if torch.cuda.is_available():
-            available_gpu = self._find_available_gpu()
-            if available_gpu is not None:
-                
-                torch.cuda.set_device(available_gpu)
-                print(f"Using GPU {available_gpu} with memory below threshold.")
-            self.device = torch.cuda.current_device()
-        else:
-            self.device = torch.device('cpu')
+        self.device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu')
         
         self.params = params
         self.use_amp = bool(getattr(self.params, 'use_amp', True))
@@ -489,7 +471,8 @@ class DownstreamTrainer():
     def setup_vertexing(self, track_ckpt):
         """
         Load the track head and build VertexHead (after launch()). From params: vertex_detector (detector file),
-        vertex_bz, vertex_device, and any VertexHead argument as vertex_<argument>, each only where set.
+        vertex_device, and any VertexHead argument as vertex_<argument> (e.g. vertex_Bz, vertex_learn_weights), each
+        only where set.
         """
         n_feat = 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone
         self.down_model = MambaAttentionHead(
@@ -503,13 +486,11 @@ class DownstreamTrainer():
         self.down_model.load_state_dict(self._load_checkpoint_state(track_ckpt, "model_state_dict")[1])
         self.down_model.eval()
 
-        # VertexHead arguments set in params as vertex_<argument>; vertex_bz is the field (Bz)
+        # VertexHead arguments set in params as vertex_<argument>
         names = set(inspect.signature(VertexHead.__init__).parameters) - {"self"}
         settings = {name: getattr(self.params, "vertex_" + name) for name in names
                     if getattr(self.params, "vertex_" + name, None) is not None}
-        if getattr(self.params, "vertex_bz", None) is not None:
-            settings["Bz"] = float(self.params.vertex_bz)
-        # VertexHead's device (vertex_device, e.g. "cpu": faster than the GPU for its many small operations)
+        # VertexHead's device (vertex_device, e.g. cuda or cpu; default: the trainer's)
         self.vertex_device = torch.device(getattr(self.params, "vertex_device", None) or self.device)
         detector = getattr(self.params, "vertex_detector", None)
         head = VertexHead.from_detector(detector, **settings) if detector else VertexHead(**settings)
@@ -668,8 +649,9 @@ class DownstreamTrainer():
         with ThreadPoolExecutor(max_workers=1) as pool:     # shut down on errors too
             for batch in tqdm(self.val_data_loader):
                 if len(batch) != 4:
-                    raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
-                                       "set params.return_reg_test = True before launch()")
+                    raise RuntimeError("loader must yield (grouped, label, knearest, reg): the test set with "
+                                       "params.return_reg_test = True before launch(), a training set with its "
+                                       "dataset's return_reg = True")
                 grouped, label, _, reg = batch
                 if max_events:      # the last batch: only the events still wanted
                     grouped, label, reg = (t[:max_events - n_seen] for t in (grouped, label, reg))
