@@ -7,7 +7,8 @@ compare_vertexing (finder tracks):
 
 1. Correlations in the ACTS track covariance VertexHead's metric leaves out: d0-phi, d0-z0, z0-theta.
 2. On the events where ACTS finds a vertex, per axis: VertexHead, ACTS AMVF, and VertexHead seeded at ACTS's
-   vertex (its first annealing weights from compatibility with it). Seeded VertexHead matching AMVF transversely
+   vertex (its first annealing weights from compatibility with it), and ACTS AMVF given only the (d0, z0) block and
+   the variances (what VertexHead's metric uses). Seeded VertexHead matching AMVF transversely
    -> the gap is association (which tracks), not the metric.
 """
 import argparse
@@ -33,6 +34,12 @@ def main():
     with torch.no_grad():
         outs = [head(*e[0]()) for e in events]
     acts_pv, _ = cv.acts_vertices(head, outs)
+    # ACTS again with only what VertexHead's metric uses: the (d0, z0) block and the other variances
+    block = torch.zeros(6, 6, dtype=torch.bool)
+    block[:2, :2] = True
+    block |= torch.eye(6, dtype=torch.bool)
+    reduced = [{**o, "track_covariance": o["track_covariance"].masked_fill(~block, 0.0)} for o in outs]
+    acts_reduced, _ = cv.acts_vertices(head, reduced)
 
     # 1. correlations of the tracks VertexHead fits (ACTS perigee covariance: d0, z0, phi, theta, q/p)
     rho = {name: [] for name in ("d0-phi", "d0-z0", "z0-theta")}
@@ -63,7 +70,8 @@ def main():
     print(f"\n{'ACTS events, finder tracks':28s} {'events':>6s} {'median':>7s} {'90%':>7s} {'<1cm':>6s} {'xy med':>7s} "
           f"{'|z| med':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (cm)")
     for name, v in (("VertexHead", np.where(on_acts[:, None], vertices, np.nan)), ("ACTS AMVF", acts_pv),
-                    ("VertexHead seeded at ACTS", seeded)):
+                    ("VertexHead seeded at ACTS", seeded),
+                    ("ACTS AMVF, no correlations", np.where(on_acts[:, None], acts_reduced, np.nan))):
         (n, m, _, p90, within), axes = cv.pv_stats(v, events)
         print(f"{name:28s} {n:6d} {m:7.4f} {p90:7.4f} {within:6.1%} {axes[0]:7.4f} {axes[2]:7.4f} {axes[7]:7.4f} "
               f"{axes[8]:7.4f} {axes[9]:7.4f}")
