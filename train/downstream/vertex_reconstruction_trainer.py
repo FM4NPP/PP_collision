@@ -44,8 +44,8 @@ from loss import compute_vertex_metrics, assign_points_to_masks
 
 PAD_VALUE = -100
 
-# track finding's per-point CSV columns (batch_idx: the event's index, as the loader step is at batch size 1;
-# vtx_*: the hit's particle's truth production vertex, cm)
+# track finding's per-point CSV columns (batch_idx: the event's index; vtx_*: the hit's particle's truth production
+# vertex, cm)
 PER_POINT_COLUMNS = ("batch_idx", "point_idx", "E_norm", "eta_norm", "phi_norm", "r_norm",
                      "px", "py", "pz", "vtx_x", "vtx_y", "vtx_z", "charge", "energy",
                      "seg_target", "pred_assignment", "confidence")
@@ -101,7 +101,7 @@ def per_point_columns(first_event, grouped, label, reg, mask, class_probs, mask_
     b, n = mask.nonzero(as_tuple=True)
 
     def col(t):
-        # float64 (exact for bf16 and float32) so the CSV prints each value as inference()'s .item() does
+        # float64 (exact for float32) so the CSV prints each value as track_finding_trainer.inference()'s .item() does
         t = t[b, n] if t.dim() == 2 else t[b]
         return t.double().cpu().numpy()
 
@@ -426,9 +426,8 @@ class DownstreamTrainer():
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     # ------------------------------------------------------------------------------------------
-    # Training (ML phase): the same names and signatures as the other trainers' methods. VertexHead's learnable
-    # parts (learn_weights) train with the backbone and track head frozen; launch() builds the train loader, and
-    # _save_checkpoint / load_checkpoint hold VertexHead and its optimizer and scheduler. The loss is to be written.
+    # Training (ML phase, loss not written): VertexHead's learnable parts (learn_weights) with the backbone and track
+    # head frozen; same names and signatures as the other trainers.
     # ------------------------------------------------------------------------------------------
 
     def train(self, pretrain=True, train_from_checkpoint=False, checkpoint_path=None):
@@ -458,7 +457,7 @@ class DownstreamTrainer():
             num_prototypes=self.params.max_gt_classes,
             embed_method=getattr(self.params, "embed_method", "add")).to(self.device)
 
-        # strict, unlike load_checkpoint(): a mismatched checkpoint raises instead of half-loading
+        # strict: a mismatched checkpoint raises instead of half-loading
         self.down_model.load_state_dict(self._load_checkpoint_state(track_ckpt, "model_state_dict")[1])
         self.down_model.eval()
 
@@ -476,7 +475,7 @@ class DownstreamTrainer():
     def _vertex_head_chunk(self, records):
         """
         VertexHead once over several loader batches, padded to a common size; returns each batch's
-        (vertex_estimate, fit_is_valid). Each event keeps only the track slots VertexHead can fit, those at least
+        (vertex_estimate, fit_is_valid, track counts per event: usable, acts_failed, acts_refit_failed (0 without)). Each event keeps only the track slots VertexHead can fit, those at least
         min_hits real hits are assigned to (VertexHead's argmax), and the hits of the others stay unassigned: the
         same result, without the track head's mostly empty max_gt_classes slots. VertexHead runs on vertex_device;
         the results come back to the CPU.
@@ -501,13 +500,17 @@ class DownstreamTrainer():
             points=torch.stack([pad(p, (0, 0, 0, n_hits - len(p))) for *_, p, _ in events]).to(d),
             padding_mask=torch.stack([pad(real, (0, n_hits - len(real)), value=False) for *_, real in events]).to(d))
         sizes = [r["mask"].shape[0] for r in records]
-        return list(zip(result["vertex_estimate"].cpu().split(sizes), result["fit_is_valid"].cpu().split(sizes)))
+        zeros = torch.zeros_like(result["track_quality_mask"])
+        counts = torch.stack([result.get(k, zeros).sum(dim=-1) for k in ("track_quality_mask", "acts_failed",
+                                                                          "acts_refit_failed")], dim=-1)
+        return list(zip(result["vertex_estimate"].cpu().split(sizes), result["fit_is_valid"].cpu().split(sizes),
+                        counts.cpu().split(sizes)))
 
     def inference(self, checkpoint_path, max_events=None, pretrain=True, save_csv=False, csv_output_path=None):
         """
-        setup_vertexing, then run_vertexing over at most max_events (None: all); appends the metrics to the run log
-        and writes the CSV (default: the run folder's data/) and the metrics JSON (metrics/: inputs, VertexHead's
-        fit settings, metrics), unless no_output.
+        setup_vertexing, then run_vertexing over at most max_events (None: all); appends the metrics to the run log,
+        writes the per-point CSV with save_csv (csv_output_path, default the run folder's data/) and, unless
+        no_output, the metrics JSON (metrics/: inputs, the track settings (TrackBuilder.track_fit_config), metrics).
 
         Args:
             checkpoint_path: track-head checkpoint; pretrain: backbone features (True) or raw points.
@@ -555,14 +558,15 @@ class DownstreamTrainer():
             pretrain: backbone features (True) or raw points; max_events: limit (None: all); save_csv: build the CSV.
 
         Returns:
-            dict: metrics (incl. time_<stage>_ms_per_event), vertex_estimate, vertex_target (n, 3), fit_is_valid (n,),
+            dict: metrics (incl. time_<stage>_ms_per_event), vertex_estimate, vertex_target (n, 3), fit_is_valid (n,)
+            (the fit is valid and the truth PV is defined),
             timing (seconds busy per stage; truth, vertex_head and csv overlap the others), per_point (with
             save_csv).
         """
         self.model.eval()
         # full fp32: no TF32 in matrix multiplies or convolutions
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-        est, tgt, ok, per_point = [], [], [], []
+        est, tgt, reco_valid, truth_valid, track_counts, per_point = [], [], [], [], [], []
         chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
         pending = []        # loader batches waiting for VertexHead (CPU copies)
         job = [None]
@@ -584,7 +588,7 @@ class DownstreamTrainer():
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
                 fitted = self._vertex_head_chunk(records)
             t2 = time.perf_counter()
-            for r, (vertex, valid) in zip(records, fitted):
+            for r, (vertex, valid, counts) in zip(records, fitted):
                 if save_csv:
                     truth_vertex = r["truth"]["vertex_target"].masked_fill(~r["truth"]["vertex_valid"][:, None],
                                                                            float("nan"))
@@ -593,7 +597,9 @@ class DownstreamTrainer():
                                                        r["truth"]["hit_vertex"]))
                 est.append(vertex)
                 tgt.append(r["truth"]["vertex_target"])
-                ok.append(valid & r["truth"]["vertex_valid"])
+                reco_valid.append(valid)
+                truth_valid.append(r["truth"]["vertex_valid"])
+                track_counts.append(counts)
             timing["truth"] += t1 - t0
             timing["vertex_head"] += t2 - t1
             timing["csv"] += time.perf_counter() - t2
@@ -610,7 +616,7 @@ class DownstreamTrainer():
 
         stages = ("data", "backbone", "track_head", "to_cpu", "waiting", "truth", "vertex_head", "csv")
         timing = dict.fromkeys(stages, 0.0)
-        vertexing.ACTS_TIMING.update(start_s=0.0, propagate_s=0.0, states=0)
+        vertexing.ACTS_TIMING.update(start_s=0.0, propagate_s=0.0, states=0, restarts=0)
         # the main loop's own stream only (VertexHead runs on another)
         sync = torch.cuda.current_stream().synchronize if torch.cuda.is_available() else (lambda: None)
         clock = [time.perf_counter()]
@@ -658,9 +664,17 @@ class DownstreamTrainer():
             flush()              # and waits for it
         timing["wall"] = wall = time.perf_counter() - start
 
-        est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)
+        est, tgt, reco_valid, truth_valid = torch.cat(est), torch.cat(tgt), torch.cat(reco_valid), torch.cat(truth_valid)
+        ok = reco_valid & truth_valid
         metrics = compute_vertex_metrics(est, tgt, ok)
-        metrics.update(n_events=len(ok), fit_valid_rate=ok.float().mean().item())
+        # fit_valid_rate: valid fits among the events with a truth PV (the accuracies are over those fits)
+        metrics.update(n_events=len(ok), truth_valid_rate=truth_valid.float().mean().item(),
+                       fit_valid_rate=reco_valid[truth_valid].float().mean().item())
+        usable, acts_failed, refit_failed = torch.cat(track_counts).double().mean(dim=0).tolist()
+        metrics.update(usable_tracks_per_event=usable)
+        if self.vertex_head.tracks.use_acts:
+            metrics.update(acts_failed_per_event=acts_failed, acts_refit_failed_per_event=refit_failed,
+                           acts_worker_restarts=vertexing.ACTS_TIMING["restarts"])
         timing["acts_start"] = vertexing.ACTS_TIMING["start_s"]
         timing["acts_propagate"] = vertexing.ACTS_TIMING["propagate_s"]
         n_events = max(len(ok), 1)

@@ -3,11 +3,13 @@
 #   scripts/run/vertexing.sh setup [options]      ACTS image (if missing) and module; writes or updates the site
 #                                                 detector file
 #   scripts/run/vertexing.sh eval [options]       eval_vertex_reconstruction.py with the run config
-#   scripts/run/vertexing.sh compare [options]    VertexHead vs ACTS's vertex finder on the newest CSV in root_dir
+#   scripts/run/vertexing.sh compare [options]    VertexHead and ACTS's vertex finder against truth on the newest
+#                                                 CSV under root_dir (--csv <file> for another)
 # setup options: --geometry, --geometry_config, --material_map <file> (ACTS inputs, must exist);
 # --field_map <file> (a ROOT map, converted into the detector folder and then used by every site file, or an ACTS
-# text map; with --field_kind xyz|rz, --field_rescale <factor>); --set [section.]key=<value> for any other detector-file setting (e.g.
-# --set acts.energy_loss=true, --set vertex_head.track_error_scale=2.5); --rebuild-base. Other commands pass
+# text map; with --field_kind xyz|rz, --field_rescale <factor> (ROOT map only)); --set [section.]key=<value> for any
+# other detector-file setting (e.g. --set acts.energy_loss=true, --set vertex_head.track_error_scale=2.5);
+# --rebuild-base. Other commands pass
 # options to the Python script.
 # RUN_CONFIG picks the run (default scripts/configs/vertex_m5_gpuserver0.yaml); its detector: key names the site
 # detector file, which setup writes from scripts/acts/detectors/sphenix/sphenix.yaml, keeping the site's own values.
@@ -133,7 +135,8 @@ EOF
         ;;
     compare)
         # the newest eval output under root_dir (<backbone>/<track head>/e<events>/); --csv <file> overrides it
-        csv=$(find "$ROOT_DIR" -name '*_per_point_data.csv' -printf '%T@ %p\n' 2> /dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+        [[ -d $ROOT_DIR ]] || { echo "root_dir $ROOT_DIR does not exist: run 'eval' first" >&2; exit 1; }
+        csv=$(find "$ROOT_DIR" -name '*_per_point_data.csv' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2- || true)
         [[ -n "$csv" ]] || { echo "no per-point CSV under $ROOT_DIR: run 'eval' first" >&2; exit 1; }
         echo "comparing on $csv"
         python "$REPO/scripts/acts/compare_vertexing.py" --csv "$csv" --detector "$DETECTOR" "$@"

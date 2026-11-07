@@ -10,9 +10,9 @@ geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (nu
 particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit, kalman_start_covariance_scale and hit_sigma (r phi, z).
 
 Protocol, after the line ACTS_WORKER_READY: n, m (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
-covariance (n, 6, 6), hit_track (m,), hits (m, 6) (the Kalman refit's hits: position, direction); reply float64
-params (n, 6), covariance (n, 6, 6), then ok (n,) and refitted (n,) uint8. States are
-propagated backward to the perigee. EOF ends it and prints a failure summary; everything else goes to stderr.
+covariance (n, 6, 6), hit_track (m,) each hit's state index (sorted) and hits (m, 6) (position, the hit fit's
+direction there): the Kalman refit's hits (m = 0 without kalman_refit). Reply: float64 params (n, 6), covariance
+(n, 6, 6), then ok (n,) and refitted (n,) uint8. States are propagated backward to the perigee. EOF ends it and prints a failure summary; everything else goes to stderr.
 """
 import collections
 import json

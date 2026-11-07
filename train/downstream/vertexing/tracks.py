@@ -2,8 +2,9 @@
 tracks.py: TrackBuilder, the tracks for the vertex fit, from the track finder's output.
 
 A helix fitted to each track's hits (Taubin circle, z against arc length), as ACTS perigee parameters
-(d0, z0, phi, theta, q/p, t) in cm with a covariance from the hit errors; with use_acts, ACTS refits the hits and
-propagates the tracks to the beam spot through the detector (acts.py, scripts/acts).
+(d0, z0, phi, theta, q/p, t) in cm with a covariance from the hit errors; with use_acts, ACTS propagates the
+tracks to the beam line through the detector, refitting their hits first with acts_kalman_refit (acts.py,
+scripts/acts).
 """
 import functools
 import math
@@ -168,8 +169,8 @@ def _helix_from_hits(points, hit_r, track, assigned, n_tracks, Bz, min_hits, bea
                 (s from _arc_length); hit_s (B, N) each hit's s on its track.
             innermost (B, T): index of each track's innermost hit (0 for a track with none).
     """
-    x, y, z = (points[..., k].double() for k in (1, 2, 3))
-    r = hit_r.double()
+    x, y, z = (points[..., k] for k in (1, 2, 3))
+    r = hit_r
     Bz = torch.as_tensor(Bz, dtype=torch.float64, device=x.device)
 
     radius, xc, yc = _circle_fit(x, y, track, assigned, n_tracks, min_hits=min_hits)
@@ -288,7 +289,7 @@ def _circle_from_perigee(perigee, Bz, beam_position):
     return circle_centre, R_s, torch.cos(theta) / torch.sin(theta), z0, pT, d0.abs()
 
 # ------------------------------------------------------------------------------------------------
-# Field map: the ACTS text map the detector file names (field.map), for VertexHead's own track maths
+# Field map: the ACTS text map the detector file names (field.map), for TrackBuilder's own track maths
 # ------------------------------------------------------------------------------------------------
 
 class _FieldMap:
@@ -298,10 +299,17 @@ class _FieldMap:
     """
     def __init__(self, path, kind):
         import numpy as np
-        table = np.loadtxt(path, comments="#")
+        if kind not in ("xyz", "rz"):
+            raise ValueError(f"field map kind {kind!r}: xyz or rz")
+        table = np.loadtxt(path, comments="#", ndmin=2)
+        if table.shape[1] != (6 if kind == "xyz" else 4):
+            raise ValueError(f"{path}: {table.shape[1]} columns, a {kind} map has {6 if kind == 'xyz' else 4}")
         # the stored order, slowest axis first: xyz (x, y, z); rz (z, r)
         columns, bz = ((0, 1, 2), 5) if kind == "xyz" else ((1, 0), 3)
         axes = [np.unique(table[:, c]) for c in columns]
+        if any(len(a) < 2 or not np.allclose(np.diff(a), a[1] - a[0]) for a in axes) or table.shape[0] != math.prod(
+                len(a) for a in axes):
+            raise ValueError(f"{path}: not a full regular grid")
         self.kind = kind
         self.axes = [(float(a[0]), float(a[1] - a[0]), len(a)) for a in axes]
         self.values = torch.from_numpy(table[:, bz].reshape(*(len(a) for a in axes)).copy())
@@ -339,7 +347,7 @@ class TrackBuilder(nn.Module):
             covariance scale (start at the plain fit); weight_hidden_dim, gate_width_pt (GeV), gate_width_r (cm)
             configure them.
         Bz: uniform field, T; field_map (+ _kind): ACTS text field map (mm, T) instead, for ACTS and the tracks' pT
-            (Bz at their hits, and at the perigee for ACTS tracks); Bz must not be 0.
+            (Bz at their hits, and at the perigee for perigee tracks: ACTS's or given); Bz must not be 0.
         noise_pt_threshold (GeV), valid_radius (cm), min_hits: track usability cuts.
         beam_position: (x, y), cm; normalization: the dataset's hit normalization (TPC_NORMALIZATION).
         hit_sigma_rphi, hit_sigma_z: per-hit errors for the track covariance, cm.
@@ -390,8 +398,8 @@ class TrackBuilder(nn.Module):
         if (acts_geometry is None) != (acts_geometry_config is None) or ((acts_material_map or acts_energy_loss) and not acts_geometry):
             raise ValueError("acts_geometry and acts_geometry_config go together; acts_material_map and "
                              "acts_energy_loss need both")
-        if Bz == 0 or acts_kalman_fallback_covariance_scale <= 0:
-            raise ValueError("Bz must not be 0, acts_kalman_fallback_covariance_scale must be > 0")
+        if Bz == 0 or acts_kalman_fallback_covariance_scale <= 0 or field_map_kind not in ("xyz", "rz"):
+            raise ValueError("Bz must not be 0, acts_kalman_fallback_covariance_scale must be > 0, field_map_kind xyz or rz")
         self.learn_weights = learn_weights
         self.Bz = Bz
         self.noise_pt_threshold = noise_pt_threshold
@@ -443,7 +451,8 @@ class TrackBuilder(nn.Module):
 
     def acts_worker_command(self):
         """
-        The command that runs the ACTS worker (singularity exec, with scripts/acts and the ACTS input directories bound).
+        The command that runs the ACTS worker: acts_command if set, else singularity exec acts_image with
+        scripts/acts and the ACTS input directories bound.
         """
         if self.acts_command:
             return list(self.acts_command)
@@ -472,15 +481,16 @@ class TrackBuilder(nn.Module):
 
     def track_fit_config(self):
         """The track-model settings."""
-        return {k: getattr(self, k) for k in ("Bz", "noise_pt_threshold",
-                                              "valid_radius", "min_hits", "beam_position", "normalization")}
+        return {k: getattr(self, k) for k in ("Bz", "field_map", "noise_pt_threshold", "valid_radius", "min_hits",
+                                              "beam_position", "normalization", "use_acts", "acts_kalman_refit")}
 
     def forward(self, class_probs=None, mask_probs=None, points=None, padding_mask=None, track_parameters=None,
                 track_covariance=None):
         """
         Args:
-            class_probs: (B, T, 2) P(empty), P(real).
-            mask_probs: (B, N, T); points: (B, N, 4) normalized hits; padding_mask: (B, N), True = real.
+            class_probs: (B, T, 2) P(empty), P(real); always required (P(real) is the base track weight).
+            mask_probs: (B, N, T); points: (B, N, 4) normalized hits; padding_mask: (B, N), True = real: the hits
+                (unused with track_parameters).
             track_parameters, track_covariance: (B, T, 6), (B, T, 6, 6) given perigee tracks instead of hits
                 (ACTS units: mm).
 
@@ -494,7 +504,7 @@ class TrackBuilder(nn.Module):
         base_weight = class_probs[..., 1]
         if track_parameters is None:
             # track model: hits in cm (padding zeroed), hard assignment, each track's circle and z line
-            hits, hit_r = _unnormalize_hits(points.masked_fill(~padding_mask.unsqueeze(-1), 0.0), self.normalization)
+            hits, hit_r = _unnormalize_hits(points.double().masked_fill(~padding_mask.unsqueeze(-1), 0.0), self.normalization)
             # each real hit goes to its most probable track slot (none if all probabilities are 0)
             n_tracks = mask_probs.shape[-1]
             assigned = padding_mask & (mask_probs.max(dim=-1).values > 0)
@@ -518,7 +528,7 @@ class TrackBuilder(nn.Module):
                 # ACTS propagates the helix state at the innermost hit (mm) back to the beam spot; with the Kalman
                 # refit, ACTS first fits the hits from it
                 start_xy, t_xy = _circle_point(centre, R_s, hits[..., 1:3].gather(
-                    1, helix["innermost"].unsqueeze(-1).expand(-1, -1, 2)).double())
+                    1, helix["innermost"].unsqueeze(-1).expand(-1, -1, 2)))
                 start_s = _arc_length(start_xy[..., 0], start_xy[..., 1], centre[..., 0], centre[..., 1], R_s,
                                       self.beam_position)
                 start_z = start_s * zslope + helix["z0"]
@@ -537,9 +547,9 @@ class TrackBuilder(nn.Module):
                     order = torch.sort(helix["hit_s"][assigned], stable=True).indices
                     order = order[torch.sort(hit_track[order], stable=True).indices]
                     _, hit_t = _circle_point(centre.gather(1, track.unsqueeze(-1).expand(-1, -1, 2)), R_s.gather(1, track),
-                                             hits[..., 1:3].double())
+                                             hits[..., 1:3])
                     hit_theta = theta.gather(1, track).unsqueeze(-1)
-                    hit_xyz = torch.cat([hits[..., 1:4].double() * MM_PER_CM, torch.sin(hit_theta) * hit_t,
+                    hit_xyz = torch.cat([hits[..., 1:4] * MM_PER_CM, torch.sin(hit_theta) * hit_t,
                                          torch.cos(hit_theta)], dim=-1)[assigned][order]
                     hit_track = hit_track[order]
                 acts_out = _acts_worker(self.acts_worker_command(), self.acts_worker_config()).propagate(
@@ -579,12 +589,12 @@ class TrackBuilder(nn.Module):
         bad = ~torch.isfinite(perigee[..., :5]).all(dim=-1)          # tracks without a fit
         circle_centre, R_s, zslope, z0, pT, beam_dca = _circle_from_perigee(
             perigee, perigee_bz, self.beam_position)
+        # tracks without a usable covariance get no weight (and a finite stand-in error) and are not usable
+        has_sigma = torch.isfinite(track_sigma).all(dim=-1) & (track_sigma > 0).all(dim=-1)
         # the helix for the fit, with finite stand-ins for tracks without one (weight 0; their outputs are masked below)
-        params = {"pT": pT, "beam_dca": beam_dca, "usable": ~bad & self._usable(pT, beam_dca),
+        params = {"pT": pT, "beam_dca": beam_dca, "usable": ~bad & has_sigma & self._usable(pT, beam_dca),
                   "helix": (circle_centre.to(dtype).masked_fill(bad.unsqueeze(-1), 0.0), R_s.to(dtype).masked_fill(bad, 1.0),
                             zslope.to(dtype).masked_fill(bad, 0.0), z0.to(dtype).masked_fill(bad, 0.0))}
-        # tracks without a usable covariance get no weight (and a finite stand-in error)
-        has_sigma = torch.isfinite(track_sigma).all(dim=-1) & (track_sigma > 0).all(dim=-1)
         base_weight = base_weight * has_sigma.to(dtype)
         params["track_sigma"] = torch.where(has_sigma.unsqueeze(-1), track_sigma * self.track_error_scale, 1.0).to(dtype)
         perigee = perigee.masked_fill(bad.unsqueeze(-1), float("nan"))
@@ -613,7 +623,7 @@ class TrackBuilder(nn.Module):
             pT, beam_dca = params["pT"].nan_to_num(0.0), params["beam_dca"].nan_to_num(1e6)
             soft = (torch.sigmoid((pT.to(track_weight.dtype) - self.pt_threshold) / self.log_gate_width_pt.exp())
                     * torch.sigmoid((self.beam_radius - beam_dca.to(track_weight.dtype)) / self.log_gate_width_r.exp()))
-            params["usable"] = ~bad & (pT >= self.pt_threshold.detach()) & (beam_dca < self.beam_radius.detach())  # SVs too
+            params["usable"] = ~bad & has_sigma & (pT >= self.pt_threshold.detach()) & (beam_dca < self.beam_radius.detach())  # SVs too
             usable = params["usable"].to(track_weight.dtype) + soft - soft.detach()
         track_weight = track_weight * usable
         outputs = {

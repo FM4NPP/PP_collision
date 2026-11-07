@@ -9,7 +9,7 @@ Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else 
 --checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events. Speed:
 --eval_batch_size.
 Outputs in <root_dir>/<backbone checkpoint>/<track-head checkpoint>/e<events>/: data/vertex_eval_<N>_per_point_data.csv,
-logs/vertex_eval_<N>.log (parameters, metrics) and metrics/vertex_eval_<N>.json (inputs, fit settings, metrics).
+logs/vertex_eval_<N>.log (parameters, metrics) and metrics/vertex_eval_<N>.json (inputs, track settings, metrics).
 --no_output writes nothing.
 """
 import os
@@ -61,7 +61,8 @@ def main():
         "--checkpoint",
         type=str,
         default="",
-        help="Path to the trained track-head checkpoint (optional; overrides default)",
+        help="Track-head checkpoint (default: <track_config>_nerf_tracking_head_d<eventnumber>_<run_num>"
+             "[_seed<seed>][_nopretrain]_checkpoint.pth in --checkpoint_dir)",
     )
     parser.add_argument(
         "--checkpoint_dir",
@@ -86,7 +87,7 @@ def main():
         "--no_seed_in_ckpt",
         action="store_true",
         default=False,
-        help="Use a checkpoint name without the _seed<N> suffix (older checkpoints)",
+        help="Checkpoint name without the _seed<N> suffix",
     )
     parser.add_argument(
         "--save_csv",
@@ -149,7 +150,7 @@ def main():
         "--max_eval_events",
         type=int,
         default=20000,
-        help="Evaluate at most this many events",
+        help="Evaluate at most this many events (0: all); also names the run folder e<events>",
     )
     parser.add_argument(
         "--combine_weights",

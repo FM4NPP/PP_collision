@@ -39,7 +39,8 @@ class VertexHead(nn.Module):
     @classmethod
     def from_detector(cls, path, **overrides):
         """
-        A VertexHead from a detector file (scripts/acts/detectors/<name>/<name>.yaml); keyword arguments override it.
+        A VertexHead from a detector file (scripts/acts/detectors/<name>/<name>.yaml): use_acts when acts.image or
+        acts.command is set, its vertex_head block as further settings; keyword arguments override it.
         """
         import yaml
         with open(path) as f:
@@ -47,7 +48,7 @@ class VertexHead(nn.Module):
         base = os.path.dirname(os.path.abspath(path))
         resolve = lambda p: p if p is None else os.path.join(base, os.path.expanduser(p))  # noqa: E731 - absolute stays
         field, acts, hit_errors = d.get("field", {}), d.get("acts", {}) or {}, d.get("hit_errors_cm", {})
-        # unset keys (None) take VertexHead's defaults
+        # unset keys (None) take TrackBuilder's / VertexFinder's defaults
         kwargs = {
             "Bz": field.get("bz_tesla"),
             "beam_position": d.get("beam_position_cm"),
@@ -81,8 +82,9 @@ class VertexHead(nn.Module):
                 track_covariance=None):
         """
         Args:
-            class_probs: (B, T, 2) P(empty), P(real).
-            mask_probs: (B, N, T); points: (B, N, 4) normalized hits; padding_mask: (B, N), True = real.
+            class_probs: (B, T, 2) P(empty), P(real); always required (P(real) is the base track weight).
+            mask_probs: (B, N, T); points: (B, N, 4) normalized hits; padding_mask: (B, N), True = real: the hits
+                (unused with track_parameters).
             track_parameters, track_covariance: (B, T, 6), (B, T, 6, 6) given perigee tracks instead of hits
                 (ACTS units: mm).
 
@@ -94,10 +96,12 @@ class VertexHead(nn.Module):
                 With max_vertices > 1: primary_vertices (B, V, 3), primary_vertex_valid, primary_vertex_n_tracks (B, V),
                 pv_index (B,) the PV among them, track_primary_vertex (B, T) each track's vertex (-1: none).
                 track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
-                track_quality_mask, track_sigma (B, T, 2), track_vertex_weight, track_chi2, track_dca (B, T),
+                track_quality_mask, track_sigma (B, T, 2) d0, z0 errors (cm) x track_error_scale, track_vertex_weight
+                (B, T) each track's annealing weight in the PV fit, track_chi2, track_dca (B, T),
                 track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS;
                 acts_refit_failed (B, T) with the Kalman refit: propagated from the hit fit's state (refit failed);
-                track_covariance (B, T, 6, 6): the ACTS perigee covariance (mm), with use_acts or given.
+                track_covariance (B, T, 6, 6): the ACTS perigee covariance (mm), with use_acts (x
+                acts_kalman_fallback_covariance_scale where the refit failed) or as given.
                 With find_secondary: sv_estimate (B, K, 3), sv_is_valid, sv_chi2, sv_chi2_per_dof, sv_displacement,
                 sv_n_tracks (B, K), sv_track_mask, sv_track_dca (B, K, T), displaced_mask, displaced_weight (B, T).
         """

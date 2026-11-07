@@ -31,7 +31,7 @@ DEFAULT_CONFIG = "mamba_5m_downstream"
 
 
 def set_seed(seed):
-    """Set all random seeds for reproducibility, as train_track_finding.py does ([FIX B8])."""
+    """Set all random seeds (torch, CUDA, NumPy, random), as train_track_finding.py does."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)  # for multi-GPU setups

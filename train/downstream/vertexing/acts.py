@@ -16,7 +16,7 @@ ACTS_WORKER_SCRIPT = os.path.join(
                                   "scripts", "acts", "acts_worker.py")
 _ACTS_WORKERS = {}
 # seconds spent starting and running ACTS workers (the eval resets and reports it)
-ACTS_TIMING = {"start_s": 0.0, "propagate_s": 0.0, "states": 0}
+ACTS_TIMING = {"start_s": 0.0, "propagate_s": 0.0, "states": 0, "restarts": 0}
 
 class _ActsWorker:
     """
@@ -61,9 +61,9 @@ class _ActsWorker:
     def propagate(self, position, direction, qop, covariance, hit_track, hits):
         """
         States in mm (position, direction (n, 3), qop (n,), covariance (n, 6, 6)) propagated backward to the
-        perigee, with the Kalman refit's hits (hits (m, 6): position mm, the hit fit's direction there; hit_track (m,)
-        their state's index, sorted; m = 0
-        without it): parameters (n, 6), ok (n,) and covariance (n, 6, 6).
+        perigee; with the Kalman refit, their hits first (hits (m, 6): position mm and the hit fit's direction there;
+        hit_track (m,): their state's index, sorted; m = 0 without the refit). Returns parameters (n, 6), ok (n,),
+        covariance (n, 6, 6), refitted (n,).
         """
         import numpy as np
         self.wait_ready()
@@ -103,7 +103,13 @@ def _acts_worker(command, config):
     key = (tuple(command), json.dumps(config, sort_keys=True))
     if key not in _ACTS_WORKERS or _ACTS_WORKERS[key].process.poll() is not None:
         if key in _ACTS_WORKERS:
-            _ACTS_WORKERS[key].close()          # the dead one: its summary, and its log removed
+            # a worker that died between batches: its log kept, a new one started
+            dead = _ACTS_WORKERS[key]
+            dead.keep_log = True
+            sys.stderr.write(f"ACTS worker exited (code {dead.process.poll()}) between batches; restarting; its log: "
+                             f"{dead.log_path}\n")
+            ACTS_TIMING["restarts"] += 1
+            dead.close()
         _ACTS_WORKERS[key] = _ActsWorker(command, config)
     return _ACTS_WORKERS[key]
 

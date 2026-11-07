@@ -184,7 +184,7 @@ def _fit_vertex_by_helix_closest_approach(
 
         step = _fit_vertex_by_closest_approach(pca, tangent, track_weight, **linear_fit_kwargs)
         # each event stops at its own convergence (independent of the rest of the batch)
-        result = step if result is None else _select(still_moving, step, result)
+        result = step if result is None else _select(still_moving & step["fit_is_valid"], step, result)
         moved = (step["vertex_estimate"] - PV).norm(dim=-1) > tolerance
         # advance PV only where the fit is valid, so one bad event can't spread NaN
         PV = torch.where((still_moving & step["fit_is_valid"]).unsqueeze(-1), step["vertex_estimate"], PV)
@@ -313,6 +313,7 @@ class VertexFinder(nn.Module):
                                              fit["track_chi2"])}
         n_temperatures = len(self.annealing_temperatures)
         done, previous_weight = torch.zeros_like(fit["fit_is_valid"]), torch.zeros_like(track_weight)    # finished events keep their fit
+        adapted = torch.zeros_like(done)
         for i in range(self.adaptive_max_iterations):
             # one annealing step per update, then the last temperature
             t2 = 2.0 * self.annealing_temperatures[min(i, n_temperatures - 1)]
@@ -333,12 +334,16 @@ class VertexFinder(nn.Module):
                                                     + (~valid).view(-1, 1, 1) * torch.eye(3, dtype=dx.dtype, device=dx.device), dx)
             relative_shift = torch.where(singular == 0, (dx * shift).sum(dim=(-2, -1)), torch.inf)
             update = valid & ~done
+            adapted = adapted | update
             fit = _select(update, new, fit)
             # at the last temperature each event stops once its shift is small
             if i >= n_temperatures - 1:
                 done = done | (relative_shift <= self.max_relative_shift) | ~valid
                 if bool(done.all()):
                     break
+        if seed is not None:
+            # seeded events whose fit never updated are only the seed: not a valid vertex
+            fit = {**fit, "fit_is_valid": fit["fit_is_valid"] & (adapted | ~seeded.squeeze(-1))}
         return fit, vertex_weight
 
     def _find_secondary_vertices(self, pv_fit, track_position, track_direction, track_weight, params, pv_weight):

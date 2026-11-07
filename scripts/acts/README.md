@@ -2,9 +2,10 @@
 
 [ACTS](https://github.com/acts-project/acts) v48.2 (MPL-2.0), unmodified, in a Singularity/apptainer image, so it
 never touches `fm4npp-env`; it runs as a separate program, so its licence places no conditions on this repository.
-`VertexHead(use_acts=True)` hands each fitted track to ACTS, which propagates it from the innermost hit back to the
-beam line, through the field or the detector's tracking geometry with its material, and returns perigee
-parameters with their covariance.
+With `acts.image` set in the detector file, VertexHead's track builder (`TrackBuilder`, `use_acts`) hands each
+fitted track to ACTS. ACTS's Kalman fitter refits its hits (`kalman_refit`), then ACTS propagates the track from the
+innermost hit back to the beam line, through the field or the detector's tracking geometry with its material, and
+returns perigee parameters with their covariance.
 
 ## Quick start
 
@@ -34,15 +35,16 @@ Options after `eval` or `compare` go to the Python script, e.g. `eval --max_eval
 | file | what |
 |---|---|
 | `build_images.sh`, `acts-base.def` | the image (ROOT, HepMC3, ACTS) and the module compiled inside it into `perigee_propagator/build/install` |
-| `perigee_propagator/` | one C++ file: backward propagation to the perigee with covariance and material (not in ACTS's Python bindings) |
+| `perigee_propagator/` | one C++ file: ACTS Kalman refit of the hits, then backward propagation to the perigee with covariance and material (not in ACTS's Python bindings) |
 | `acts_worker.py` | runs in the image; VertexHead starts it once and streams track states to it |
 | `detectors/<name>/` | the detector file template `<name>.yaml` and the tools that make its inputs |
 | `check_geometry.py` | a detector's geometry and material map in ACTS |
 | `compare_vertexing.py` | VertexHead against ACTS's own vertex finder and truth: PV, PV per axis, SVs |
 | `acts_vertexing.py` | ACTS's vertex finder as shipped (AMVF, Gaussian seeder) on given tracks, for the comparison |
 
-Tracks ACTS fails on (soft curlers the hit fit already rejects) are dropped and flagged in `acts_failed`; the
-worker prints a failure summary when it exits.
+Tracks ACTS fails to propagate are dropped; those the hit fit had kept are flagged in `acts_failed`. Where the
+Kalman refit fails, the hit fit's state is propagated instead, with its covariance x `kalman_fallback_covariance_scale`,
+flagged in `acts_refit_failed`. The worker prints a failure summary when it exits.
 
 ## Adding a detector
 

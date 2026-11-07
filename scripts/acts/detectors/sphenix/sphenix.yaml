@@ -20,7 +20,7 @@ normalization:
   E_mean: 253.0982
   E_std: 268.7093
 
-hit_errors_cm:                 # per-hit errors for the hit fit's covariance (core residuals measured on the data)
+hit_errors_cm:                 # per-hit errors: the hit fit's covariance and the Kalman refit's measurements (core residuals on the data)
   rphi: 0.034
   z: 0.1
 
