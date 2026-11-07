@@ -10,8 +10,8 @@ and test_* truth columns.
 
 import numpy as np
 from sklearn.metrics import adjusted_rand_score
-import os, sys, time, shutil, random
-import argparse
+import copy
+import os, sys, time
 import inspect
 import torch
 
@@ -263,7 +263,9 @@ class DownstreamTrainer():
         total_weight = sum(weights.values())
         return {i: weights[i] / total_weight for i in weights}  # Normalize weights
 
-    def launch(self):
+    def launch(self, train=True):
+        """Run folder, backbone (pretrained checkpoint), optimizer and loaders; train=False (the eval): the test
+        loader only."""
         print(self.root_dir, self.config, self.run_num)
         # the run folder: params.run_folder (the eval: <backbone>/<track head>/e<events>), else <config>/<run_num>
         exp_dir = os.path.join(self.root_dir, getattr(self.params, "run_folder", None) or os.path.join(self.config, self.run_num))
@@ -400,7 +402,14 @@ class DownstreamTrainer():
         # between ~48 min/epoch and ~8 min/epoch.
         self.feature_cache = getattr(self.params, 'feature_cache', None)
         self.feature_cache_val = getattr(self.params, 'feature_cache_val', None)
-        if self.feature_cache:
+        if not train:
+            # the eval: the test loader. get_data_loader (shared) builds the training set too; limited to its first
+            # event it is not scanned (all its events otherwise)
+            loader_params = copy.copy(self.params)
+            loader_params.limit_data, loader_params.limit_size = True, 1
+            self.train_data_loader = self.train_sampler = None
+            _, _, self.val_data_loader, _ = get_data_loader(loader_params, dist.is_initialized())
+        elif self.feature_cache:
             self.train_data_loader, ds_tr = get_cached_data_loader(
                 self.feature_cache, batch_size=self.params.local_batch_size, shuffle=True,
                 num_workers=self.params.num_data_workers, limit_size=self.params.limit_size)
@@ -601,7 +610,8 @@ class DownstreamTrainer():
         #    self.model.load_state_dict(new_state_dict)
 
         self.iters = checkpoint['iters']
-        self.startEpoch = checkpoint['epoch']+1 if self.iters % len(self.train_data_loader) == 0 else checkpoint['epoch']
+        if self.train_data_loader is not None:     # the eval builds no train loader
+            self.startEpoch = checkpoint['epoch']+1 if self.iters % len(self.train_data_loader) == 0 else checkpoint['epoch']
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if self.scheduler is not None:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

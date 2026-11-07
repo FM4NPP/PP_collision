@@ -286,7 +286,7 @@ def main():
         trainer.cache_combined = True          # so the head is built with L=1
         trainer.eval_combine_weights = w       # so the backbone stack is collapsed the same way
         print(f'[eval] layer-combined head: {[round(x,4) for x in w]}')
-    trainer.launch()
+    trainer.launch(train=False)
     result = trainer.inference(
         checkpoint_path=checkpoint_path,
         pretrain=args.usepretrain,
