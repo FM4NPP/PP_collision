@@ -190,7 +190,7 @@ def _helix_from_hits(points, hit_r, track, assigned, n_tracks, Bz, min_hits, bea
             pT, theta, qop, beam_dca (closest approach of the circle to the beam line) (B, T).
             circle_centre (B, T, 2), R_s, zslope, z0 (B, T): the circle and z line z = zslope * s + z0
                 (s from _arc_length); hit_s (B, N) each hit's s on its track.
-            innermost, outermost (B, T): index of each track's innermost and outermost hit (0 for a track with none).
+            innermost (B, T): index of each track's innermost hit (0 for a track with none).
     """
     x, y, z = (points[..., k].double() for k in (1, 2, 3))
     r = hit_r.double()
@@ -226,7 +226,7 @@ def _helix_from_hits(points, hit_r, track, assigned, n_tracks, Bz, min_hits, bea
     return {
         "pT": pT, "theta": theta, "qop": q * torch.sin(theta) / pT, "beam_dca": beam_dca,
         "circle_centre": torch.where(fit_ok.unsqueeze(-1), torch.stack([xc, yc], dim=-1), nan.unsqueeze(-1)),
-        "R_s": R_s, "zslope": zslope, "z0": z0, "hit_s": s, "innermost": i_in, "outermost": i_out,
+        "R_s": R_s, "zslope": zslope, "z0": z0, "hit_s": s, "innermost": i_in,
     }
 
 def _track_covariance(s, track, assigned, n_tracks, theta, qop, s_reference, sigma_rphi, sigma_z, Bz, curvilinear,
@@ -670,7 +670,7 @@ class VertexHead(nn.Module):
             acts_max_steps, acts_threads (propagation threads; None: the CPUs it may use), acts_particle_pdg and
             acts_particle_mass (GeV; None: ACTS's mass for the PDG id; the tracks' particle, which sets energy loss and
             multiple scattering in material) configure it. acts_kalman_refit: ACTS's Kalman fitter first refits each
-            track's hits (hit_sigma_rphi, hit_sigma_z), from the hit fit's state at the outermost hit with its
+            track's hits (hit_sigma_rphi, hit_sigma_z), from the hit fit's state at the innermost hit with its
             covariance x acts_kalman_start_covariance_scale.
         find_secondary: find SVs; refit_pv: report the PV refitted with SV tracks shared.
         sv_min_track_pv_chi2, sv_min_track_beam_significance: SV candidate cuts.
@@ -1121,10 +1121,9 @@ class VertexHead(nn.Module):
                 track_bz, curvilinear, self.min_hits)
             if self.use_acts:
                 # ACTS propagates the helix state at the innermost hit (mm) back to the beam spot; with the Kalman
-                # refit, ACTS first fits the hits from the state at the outermost hit
+                # refit, ACTS first fits the hits from it
                 start_xy, t_xy = _circle_point(centre, R_s, hits[..., 1:3].gather(
-                    1, helix["outermost" if self.acts_kalman_refit else "innermost"].unsqueeze(-1).expand(-1, -1, 2)
-                ).double())
+                    1, helix["innermost"].unsqueeze(-1).expand(-1, -1, 2)).double())
                 start_s = _arc_length(start_xy[..., 0], start_xy[..., 1], centre[..., 0], centre[..., 1], R_s,
                                       self.beam_position)
                 start_z = start_s * zslope + helix["z0"]

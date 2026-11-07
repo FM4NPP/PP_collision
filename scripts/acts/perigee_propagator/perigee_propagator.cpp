@@ -2,8 +2,8 @@
 // acts_worker.py; the one call ACTS's Python bindings lack. Takes the field and geometry objects the bindings
 // build. Without a geometry: field only (VoidNavigator); with one: navigated, with material (MaterialInteractor).
 // With the Kalman refit: each track's hits are first fitted by ACTS's Kalman fitter (each hit an (r phi, z)
-// measurement on its own cylinder, DirectNavigator, field only: no TPC gas material), from the track's state at
-// its outermost hit inward; the fitted state at the innermost hit is then propagated to the perigee.
+// measurement on its own cylinder, DirectNavigator, field only: no TPC gas material) outward from the track's
+// state just inside its innermost hit; the smoothed state at the innermost hit is then propagated to the perigee.
 // States are split across threads (the propagator is const and keeps its state per call). Tracks are singly charged
 // particles of one hypothesis (PDG id, mass), which sets the energy loss and multiple scattering in material.
 // Units mm, GeV, e.
@@ -60,9 +60,9 @@ namespace py = pybind11;
 using Array = py::array_t<double, py::array::c_style | py::array::forcecast>;
 using RowMatrix6 = Eigen::Matrix<double, 6, 6, Eigen::RowMajor>;
 
-// the Kalman refit: a hit's cylinder is unbounded in z (mm); the fit starts this far (mm) outside the outermost hit
+// the Kalman refit: a hit's cylinder is unbounded in z (mm); the fit starts this far (mm) before the innermost hit
 constexpr double kHitCylinderHalfZ = 1e6;
-constexpr double kKalmanStartOffset = 1.0;
+constexpr double kKalmanStartOffset = 10.0;
 
 // one hit as a Kalman fit measurement: (r phi, z) = (0, z) on its own cylinder, rotated so the hit is at phi = 0
 struct HitLink {
@@ -126,7 +126,7 @@ class PerigeePropagator {
   }
 
   // position, direction (n, 3), q/p (n,) and covariance (n, 6, 6) (curvilinear, in the track's direction of
-  // travel; with the Kalman refit: at the outermost hit) and the hits (m, 3) with their state's index hit_track (m,)
+  // travel; at the innermost hit) and the hits (m, 3) with their state's index hit_track (m,)
   // (sorted by it, each track's hits in order along it; none without the refit) -> perigee parameters (d0, z0, phi,
   // theta, q/p, t) (n, 6), their covariance (n, 6, 6) (both NaN where ACTS failed or an input is not finite),
   // ok (n,) and {error message: count}
@@ -186,7 +186,7 @@ class PerigeePropagator {
             continue;
           }
           try {
-            const Acts::Vector3 at = m_kalman ? Acts::Vector3(pos + kKalmanStartOffset * dir.normalized()) : pos;
+            const Acts::Vector3 at = m_kalman ? Acts::Vector3(pos - kKalmanStartOffset * dir.normalized()) : pos;
             const auto state = Acts::BoundTrackParameters::createCurvilinear(
                 Acts::Vector4(at.x(), at.y(), at.z(), 0.0), dir.normalized(), Q[i], startCov, m_particle);
             std::string error;
@@ -248,8 +248,8 @@ class PerigeePropagator {
   }
 
  private:
-  // the Kalman fit of a track's count hits (in order along it), travelling backward from start (outside the
-  // outermost hit): the fitted state at the innermost hit
+  // the Kalman fit of a track's count hits (in order along it), travelling forward from start (before the
+  // innermost hit): the smoothed state at the innermost hit
   std::optional<Acts::BoundTrackParameters> refit(const Acts::BoundTrackParameters& start, const double* hits,
                                                   py::ssize_t count, std::string& error) const {
     if (count == 0) {
@@ -274,7 +274,6 @@ class PerigeePropagator {
     extensions.updater.connect<&Acts::GainMatrixUpdater::operator()<Acts::VectorMultiTrajectory>>(&m_updater);
     extensions.smoother.connect<&Acts::GainMatrixSmoother::operator()<Acts::VectorMultiTrajectory>>(&m_smoother);
     Acts::PropagatorPlainOptions plain(m_geometryContext, m_fieldContext);
-    plain.direction = Acts::Direction::Backward();
     if (m_maxSteps > 0) {
       plain.maxSteps = m_maxSteps;
     }
@@ -286,10 +285,18 @@ class PerigeePropagator {
       error = "Kalman refit: " + result.error().message();
       return std::nullopt;
     }
-    const auto state = tracks.trackStateContainer().getTrackState(result.value().tipIndex());
-    const Acts::BoundVector parameters = state.hasSmoothed() ? state.smoothed() : state.filtered();
-    const Acts::BoundMatrix covariance = state.hasSmoothed() ? state.smoothedCovariance() : state.filteredCovariance();
-    return Acts::BoundTrackParameters(state.referenceSurface().getSharedPtr(), parameters, covariance, m_particle);
+    // the innermost measurement: the last one from the tip back
+    std::optional<Acts::BoundTrackParameters> innermost;
+    for (const auto state : result.value().trackStatesReversed()) {
+      if (state.hasCalibrated() && state.hasSmoothed()) {
+        innermost.emplace(state.referenceSurface().getSharedPtr(), Acts::BoundVector(state.smoothed()),
+                          Acts::BoundMatrix(state.smoothedCovariance()), m_particle);
+      }
+    }
+    if (!innermost) {
+      error = "Kalman refit: not smoothed";
+    }
+    return innermost;
   }
 
   // a singly charged particle (the hit fit's q/p): the PDG id's mass from ACTS's particle data, or mass (GeV)

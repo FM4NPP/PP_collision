@@ -36,7 +36,7 @@ acts:                          # use_acts is on when image (or command) is set
   particle_pdg: 211            # tracks' particle (PDG id; its mass sets energy loss and multiple scattering in material)
   particle_mass: null          # GeV (null: ACTS's mass for particle_pdg)
   kalman_refit: true           # ACTS Kalman fit of each track's hits (hit_errors_cm) before the perigee propagation
-  kalman_start_covariance_scale: 100.0   # the fit's start: the hit fit's covariance at the outermost hit x this
+  kalman_start_covariance_scale: 100.0   # the fit's start: the hit fit's covariance at the innermost hit x this
 
 # any other VertexHead argument (VertexHead's defaults otherwise)
 vertex_head: {}
