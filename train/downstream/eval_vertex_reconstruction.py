@@ -7,7 +7,7 @@ Evaluate VertexHead after a trained track-finding head. Run from train/downstrea
 
 Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
 --checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events. Speed:
---eval_batch_size, --length_sorted_batches, --precision.
+--eval_batch_size, --precision.
 Outputs in <root_dir>/<backbone checkpoint>/<track-head checkpoint>/e<events>/: data/vertex_eval_<N>_per_point_data.csv,
 logs/vertex_eval_<N>.log (parameters, metrics) and metrics/vertex_eval_<N>.json (inputs, fit settings, metrics).
 --no_output writes nothing.
@@ -192,14 +192,8 @@ def main():
         "--precision",
         choices=("bf16", "fp16", "tf32", "fp32"),
         default=None,
-        help="Backbone and track-head arithmetic: bf16 or fp16 autocast, fp32 with TF32 matrix multiplies, or full "
-             "fp32 (default: bf16, else fp32 without the YAML's use_amp)",
-    )
-    parser.add_argument(
-        "--length_sorted_batches",
-        action="store_true",
-        help="Batch the evaluated events by their number of points (less padding; the same events, in a "
-             "different order)",
+        help="Backbone and track-head arithmetic: full fp32 (default; bf16 cost vertex accuracy: 0.9072 against "
+             "0.9109 within 0.5 cm), fp32 with TF32 matrix multiplies, or bf16 / fp16 autocast",
     )
     parser.add_argument(
         "--vertex_device",
@@ -278,7 +272,6 @@ def main():
         params.vertex_device = args.vertex_device
     if args.precision is not None:
         params.eval_precision = args.precision
-    params.length_sorted_batches = args.length_sorted_batches
     if args.detector is not None:
         params.vertex_detector = os.path.abspath(args.detector)
 

@@ -23,7 +23,7 @@ from torch.amp import autocast
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torch.nn.parallel import DistributedDataParallel
 
 from tqdm import tqdm 
@@ -727,17 +727,6 @@ class DownstreamTrainer():
             return feature
         return torch.einsum("lbnd,l->bnd", feature, feature.new_tensor(weights)).unsqueeze(0)
 
-    def _length_sorted_loader(self, max_events=None):
-        """The test loader over its first max_events events (all: None), batched by number of points: the same events
-        with less padding."""
-        loader, dataset = self.val_data_loader, self.val_data_loader.dataset
-        if not hasattr(dataset, "seqlens") or len(dataset.seqlens) != len(dataset) or dist.is_initialized():
-            raise ValueError("length_sorted_batches needs the plain (unchunked, single-process) test dataset")
-        n = min(max_events or len(dataset), len(dataset))
-        order = sorted(range(n), key=lambda i: dataset.seqlens[i])
-        return DataLoader(dataset, batch_sampler=[order[k:k + loader.batch_size] for k in range(0, n, loader.batch_size)],
-                          num_workers=loader.num_workers, pin_memory=loader.pin_memory, collate_fn=loader.collate_fn)
-
     @torch.no_grad()
     def run_vertexing(self, pretrain=True, max_events=None, save_csv=False):
         """
@@ -754,8 +743,9 @@ class DownstreamTrainer():
             save_csv).
         """
         self.model.eval()
-        # eval_precision: bf16 / fp16 autocast, tf32 (fp32 with TF32 matrix multiplies, global while this runs) or fp32
-        precision = getattr(self.params, "eval_precision", None) or ("bf16" if self.use_amp else "fp32")
+        # eval_precision: fp32 (default), tf32 (fp32 with TF32 matrix multiplies, global while this runs), bf16 / fp16
+        # autocast
+        precision = getattr(self.params, "eval_precision", None) or "fp32"
         amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision) if torch.cuda.is_available() else None
         tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = precision == "tf32"
@@ -820,9 +810,7 @@ class DownstreamTrainer():
             timing[stage] += now - clock[0]
             clock[0] = now
 
-        loader = (self._length_sorted_loader(max_events) if getattr(self.params, "length_sorted_batches", False)
-                  else self.val_data_loader)
-        for step, batch in enumerate(tqdm(loader)):
+        for step, batch in enumerate(tqdm(self.val_data_loader)):
             if len(batch) != 4:
                 raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
                                    "set params.return_reg_test = True before launch()")

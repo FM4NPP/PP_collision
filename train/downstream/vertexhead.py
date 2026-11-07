@@ -133,7 +133,7 @@ def _circle_fit(x, y, track, assigned, n_tracks, min_hits=3, newton_iters=20, ep
 def _extreme_hit(r, track, assigned, n_tracks, outermost=False):
     """
     Hit index (B, T) of each track's innermost (or outermost) assigned hit by r: the first such hit on
-    ties, and 0 for a track with none, as argmin / argmax over a masked (B, N, T) grid would give.
+    ties, and 0 for a track with none.
     """
     n_events, n_hits = r.shape
     key = torch.where(assigned, r if outermost else -r, -torch.inf)
@@ -149,7 +149,6 @@ def _arc_length(x, y, xc, yc, R_s, beam_position=(0.0, 0.0)):
     closest approach to the beam line (at beam_position in x-y, cm) to the circle point at the angle of
     (x, y); positive in the direction of travel (anticlockwise <=> R_s < 0). All inputs broadcast.
     """
-    # in place, so a long per-hit array costs one allocation
     s = torch.atan2(y - yc, x - xc)
     beam_angle = torch.atan2(-(yc - beam_position[1]), -(xc - beam_position[0]))
     return s.sub_(beam_angle).add_(torch.pi).remainder_(2 * torch.pi).sub_(torch.pi).mul_(-R_s)
@@ -173,59 +172,29 @@ def _unnormalize_hits(points, normalization=TPC_NORMALIZATION):
     r = points[..., 3] * (r_lim[1] - r_lim[0]) + r_lim[0]
     return torch.stack([E, r * torch.cos(phi), r * torch.sin(phi), r * torch.sinh(eta)], dim=-1), r
 
-def _track_position_from_hits(points, hit_r, mask_probs, padding_mask):
+def _helix_from_hits(points, hit_r, track, assigned, n_tracks, Bz=1.4, scaling_factor=100.0, min_hits=3,
+                     beam_position=(0.0, 0.0), field=None):
     """
-    Hard hit-to-track assignment and each track's reference point.
-
-    Args:
-        points: (B, N, 4) (E, x, y, z); hit_r: (B, N); mask_probs: (B, N, T); padding_mask: (B, N).
-
-    Returns:
-        track_position: (B, T, 3) innermost assigned hit; 0 for a track with none.
-        total_hit_weight: (B, T) sum of mask_probs over real hits.
-        is_assigned: (B, N, T) each real hit on its argmax track (none if all probabilities are 0).
-    """
-    n_tracks = mask_probs.shape[-1]
-    total_hit_weight = (mask_probs * padding_mask.unsqueeze(-1).to(mask_probs.dtype)).sum(dim=1)
-
-    # each real hit goes to its most probable track slot (none if all probabilities are 0)
-    track = mask_probs.argmax(dim=-1)
-    assigned = padding_mask & (mask_probs.max(dim=-1).values > 0)
-    is_assigned = (torch.arange(n_tracks, device=track.device) == track.unsqueeze(-1)) & assigned.unsqueeze(-1)
-
-    innermost = _extreme_hit(hit_r, track, assigned, n_tracks)
-    track_position = points[..., 1:4].gather(1, innermost.unsqueeze(-1).expand(-1, -1, 3))
-    track_position = track_position.masked_fill(~is_assigned.any(dim=1).unsqueeze(-1), 0.0)
-    return track_position, total_hit_weight, is_assigned
-
-def _helix_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4, scaling_factor=100.0,
-                     valid_radius=1.0, min_hits=3, beam_position=(0.0, 0.0), field=None):
-    """
-    Each track's helix (circle and z line) and quality labels from its assigned hits.
+    Each track's helix (circle and z line) from its assigned hits.
 
     Travel from the innermost to the outermost hit gives the charge and phi at the innermost hit:
     centre = innermost hit + R_s (sin phi, -cos phi), sign(R_s) = sign(q Bz).
 
     Args:
-        points, hit_r, is_assigned: as from _track_position_from_hits.
-        noise_pt_threshold: GeV; lower fitted pT -> not usable.
+        points: (B, N, 4) (E, x, y, z) cm; hit_r: (B, N); track: (B, N) each hit's track slot (0 if unassigned);
+            assigned: (B, N) the hit is on that track; n_tracks: T.
         Bz: Tesla (its sign gives the charge); field: (B, T) each track's |Bz| for its pT (a field map), else |Bz|.
         scaling_factor: converts metres to the units of points.
-        valid_radius: cm; the circle must pass within this of the beam line to be usable.
         min_hits: fewer assigned hits -> not fitted.
         beam_position: (x, y) of the beam line, cm; arc length and beam_dca are measured from it.
 
     Returns:
         dict, float64, NaN (or False) where fit_ok is False:
-            usable (B, T): pT >= noise_pt_threshold and beam_dca < valid_radius.
-            pT, theta, beam_dca, fit_ok (B, T).
+            pT, beam_dca (closest approach of the circle to the beam line), fit_ok (B, T).
             circle_centre (B, T, 2), R_s, zslope, z0 (B, T): the circle and z line z = zslope * s + z0
                 (s from _arc_length).
+            innermost (B, T): index of each track's innermost hit (0 for a track with none).
     """
-    # per hit (B, N): each hit's track slot (0 if unassigned) and coordinates
-    n_tracks = is_assigned.shape[-1]
-    assigned = is_assigned.any(dim=-1)
-    track = is_assigned.to(torch.uint8).argmax(dim=-1)
     x, y, z = (points[..., k].double() for k in (1, 2, 3))
     r = hit_r.double()
 
@@ -260,10 +229,9 @@ def _helix_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4, sca
                                             for v in (pT, theta, beam_dca, sign_Rs * radius, zslope, z0))
 
     return {
-        "usable": (pT >= noise_pt_threshold) & (beam_dca < valid_radius),    # NaN where fit_ok is False -> False
-        "pT": pT, "theta": theta, "beam_dca": beam_dca, "fit_ok": fit_ok,
+        "pT": pT, "beam_dca": beam_dca, "fit_ok": fit_ok,
         "circle_centre": torch.where(fit_ok.unsqueeze(-1), torch.stack([xc, yc], dim=-1), nan.unsqueeze(-1)),
-        "R_s": R_s, "zslope": zslope, "z0": z0,
+        "R_s": R_s, "zslope": zslope, "z0": z0, "innermost": i_in,
     }
 
 def _track_covariance(s, track, assigned, n_tracks, theta, qop, s_reference, sigma_rphi, sigma_z, Bz=1.4,
@@ -316,13 +284,13 @@ def _track_covariance(s, track, assigned, n_tracks, theta, qop, s_reference, sig
 # ACTS perigee parameters (d0, z0, phi, theta, q/p, t) w.r.t. the beam line: point = beam + d0 (-sin phi, cos phi)
 # ------------------------------------------------------------------------------------------------
 
-def _perigee_from_circle(circle_centre, R_s, zslope, z0, qop, beam_position=(0.0, 0.0)):
+def _perigee_from_circle(circle_centre, R_s, theta, z0, qop, beam_position=(0.0, 0.0)):
     """
     Perigee parameters (B, T, 6) of the fitted helix (cm, q/p in e/GeV, t = 0).
 
     Args:
         circle_centre (B, T, 2), R_s (B, T): circle, sign(R_s) = sign(q Bz).
-        zslope, z0: (B, T) z = zslope * s + z0 (zslope = cot theta, z0 = perigee z).
+        theta, z0: (B, T) polar angle and perigee z.
         qop: (B, T); beam_position: (x, y), cm.
     """
     bx, by = beam_position
@@ -333,7 +301,6 @@ def _perigee_from_circle(circle_centre, R_s, zslope, z0, qop, beam_position=(0.0
     phi = torch.atan2(-h * ux, h * uy)                         # heading at the perigee, along the direction of travel
     d0 = (-(circle_centre[..., 0] + radius * ux - bx) * torch.sin(phi)
           + (circle_centre[..., 1] + radius * uy - by) * torch.cos(phi))
-    theta = torch.atan2(torch.ones_like(zslope), zslope)
     return torch.stack([d0, z0, phi, theta, qop, torch.zeros_like(d0)], dim=-1)
 
 def _circle_from_perigee(perigee, Bz, scaling_factor=100.0, beam_position=(0.0, 0.0)):
@@ -518,11 +485,8 @@ def _fit_vertex_by_closest_approach(
 
     I3 = torch.eye(3, device=track_position.device, dtype=track_position.dtype)
     projector = I3 - track_direction.unsqueeze(-1) * track_direction.unsqueeze(-2)
-    # W = U U^T / sigma_d0^2 + V V^T / (sigma_z0 sin theta)^2, V = direction x U; W projector = W
-    transverse = track_direction[..., :2].norm(dim=-1).clamp(min=1e-12)
-    U = torch.stack([-track_direction[..., 1], track_direction[..., 0], torch.zeros_like(transverse)], dim=-1) \
-        / transverse.unsqueeze(-1)
-    V = torch.cross(track_direction, U, dim=-1)
+    # W = U U^T / sigma_d0^2 + V V^T / (sigma_z0 sin theta)^2; W projector = W
+    U, V, transverse = _track_frame(track_direction)
     P = (U.unsqueeze(-1) * U.unsqueeze(-2) / track_sigma[..., 0, None, None] ** 2
          + V.unsqueeze(-1) * V.unsqueeze(-2) / (track_sigma[..., 1] * transverse)[..., None, None] ** 2)
 
@@ -558,15 +522,23 @@ def _fit_vertex_by_closest_approach(
         "vertex_covariance": vertex_covariance.masked_fill(invalid.view(-1, 1, 1), float("nan")),
     }
 
+def _track_frame(track_direction):
+    """
+    Each track's d0 and z0 directions perpendicular to it: U (transverse, in x-y) and V = direction x U (B, T, 3),
+    and the transverse length of the direction (sin theta) (B, T).
+    """
+    transverse = track_direction[..., :2].norm(dim=-1).clamp(min=1e-12)
+    U = torch.stack([-track_direction[..., 1], track_direction[..., 0], torch.zeros_like(transverse)], dim=-1) \
+        / transverse.unsqueeze(-1)
+    return U, torch.cross(track_direction, U, dim=-1), transverse
+
 def _track_compatibility(point, track_position, track_direction, track_sigma):
     """
     Compatibility chi2 (B, T) of a point (B, 3) with each track, in the fit's metric.
     """
     r = point.unsqueeze(1) - track_position
     r = r - (r * track_direction).sum(dim=-1, keepdim=True) * track_direction
-    transverse = track_direction[..., :2].norm(dim=-1).clamp(min=1e-12)
-    U = torch.stack([-track_direction[..., 1], track_direction[..., 0], torch.zeros_like(transverse)], dim=-1) / transverse.unsqueeze(-1)
-    V = torch.cross(track_direction, U, dim=-1)
+    U, V, transverse = _track_frame(track_direction)
     return ((r * U).sum(dim=-1) / track_sigma[..., 0]) ** 2 + ((r * V).sum(dim=-1) / (track_sigma[..., 1] * transverse)) ** 2
 
 def _density_seed(d0, z0, track_sigma, track_weight, d0_significance=3.5, z0_significance=12.0):
@@ -682,7 +654,7 @@ class VertexHead(nn.Module):
         noise_pt_threshold (GeV), valid_radius (cm), min_hits: track usability cuts.
         beam_position: (x, y), cm; normalization: the dataset's hit normalization (TPC_NORMALIZATION).
         hit_sigma_rphi, hit_sigma_z: per-hit errors for the track covariance, cm.
-        track_error_scale: multiplies the track errors (2.5: PV chi2/ndf about 1).
+        track_error_scale: multiplies the track errors.
         helix_iterations, convergence_tolerance (cm), minimum_total_weight: fit limits.
         annealing_temperatures, annealing_cut_off, min_track_weight, adaptive_max_iterations, max_relative_shift:
             the adaptive fit (ACTS's defaults).
@@ -897,6 +869,10 @@ class VertexHead(nn.Module):
                 "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
                 "energy_loss": self.acts_energy_loss}
 
+    def _usable(self, pT, beam_dca):
+        """The track usability cuts: pT >= noise_pt_threshold and beam_dca < valid_radius (False where NaN)."""
+        return (pT >= self.noise_pt_threshold) & (beam_dca < self.valid_radius)
+
     def track_fit_config(self):
         """The track-model settings."""
         return {k: getattr(self, k) for k in ("Bz", "scaling_factor", "noise_pt_threshold",
@@ -936,18 +912,15 @@ class VertexHead(nn.Module):
                    "track_chi2": torch.where(seeded, _track_compatibility(seed.nan_to_num(), track_position,
                                                                           track_direction, params["track_sigma"]),
                                              fit["track_chi2"])}
-        index, equilibrium = 0, False
+        n_temperatures = len(self.annealing_temperatures)
         done, previous_weight = torch.zeros_like(fit["fit_is_valid"]), None    # finished events keep their fit
-        for _ in range(self.adaptive_max_iterations):
-            temperature = self.annealing_temperatures[index]
-            # compatibility at the current vertex -> AnnealingUtility weight (single vertex)
-            if competing_chi2 is None:
-                vertex_weight = torch.sigmoid((self.annealing_cut_off - fit["track_chi2"]) / (2.0 * temperature)).nan_to_num(0.0)
-            else:   # 1 / (1 + exp((chi2 - cutOff)/2T) + sum_k exp((chi2 - chi2_k)/2T))
-                chi2 = fit["track_chi2"].unsqueeze(-1)
-                vertex_weight = 1.0 / (1.0 + torch.exp((chi2.squeeze(-1) - self.annealing_cut_off) / (2.0 * temperature))
-                                       + torch.exp((chi2 - competing_chi2) / (2.0 * temperature)).sum(dim=-1))
-                vertex_weight = vertex_weight.nan_to_num(0.0)
+        for i in range(self.adaptive_max_iterations):
+            # one annealing step per update, then the last temperature
+            t2 = 2.0 * self.annealing_temperatures[min(i, n_temperatures - 1)]
+            # AnnealingUtility weight: 1 / (1 + exp((chi2 - cutOff)/2T) + sum_k exp((chi2 - chi2_k)/2T))
+            chi2 = fit["track_chi2"]
+            competing = 0.0 if competing_chi2 is None else torch.exp((chi2.unsqueeze(-1) - competing_chi2) / t2).sum(dim=-1)
+            vertex_weight = (1.0 / (1.0 + torch.exp((chi2 - self.annealing_cut_off) / t2) + competing)).nan_to_num(0.0)
             vertex_weight = vertex_weight.masked_fill(vertex_weight <= self.min_track_weight, 0.0).to(track_weight.dtype)
             if previous_weight is not None:
                 vertex_weight = torch.where(done.unsqueeze(-1), previous_weight, vertex_weight)
@@ -962,13 +935,8 @@ class VertexHead(nn.Module):
             relative_shift = torch.where(singular == 0, (dx * shift).sum(dim=(-2, -1)), torch.inf)
             update = valid & ~done
             fit = {k: torch.where(update.view(-1, *[1] * (v.dim() - 1)), v, fit[k]) for k, v in new.items()}
-            # anneal after each update; after the last temperature each event stops once its shift is small
-            if not equilibrium:
-                if index < len(self.annealing_temperatures) - 1:
-                    index += 1
-                else:
-                    equilibrium = True
-            if equilibrium:
+            # at the last temperature each event stops once its shift is small
+            if i >= n_temperatures - 1:
                 done = done | (relative_shift <= self.max_relative_shift) | ~valid
                 if bool(done.all()):
                     break
@@ -1123,89 +1091,86 @@ class VertexHead(nn.Module):
         if track_parameters is None:
             # track model: hits in cm (padding zeroed), hard assignment, each track's circle and z line
             hits, hit_r = _unnormalize_hits(points.masked_fill(~padding_mask.unsqueeze(-1), 0.0), self.normalization)
-            innermost_hit, total_hit_weight, is_assigned = _track_position_from_hits(hits, hit_r, mask_probs, padding_mask)
+            total_hit_weight = (mask_probs * padding_mask.unsqueeze(-1).to(mask_probs.dtype)).sum(dim=1)
+            # each real hit goes to its most probable track slot (none if all probabilities are 0)
+            n_tracks = mask_probs.shape[-1]
+            assigned = padding_mask & (mask_probs.max(dim=-1).values > 0)
+            track = mask_probs.argmax(dim=-1).masked_fill(~assigned, 0)
             # with a field map: each track's Bz, the mean over its hits (signed; tracks without hits: Bz)
             track_bz = self.Bz
             if self.field_map is not None:
                 hit_bz = _field_map(self.field_map, self.field_map_kind).bz(
                     hits[..., 1], hits[..., 2], hits[..., 3], 1000.0 / self.scaling_factor)
-                n_hits = is_assigned.sum(dim=1)
-                track_bz = torch.where(n_hits > 0, (is_assigned * hit_bz.unsqueeze(-1)).sum(dim=1) / n_hits.clamp(min=1),
+                n_hits = _per_track_sum(assigned.to(hit_bz.dtype), track, n_tracks)
+                track_bz = torch.where(n_hits > 0, _per_track_sum(hit_bz * assigned, track, n_tracks) / n_hits.clamp(min=1),
                                        float(self.Bz))
-            params = _helix_from_hits(hits, hit_r, is_assigned, self.noise_pt_threshold, Bz=self.Bz,
-                                      scaling_factor=self.scaling_factor, valid_radius=self.valid_radius,
-                                      min_hits=self.min_hits, beam_position=self.beam_position,
-                                      field=track_bz.abs() if torch.is_tensor(track_bz) else None)
-            # the helix fit runs in the dtype of the hits
-            params.update({k: params[k].to(hits.dtype) for k in ("theta", "circle_centre", "R_s", "zslope", "z0")})
-            theta = params["theta"].double()
-            q = torch.sign(params["R_s"].double()) * (1.0 if self.Bz >= 0 else -1.0)
+            helix = _helix_from_hits(hits, hit_r, track, assigned, n_tracks, Bz=self.Bz, scaling_factor=self.scaling_factor,
+                                   min_hits=self.min_hits, beam_position=self.beam_position,
+                                   field=track_bz.abs() if torch.is_tensor(track_bz) else None)
+            centre, R_s, zslope = helix["circle_centre"], helix["R_s"], helix["zslope"]
+            theta = torch.atan2(torch.ones_like(zslope), zslope)        # cot(theta) = dz/ds
+            qop = torch.sign(R_s) * (1.0 if self.Bz >= 0 else -1.0) * torch.sin(theta) / helix["pT"]
             # the hit fit's covariance at a point s_reference along each helix (cm, from the hit errors)
-            hit_track, hit_assigned = is_assigned.to(torch.uint8).argmax(dim=-1), is_assigned.any(dim=-1)
-            centre, R_s = params["circle_centre"].double(), params["R_s"].double()
-            hit_s = _arc_length(hits[..., 1].double(), hits[..., 2].double(), centre[..., 0].gather(1, hit_track),
-                                centre[..., 1].gather(1, hit_track), R_s.gather(1, hit_track), self.beam_position)
-            fit_theta = torch.atan2(torch.ones_like(theta), params["zslope"].double())
+            hit_s = _arc_length(hits[..., 1].double(), hits[..., 2].double(), centre[..., 0].gather(1, track),
+                                centre[..., 1].gather(1, track), R_s.gather(1, track), self.beam_position)
             hit_covariance = lambda s_reference, curvilinear: _track_covariance(  # noqa: E731
-                hit_s, hit_track, hit_assigned, R_s.shape[-1], fit_theta, q * torch.sin(fit_theta) / params["pT"],
-                s_reference, self.hit_sigma_rphi, self.hit_sigma_z, track_bz, self.scaling_factor, curvilinear,
-                self.min_hits)
+                hit_s, track, assigned, n_tracks, theta, qop, s_reference, self.hit_sigma_rphi, self.hit_sigma_z,
+                track_bz, self.scaling_factor, curvilinear, self.min_hits)
             if self.use_acts:
                 # ACTS propagates the helix state at the innermost hit (mm) back to the beam spot
-                centre, R_s = params["circle_centre"].double(), params["R_s"].double()
-                n = innermost_hit[..., :2].double() - centre
+                n = hits[..., 1:3].gather(1, helix["innermost"].unsqueeze(-1).expand(-1, -1, 2)).double() - centre
                 n = n / n.norm(dim=-1, keepdim=True).clamp(min=1e-12)
                 start_xy = centre + R_s.abs().unsqueeze(-1) * n
                 start_s = _arc_length(start_xy[..., 0], start_xy[..., 1], centre[..., 0], centre[..., 1], R_s,
                                       self.beam_position)
-                start_z = start_s * params["zslope"].double() + params["z0"].double()
-                theta = torch.atan2(torch.ones_like(theta), params["zslope"].double())
+                start_z = start_s * zslope + helix["z0"]
                 direction = torch.cat([torch.sin(theta).unsqueeze(-1) * torch.sign(R_s).unsqueeze(-1)
                                        * torch.stack([n[..., 1], -n[..., 0]], dim=-1), torch.cos(theta).unsqueeze(-1)], dim=-1)
                 # start covariance (curvilinear, mm; t uncorrelated) for ACTS to transport
-                to_mm = q.new_tensor([1.0, 1.0, self.track_parameter_length_scale, self.track_parameter_length_scale,
-                                      self.track_parameter_length_scale]) / self.track_parameter_length_scale
-                start_covariance = q.new_zeros(*q.shape, 6, 6)
+                to_mm = qop.new_tensor([1.0, 1.0, self.track_parameter_length_scale, self.track_parameter_length_scale,
+                                        self.track_parameter_length_scale]) / self.track_parameter_length_scale
+                start_covariance = qop.new_zeros(*qop.shape, 6, 6)
                 start_covariance[..., 5, 5] = 1.0
                 start_covariance[..., :5, :5] = hit_covariance(start_s, True) * to_mm[:, None] * to_mm[None, :]
                 start_covariance = start_covariance.reshape(-1, 6, 6).cpu().numpy()
                 acts_out = _acts_worker(self.acts_worker_command(), self.acts_worker_config()).propagate(
                     (torch.cat([start_xy, start_z.unsqueeze(-1)], dim=-1) / self.track_parameter_length_scale
                      ).reshape(-1, 3).cpu().numpy(), direction.reshape(-1, 3).cpu().numpy(),
-                    (q * torch.sin(theta) / params["pT"]).reshape(-1).cpu().numpy(), start_covariance)
-                track_parameters = torch.from_numpy(acts_out[0]).reshape(*q.shape, 6).to(hits.device, total_hit_weight.dtype)
-                acts_failed = params["usable"] & ~torch.from_numpy(acts_out[1]).reshape(q.shape).to(hits.device)
-                track_covariance = torch.from_numpy(acts_out[2]).reshape(*q.shape, 6, 6).to(hits.device)
+                    qop.reshape(-1).cpu().numpy(), start_covariance)
+                track_parameters = torch.from_numpy(acts_out[0]).reshape(*qop.shape, 6).to(hits.device, total_hit_weight.dtype)
+                acts_failed = self._usable(helix["pT"], helix["beam_dca"]) & ~torch.from_numpy(acts_out[1]).reshape(
+                    qop.shape).to(hits.device)
+                track_covariance = torch.from_numpy(acts_out[2]).reshape(*qop.shape, 6, 6).to(hits.device)
                 track_weight = torch.ones_like(total_hit_weight)
             else:
-                perigee = _perigee_from_circle(params["circle_centre"].double(), params["R_s"].double(),
-                                               params["zslope"].double(), params["z0"].double(),
-                                               q * torch.sin(theta) / params["pT"], self.beam_position)
+                # the hit fit as perigee tracks (cm); its circle comes back with the field its pT came from
+                perigee, perigee_bz = _perigee_from_circle(centre, R_s, theta, helix["z0"], qop, self.beam_position), track_bz
                 covariance = hit_covariance(torch.zeros_like(theta), False)
                 track_sigma = torch.stack([covariance[..., 0, 0], covariance[..., 1, 1]], dim=-1).sqrt()
                 base_weight = class_probs[..., 1].clone()
         if track_parameters is not None:
             perigee = track_parameters.double().clone()
             perigee[..., [0, 1, 5]] = perigee[..., [0, 1, 5]] * self.track_parameter_length_scale
-            fit_ok = torch.isfinite(perigee[..., :5]).all(dim=-1)
             # with a field map: Bz at each track's perigee (beam line, z0)
             perigee_bz = self.Bz if self.field_map is None else _field_map(self.field_map, self.field_map_kind).bz(
                 torch.full_like(perigee[..., 1], self.beam_position[0]), torch.full_like(perigee[..., 1], self.beam_position[1]),
                 perigee[..., 1], 1000.0 / self.scaling_factor)
-            circle_centre, R_s, zslope, z0, pT, beam_dca = _circle_from_perigee(
-                perigee, perigee_bz, self.scaling_factor, self.beam_position)
-            dtype = track_parameters.dtype
-            params = {"circle_centre": circle_centre.to(dtype), "R_s": R_s.to(dtype), "zslope": zslope.to(dtype),
-                      "z0": z0.to(dtype), "pT": pT, "beam_dca": beam_dca, "fit_ok": fit_ok,
-                      "usable": fit_ok & (pT >= self.noise_pt_threshold) & (beam_dca < self.valid_radius)}
             if class_probs is None:
-                class_probs = torch.stack([torch.zeros_like(pT), torch.ones_like(pT)], dim=-1).to(dtype)
-            base_weight = class_probs[..., 1] * (torch.ones_like(pT).to(dtype) if track_weight is None else track_weight)
+                class_probs = torch.stack([torch.zeros_like(perigee[..., 0]), torch.ones_like(perigee[..., 0])],
+                                          dim=-1).to(track_parameters.dtype)
+            base_weight = class_probs[..., 1] * (1.0 if track_weight is None else track_weight)
             if track_covariance is None:
                 raise ValueError("track_parameters need their track_covariance")
             track_sigma = torch.stack([track_covariance[..., 0, 0], track_covariance[..., 1, 1]], dim=-1
                                       ).double().sqrt() * self.track_parameter_length_scale
+        # every route: perigee tracks (cm) -> circle, z line, pT and usability
         dtype = base_weight.dtype
+        fit_ok = torch.isfinite(perigee[..., :5]).all(dim=-1)
+        circle_centre, R_s, zslope, z0, pT, beam_dca = _circle_from_perigee(
+            perigee, perigee_bz, self.scaling_factor, self.beam_position)
+        params = {"circle_centre": circle_centre.to(dtype), "R_s": R_s.to(dtype), "zslope": zslope.to(dtype),
+                  "z0": z0.to(dtype), "pT": pT, "beam_dca": beam_dca, "fit_ok": fit_ok,
+                  "usable": fit_ok & self._usable(pT, beam_dca)}
         # tracks without a usable covariance get no weight (and a finite stand-in error)
         has_sigma = torch.isfinite(track_sigma).all(dim=-1) & (track_sigma > 0).all(dim=-1)
         base_weight = base_weight * has_sigma.to(dtype)
@@ -1269,23 +1234,18 @@ class VertexHead(nn.Module):
             # the candidate's tracks leave the pool whether or not it is kept, so its seed is not found again
             used = vertex_fit["fit_is_valid"].unsqueeze(-1).to(fit_weight.dtype)
             available = available * (1 - fit_weight * used).clamp(min=0.0)
-        # the PV: one vertex, or the valid one with the highest sum of fit weight x pT^2
-        pv_index = torch.zeros(track_weight.shape[0], dtype=torch.long, device=track_weight.device)
-        if len(candidates) > 1:
-            pT2 = params["pT"].nan_to_num(0.0).to(dtype) ** 2
-            score = torch.stack([(c[5] * pT2).sum(dim=-1).masked_fill(~c[6], -torch.inf) for c in candidates], dim=1)
-            pv_index = score.argmax(dim=1)
-        pick = lambda values: values[0] if len(candidates) == 1 else torch.stack(values, dim=1)[  # noqa: E731
-            torch.arange(len(pv_index), device=pv_index.device), pv_index]
+        # the PV: the valid vertex with the highest sum of fit weight x pT^2 (the first without a valid one)
+        pT2 = params["pT"].nan_to_num(0.0).to(dtype) ** 2
+        pv_index = torch.stack([(c[5] * pT2).sum(dim=-1).masked_fill(~c[6], -torch.inf) for c in candidates],
+                               dim=1).argmax(dim=1)
+        pick = lambda values: torch.stack(values, dim=1)[torch.arange(len(pv_index), device=pv_index.device), pv_index]  # noqa: E731
         fit = {key: pick([c[0][key] for c in candidates]) for key in candidates[0][0]}
         vertex_weight, window, pv_weight = (pick([c[i] for c in candidates]) for i in (1, 3, 4))
         seed = None if candidates[0][2] is None else pick([c[2] for c in candidates])
         # SV finding keeps track_weight, minus the tracks of the other primary vertices
-        sv_weight = track_weight
-        if len(candidates) > 1:
-            others = torch.stack([c[5] * c[6].unsqueeze(-1) for c in candidates], dim=1)
-            others = others.masked_fill(torch.nn.functional.one_hot(pv_index, len(candidates)).bool().unsqueeze(-1), 0.0)
-            sv_weight = track_weight * (1 - others.max(dim=1).values)
+        others = torch.stack([c[5] * c[6].unsqueeze(-1) for c in candidates], dim=1).masked_fill(
+            torch.nn.functional.one_hot(pv_index, len(candidates)).bool().unsqueeze(-1), 0.0)
+        sv_weight = track_weight * (1 - others.max(dim=1).values)
 
         result = {
             "track_parameters": perigee.to(dtype),
