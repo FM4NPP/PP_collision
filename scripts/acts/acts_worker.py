@@ -7,7 +7,7 @@ streams batches:
 
 Config (VertexHead.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
 geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (null: the CPUs this process may use),
-particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit and hit_sigma (r phi, z).
+particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit, kalman_start_covariance_scale and hit_sigma (r phi, z).
 
 Protocol, after the line ACTS_WORKER_READY: n, m (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
 covariance (n, 6, 6), hit_track (m,), hits (m, 6) (the Kalman refit's hits: position, direction); reply float64 params (n, 6), covariance (n, 6, 6), then ok (n,) uint8. States are
@@ -72,7 +72,9 @@ def build_propagator(config):
         energy_loss=bool(config["energy_loss"]), max_steps=int(config["max_steps"] or 0),
         threads=int(config["threads"] if config["threads"] is not None else len(os.sched_getaffinity(0))),
         particle_pdg=int(config["particle_pdg"]), particle_mass=config["particle_mass"],
-        kalman_refit=bool(config["kalman_refit"]), hit_sigma=[float(v) for v in config["hit_sigma"]])
+        kalman_refit=bool(config["kalman_refit"]),
+        kalman_start_covariance_scale=float(config["kalman_start_covariance_scale"]),
+        hit_sigma=[float(v) for v in config["hit_sigma"]])
     return propagator, (field, detector, geometry)
 
 

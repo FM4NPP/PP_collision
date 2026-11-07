@@ -3,7 +3,9 @@
 // build. Without a geometry: field only (VoidNavigator); with one: navigated, with material (MaterialInteractor).
 // With the Kalman refit: each track's hits are first fitted by ACTS's Kalman fitter (each hit a measurement on
 // its own plane, through the hit and normal to the hit fit's direction there, so the track crosses it once;
-// DirectNavigator, field only: no TPC gas material) outward from the track's state just before its innermost hit; the smoothed state at the innermost hit is then propagated to the perigee.
+// DirectNavigator, field only: no TPC gas material) outward from the track's state just before its innermost hit,
+// its covariance x kalmanStartScale; the smoothed state at the innermost hit is then propagated to the perigee
+// (where the refit fails: the given state, counted as a failure of the refit).
 // States are split across threads (the propagator is const and keeps its state per call). Tracks are singly charged
 // particles of one hypothesis (PDG id, mass), which sets the energy loss and multiple scattering in material.
 // Units mm, GeV, e.
@@ -93,7 +95,7 @@ class PerigeePropagator {
   PerigeePropagator(std::shared_ptr<Acts::MagneticFieldProvider> field, std::array<double, 3> reference,
                     std::shared_ptr<Acts::TrackingGeometry> geometry, bool energyLoss, std::size_t maxSteps,
                     std::size_t threads, int particlePdg, std::optional<float> particleMass, bool kalmanRefit,
-                    std::array<double, 2> hitSigma)
+                    double kalmanStartScale, std::array<double, 2> hitSigma)
       : m_particle(particleHypothesis(particlePdg, particleMass)),
         m_surface(Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3(reference[0], reference[1], reference[2]))),
         m_energyLoss(energyLoss),
@@ -120,6 +122,7 @@ class PerigeePropagator {
       m_kalman.emplace(KalmanPropagator(Acts::EigenStepper<>(field), Acts::DirectNavigator(logger("DirectNavigator")),
                                         logger("KalmanPropagator")),
                        logger("KalmanFitter"));
+      m_kalmanStartScale = kalmanStartScale;
       m_hitSigma = hitSigma;
     }
   }
@@ -186,15 +189,20 @@ class PerigeePropagator {
             continue;
           }
           try {
-            const Acts::Vector3 at = m_kalman ? Acts::Vector3(pos - kKalmanStartOffset * dir.normalized()) : pos;
-            const auto state = Acts::BoundTrackParameters::createCurvilinear(
-                Acts::Vector4(at.x(), at.y(), at.z(), 0.0), dir.normalized(), Q[i], startCov, m_particle);
+            std::optional<Acts::BoundTrackParameters> start = Acts::BoundTrackParameters::createCurvilinear(
+                Acts::Vector4(pos.x(), pos.y(), pos.z(), 0.0), dir.normalized(), Q[i], startCov, m_particle);
             std::string error;
-            const std::optional<Acts::BoundTrackParameters> start =
-                m_kalman ? refit(state, H + 6 * hitBegin[i], hitBegin[i + 1] - hitBegin[i], error) : state;
-            if (!start) {
-              ++errors[error];
-              continue;
+            if (m_kalman) {
+              const Acts::Vector3 before = pos - kKalmanStartOffset * dir.normalized();
+              auto refitted = refit(Acts::BoundTrackParameters::createCurvilinear(
+                                        Acts::Vector4(before.x(), before.y(), before.z(), 0.0), dir.normalized(), Q[i],
+                                        m_kalmanStartScale * startCov, m_particle),
+                                    H + 6 * hitBegin[i], hitBegin[i + 1] - hitBegin[i], error);
+              if (refitted) {
+                start = std::move(refitted);
+              } else {
+                ++errors["Kalman refit failed (hit fit used): " + error];
+              }
             }
             std::optional<Acts::BoundTrackParameters> end;
             if (m_geometryPropagator) {
@@ -253,7 +261,7 @@ class PerigeePropagator {
   std::optional<Acts::BoundTrackParameters> refit(const Acts::BoundTrackParameters& start, const double* hits,
                                                   py::ssize_t count, std::string& error) const {
     if (count == 0) {
-      error = "Kalman refit: no hits";
+      error = "no hits";
       return std::nullopt;
     }
     std::vector<std::shared_ptr<Acts::PlaneSurface>> surfaces;
@@ -295,7 +303,7 @@ class PerigeePropagator {
     Acts::TrackContainer tracks{Acts::VectorTrackContainer{}, Acts::VectorMultiTrajectory{}};
     auto result = m_kalman->fit(links.begin(), links.end(), start, options, sequence, tracks);
     if (!result.ok()) {
-      error = "Kalman refit: " + result.error().message();
+      error = result.error().message();
       return std::nullopt;
     }
     // the innermost measurement: the last one from the tip back
@@ -307,7 +315,7 @@ class PerigeePropagator {
       }
     }
     if (!innermost) {
-      error = "Kalman refit: not smoothed";
+      error = "not smoothed";
     }
     return innermost;
   }
@@ -349,6 +357,7 @@ class PerigeePropagator {
   Acts::CalibrationContext m_calibrationContext{};
   Acts::GainMatrixUpdater m_updater;
   Acts::GainMatrixSmoother m_smoother;
+  double m_kalmanStartScale = 1.0;
   std::array<double, 2> m_hitSigma{};
   Acts::ParticleHypothesis m_particle;
   std::shared_ptr<Acts::PerigeeSurface> m_surface;
@@ -363,10 +372,10 @@ PYBIND11_MODULE(acts_perigee_propagator, m) {
   py::class_<PerigeePropagator>(m, "PerigeePropagator")
       .def(py::init<std::shared_ptr<Acts::MagneticFieldProvider>, std::array<double, 3>,
                     std::shared_ptr<Acts::TrackingGeometry>, bool, std::size_t, std::size_t, int, std::optional<float>,
-                    bool, std::array<double, 2>>(),
+                    bool, double, std::array<double, 2>>(),
            py::arg("field"), py::arg("reference"), py::arg("geometry"), py::arg("energy_loss"), py::arg("max_steps"),
            py::arg("threads"), py::arg("particle_pdg"), py::arg("particle_mass"), py::arg("kalman_refit"),
-           py::arg("hit_sigma"))
+           py::arg("kalman_start_covariance_scale"), py::arg("hit_sigma"))
       .def("propagate", &PerigeePropagator::propagate, py::arg("position"), py::arg("direction"), py::arg("qop"),
            py::arg("covariance"), py::arg("hit_track"), py::arg("hits"));
 }

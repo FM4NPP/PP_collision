@@ -672,7 +672,7 @@ class VertexHead(nn.Module):
             acts_particle_mass (GeV; None: ACTS's mass for the PDG id; the tracks' particle, which sets energy loss and
             multiple scattering in material) configure it. acts_kalman_refit: ACTS's Kalman fitter first refits each
             track's hits (hit_sigma_rphi, hit_sigma_z), from the hit fit's state at the innermost hit with its
-            covariance x acts_kalman_start_covariance_scale.
+            covariance x acts_kalman_start_covariance_scale (where it fails: that state, as without the refit).
         find_secondary: find SVs; refit_pv: report the PV refitted with SV tracks shared.
         sv_min_track_pv_chi2, sv_min_track_beam_significance: SV candidate cuts.
         max_pair_doca (cm): seed pairs; sv_max_track_chi2: tracks attached to a seed.
@@ -879,7 +879,7 @@ class VertexHead(nn.Module):
                 "geometry_config": self.acts_geometry_config, "material_map": self.acts_material_map,
                 "energy_loss": self.acts_energy_loss, "particle_pdg": self.acts_particle_pdg,
                 "particle_mass": self.acts_particle_mass, "kalman_refit": self.acts_kalman_refit,
-                "hit_sigma": [self.hit_sigma_rphi * MM_PER_CM, self.hit_sigma_z * MM_PER_CM]}
+                "kalman_start_covariance_scale": self.acts_kalman_start_covariance_scale, "hit_sigma": [self.hit_sigma_rphi * MM_PER_CM, self.hit_sigma_z * MM_PER_CM]}
 
     def _usable(self, pT, beam_dca):
         """The track usability cuts: pT >= noise_pt_threshold and beam_dca < valid_radius (False where NaN)."""
@@ -1133,8 +1133,7 @@ class VertexHead(nn.Module):
                 to_mm = qop.new_tensor([MM_PER_CM, MM_PER_CM, 1.0, 1.0, 1.0])
                 start_covariance = qop.new_zeros(*qop.shape, 6, 6)
                 start_covariance[..., 5, 5] = 1.0
-                start_covariance[..., :5, :5] = hit_covariance(start_s, True) * to_mm[:, None] * to_mm[None, :] * (
-                    self.acts_kalman_start_covariance_scale if self.acts_kalman_refit else 1.0)
+                start_covariance[..., :5, :5] = hit_covariance(start_s, True) * to_mm[:, None] * to_mm[None, :]
                 start_covariance = start_covariance.reshape(-1, 6, 6).cpu().numpy()
                 # the refit's hits: position (mm) and the helix direction there, each with its state's index
                 # (event x T + slot), in order along the track
