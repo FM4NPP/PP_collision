@@ -10,7 +10,7 @@
 # --set acts.energy_loss=true, --set vertex_head.track_error_scale=2.5); --rebuild-base. Other commands pass
 # options to the Python script.
 # RUN_CONFIG picks the run (default scripts/configs/vertex_m5_gpuserver0.yaml); its detector: key names the site
-# detector file, which setup creates from scripts/acts/detectors/sphenix/sphenix.yaml if missing.
+# detector file, which setup writes from scripts/acts/detectors/sphenix/sphenix.yaml, keeping the site's own values.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 RUN_CONFIG=$(realpath "${RUN_CONFIG:-$REPO/scripts/configs/vertex_m5_gpuserver0.yaml}")
@@ -55,21 +55,39 @@ case "$COMMAND" in
                 --kind "$field_kind" ${convert_args[@]+"${convert_args[@]}"}
             field_map=$detector_dir/field_$field_kind.txt
         fi
-        if [[ ! -f "$DETECTOR" ]]; then
-            image=$(realpath --relative-to="$(dirname "$DETECTOR")" "$REPO/scripts/acts/acts-base-48.2.0.sif")
-            sed "s|^  image: null .*|  image: $image|" "$detector_dir/sphenix.yaml" > "$DETECTOR"
-            echo "wrote $DETECTOR"
-        fi
         # a map converted earlier is used by a site file that has none yet
-        if [[ -z $field_map && -f $detector_dir/field_$field_kind.txt ]] && grep -qE "^  map: null" "$DETECTOR"; then
+        if [[ -z $field_map && -f $detector_dir/field_$field_kind.txt ]] &&
+                { [[ ! -f "$DETECTOR" ]] || grep -qE "^  map: *(null)? *(#|$)" "$DETECTOR"; }; then
             field_map=$detector_dir/field_$field_kind.txt
         fi
         [[ -z $field_map ]] || settings+=("field.map=$field_map" "field.map_kind=$field_kind")
-        # each section.key=value replaces that line's value (its comment kept) or is added to its section
-        python - "$DETECTOR" ${settings[@]+"${settings[@]}"} <<'EOF'
-import re, sys
-path, settings = sys.argv[1], sys.argv[2:]
-lines = open(path).read().splitlines()
+        image=$(realpath --relative-to="$(dirname "$DETECTOR")" "$REPO/scripts/acts/acts-base-48.2.0.sif")
+        # the site file is rewritten from the template each time (new keys and comments), keeping the site's own
+        # values (any section.key differing from the template); then each section.key=value replaces that line's
+        # value (its comment kept) or is added to its section
+        python - "$DETECTOR" "$detector_dir/sphenix.yaml" "acts.image=$image" ${settings[@]+"${settings[@]}"} <<'EOF'
+import os, re, sys
+path, template, settings = sys.argv[1], sys.argv[2], sys.argv[3:]
+
+
+def entries(lines):
+    """section.key -> value of each two-level setting."""
+    found, section = {}, None
+    for line in lines:
+        if re.match(r"\w+:", line):
+            section = line.split(":")[0]
+        elif (m := re.match(r"  (\w+):\s*(.*?)\s*(#.*)?$", line)) and section:
+            found[f"{section}.{m[1]}"] = m[2]
+    return found
+
+
+lines = open(template).read().splitlines()
+if os.path.exists(path):
+    defaults = entries(lines)
+    kept = [f"{k}={v}" for k, v in entries(open(path).read().splitlines()).items() if v and v != defaults.get(k)]
+    settings = settings[:1] + kept + settings[1:]
+else:
+    print(f"writing {path}")
 for setting in settings:
     name, sep, value = setting.partition("=")
     section, _, key = name.rpartition(".")

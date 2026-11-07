@@ -23,8 +23,9 @@ scripts/run/vertexing.sh compare    # VertexHead and ACTS's own vertex finder ag
 ```
 
 The run is `scripts/configs/vertex_m5_gpuserver0.yaml` (`RUN_CONFIG=<file>` for another). Its `detector:` file,
-`scripts/configs/sphenix_<site>.yaml` (gitignored), is written by `setup` from `detectors/sphenix/sphenix.yaml`
-and updated by its options, which also overwrite an existing file's settings:
+`scripts/configs/sphenix_<site>.yaml` (gitignored), is rewritten by every `setup` from `detectors/sphenix/sphenix.yaml`
+(so it gets the template's new keys and comments), keeping the site's own values (any setting differing from the
+template) and then applying its options:
 
 ```bash
 scripts/run/vertexing.sh setup --geometry <tgeo.root> --geometry_config <config.json> --material_map <material.json> \
