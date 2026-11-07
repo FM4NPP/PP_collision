@@ -754,7 +754,11 @@ class DownstreamTrainer():
             save_csv).
         """
         self.model.eval()
-        amp = torch.cuda.is_available() and self.use_amp
+        # eval_precision: bf16 / fp16 autocast, tf32 (fp32 with TF32 matrix multiplies, global while this runs) or fp32
+        precision = getattr(self.params, "eval_precision", None) or ("bf16" if self.use_amp else "fp32")
+        amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision) if torch.cuda.is_available() else None
+        tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = precision == "tf32"
         est, tgt, ok, per_point = [], [], [], []
         chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
         pending = []        # loader batches waiting for VertexHead (CPU copies)
@@ -829,7 +833,7 @@ class DownstreamTrainer():
             mask = grouped[..., 0] != PAD_VALUE
             lap("data")
 
-            with autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext():
+            with autocast("cuda", dtype=amp_dtype) if amp_dtype else nullcontext():
                 if pretrain:
                     _, pre_embed, _ = self.model(grouped, return_z=True)
                     lap("backbone")
@@ -850,6 +854,7 @@ class DownstreamTrainer():
         flush()              # the loader ended with a partial chunk
         flush()              # and waits for it
         pool.shutdown()
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
         timing["wall"] = wall = time.perf_counter() - start
 
         est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)
