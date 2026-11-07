@@ -486,6 +486,49 @@ def _track_compatibility(point, track_position, track_direction, track_sigma):
     V = torch.cross(track_direction, U, dim=-1)
     return ((r * U).sum(dim=-1) / track_sigma[..., 0]) ** 2 + ((r * V).sum(dim=-1) / (track_sigma[..., 1] * transverse)) ** 2
 
+def _density_seed(d0, z0, track_sigma, track_weight, d0_significance=3.5, z0_significance=12.0):
+    """
+    z of the highest track density on the beam line, as ACTS's Gaussian track-density seeder (d0-z0 correlation
+    ignored): each track with |d0| / sigma_d0 <= d0_significance adds weight x N(d0, z0 - z) within its
+    z0_significance window; the maximum is searched from each track's z0 with two Gaussian-shaped Newton steps.
+
+    Args:
+        d0, z0: (B, T) perigee to the beam line, cm; track_sigma: (B, T, 2) their errors; track_weight: (B, T).
+
+    Returns:
+        z (B,), NaN where no track contributes.
+    """
+    sigma_d0, sigma_z0 = track_sigma[..., 0], track_sigma[..., 1]
+    d0_chi2 = (d0 / sigma_d0) ** 2
+    use = (track_weight > 0) & (d0_chi2 <= d0_significance ** 2) & torch.isfinite(z0)
+    # log of each track's density on the beam line at its own z0, and its z window (ACTS: chi2 <= 4 z0_significance^2)
+    log_peak = torch.where(use, torch.log(track_weight.clamp(min=1e-30)) - 0.5 * d0_chi2.nan_to_num()
+                           - torch.log(2 * math.pi * sigma_d0 * sigma_z0), -torch.inf)
+    half_window = sigma_z0 * (4 * z0_significance ** 2 - d0_chi2.nan_to_num()).clamp(min=0).sqrt()
+    z0, sigma_z0 = z0.nan_to_num().unsqueeze(1), sigma_z0.unsqueeze(1)
+
+    def density(z):
+        """Density and its first two derivatives at candidates z (B, C)."""
+        dz = z.unsqueeze(-1) - z0                                               # (B, C, T)
+        delta = torch.where(dz.abs() < half_window.unsqueeze(1),
+                            torch.exp(log_peak.unsqueeze(1) - 0.5 * (dz / sigma_z0) ** 2), 0.0)
+        slope = -dz / sigma_z0 ** 2
+        return delta.sum(-1), (delta * slope).sum(-1), (delta * (slope ** 2 - 1 / sigma_z0 ** 2)).sum(-1)
+
+    # from each track's z0: a candidate counts while density > 0 and it is a maximum (second derivative < 0)
+    z, ok = z0.squeeze(1), use
+    candidates, values = [], []
+    for step in range(3):
+        y, dy, ddy = density(z)
+        ok = ok & (y > 0) & (ddy < 0)
+        candidates.append(z)
+        values.append(torch.where(ok, y, -torch.inf))
+        if step < 2:
+            z = z + (y * dy / (dy * dy - y * ddy)).nan_to_num()
+    values, candidates = torch.cat(values, dim=-1), torch.cat(candidates, dim=-1)
+    best = values.argmax(dim=-1, keepdim=True)
+    return torch.where(torch.isfinite(values.gather(-1, best)), candidates.gather(-1, best), torch.nan).squeeze(-1)
+
 def _fit_vertex_by_helix_closest_approach(
     circle_centre,
     R_s,
@@ -559,6 +602,8 @@ class VertexHead(nn.Module):
         helix_iterations, convergence_tolerance (cm), minimum_total_weight: fit limits.
         annealing_temperatures, annealing_cut_off, min_track_weight, adaptive_max_iterations, max_relative_shift:
             the adaptive fit (ACTS's defaults).
+        density_seed: the adaptive fit's first weights from compatibility with the track-density seed on the beam line
+            (ACTS's Gaussian seeder), not the all-track fit; seed_d0_significance, seed_z0_significance: its cuts.
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped);
             acts_image or acts_command, acts_field_map (+ _kind), acts_geometry + acts_geometry_config,
             acts_material_map, acts_energy_loss, acts_max_steps configure it.
@@ -600,6 +645,9 @@ class VertexHead(nn.Module):
         min_track_weight: float = 1e-4,
         adaptive_max_iterations: int = 30,
         max_relative_shift: float = 0.01,
+        density_seed: bool = True,
+        seed_d0_significance: float = 3.5,
+        seed_z0_significance: float = 12.0,
         sv_min_track_pv_chi2: float = 9.0,
         sv_min_track_beam_significance: float = 0.0,
         sv_max_track_chi2: float = 9.0,
@@ -641,6 +689,9 @@ class VertexHead(nn.Module):
         self.min_track_weight = min_track_weight
         self.adaptive_max_iterations = adaptive_max_iterations
         self.max_relative_shift = max_relative_shift
+        self.density_seed = density_seed
+        self.seed_d0_significance = seed_d0_significance
+        self.seed_z0_significance = seed_z0_significance
         self.sv_min_track_pv_chi2 = sv_min_track_pv_chi2
         self.sv_min_track_beam_significance = sv_min_track_beam_significance
         self.sv_max_track_chi2 = sv_max_track_chi2
@@ -763,12 +814,20 @@ class VertexHead(nn.Module):
             fit = {k: torch.where(keep_linear.view(-1, *[1] * (v.dim() - 1)), linear[k], v) for k, v in fit.items()}
         return fit
 
-    def _fit_adaptive(self, track_position, track_direction, track_weight, params, competing_chi2=None, start=None):
+    def _fit_adaptive(self, track_position, track_direction, track_weight, params, competing_chi2=None, start=None,
+                      seed=None):
         """
         ACTS's adaptive (annealed) fit of one vertex. competing_chi2: (B, T, K) chi2 to other vertices (inf if none),
-        for shared track weights. Returns the fit and each track's weight (B, T).
+        for shared track weights; seed: (B, 3) the first weights come from compatibility with it (NaN rows: with
+        the all-track fit). Returns the fit and each track's weight (B, T).
         """
         fit = self._fit(track_position, track_direction, track_weight, params, start=start)
+        if seed is not None:
+            seeded = torch.isfinite(seed).all(dim=-1, keepdim=True)
+            fit = {**fit, "vertex_estimate": torch.where(seeded, seed, fit["vertex_estimate"]),
+                   "track_chi2": torch.where(seeded, _track_compatibility(seed.nan_to_num(), track_position,
+                                                                          track_direction, params["track_sigma"]),
+                                             fit["track_chi2"])}
         index, equilibrium = 0, False
         done, previous_weight = torch.zeros_like(fit["fit_is_valid"]), None    # finished events keep their fit
         for _ in range(self.adaptive_max_iterations):
@@ -1060,7 +1119,12 @@ class VertexHead(nn.Module):
         bad = ~params["fit_ok"]
         params["helix"] = (params["circle_centre"].masked_fill(bad.unsqueeze(-1), 0.0), params["R_s"].masked_fill(bad, 1.0),
                            params["zslope"].masked_fill(bad, 0.0), params["z0"].masked_fill(bad, 0.0))
-        fit, vertex_weight = self._fit_adaptive(track_position, track_direction, track_weight, params)
+        seed = None
+        if self.density_seed:
+            z = _density_seed(d0, z0, params["track_sigma"], track_weight, self.seed_d0_significance,
+                              self.seed_z0_significance).to(dtype)
+            seed = torch.stack([torch.full_like(z, self.beam_position[0]), torch.full_like(z, self.beam_position[1]), z], -1)
+        fit, vertex_weight = self._fit_adaptive(track_position, track_direction, track_weight, params, seed=seed)
 
         result = {
             "track_parameters": perigee.to(dtype),
@@ -1073,6 +1137,8 @@ class VertexHead(nn.Module):
             result["acts_failed"] = acts_failed
         if track_covariance is not None:
             result["track_covariance"] = track_covariance
+        if seed is not None:
+            result["pv_seed"] = seed
         result["track_sigma"] = params["track_sigma"]
         # per-track outputs of unfitted tracks (bad) come from their finite stand-ins: NaN in what is reported
         def masked(f):

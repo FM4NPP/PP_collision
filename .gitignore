@@ -79,3 +79,5 @@ slurm-*.out
 scripts/configs/sphenix_*.yaml
 # field maps converted by setup into the detector folder
 scripts/acts/detectors/*/field_*.txt
+# ACTS images (scripts/acts/build_images.sh)
+scripts/acts/*.sif
