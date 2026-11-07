@@ -74,13 +74,9 @@ def build_propagator(config):
 
 
 def read_exact(stream, size):
-    data = bytearray()
-    while len(data) < size:
-        chunk = stream.read(size - len(data))
-        if not chunk:
-            return None
-        data += chunk
-    return bytes(data)
+    """size bytes from a buffered stream (its read waits for them), None at the end of the input."""
+    data = stream.read(size)
+    return data if len(data) == size else None
 
 
 def serve(config):

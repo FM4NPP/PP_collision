@@ -660,13 +660,11 @@ class DownstreamTrainer():
         self.vertex_head.start_acts()       # boots while the checkpoints and data load
 
     def _vertex_head(self, class_probs, mask_probs, points, padding_mask):
-        """VertexHead on its device (vertex_device); its tensor outputs back on the inputs' device."""
+        """VertexHead on its device (vertex_device); vertex_estimate and fit_is_valid back on the inputs' device."""
         d = self.vertex_device
         result = self.vertex_head(class_probs=class_probs.to(d), mask_probs=mask_probs.to(d), points=points.to(d),
                                   padding_mask=padding_mask.to(d))
-        move = lambda v: v.to(class_probs.device) if torch.is_tensor(v) else (  # noqa: E731
-            {k: move(x) for k, x in v.items()} if isinstance(v, dict) else v)
-        return {k: move(v) for k, v in result.items()}
+        return {k: result[k].to(class_probs.device) for k in ("vertex_estimate", "fit_is_valid")}
 
     def _vertex_head_chunk(self, records):
         """
@@ -681,10 +679,9 @@ class DownstreamTrainer():
                 probs, real = r["mask_probs"][e].float(), r["mask"][e]
                 assigned = real & (probs.max(dim=-1).values > 0)
                 best = probs.argmax(dim=-1)
-                n_hits = torch.zeros(probs.shape[-1], dtype=torch.long, device=probs.device).index_add_(
-                    0, best[assigned], torch.ones_like(best[assigned]))
-                slots = (n_hits >= self.vertex_head.min_hits).nonzero(as_tuple=True)[0]
-                probs = probs * (n_hits >= self.vertex_head.min_hits)[best].unsqueeze(-1)    # other hits: unassigned
+                keep = torch.bincount(best[assigned], minlength=probs.shape[-1]) >= self.vertex_head.min_hits
+                slots = keep.nonzero(as_tuple=True)[0]
+                probs = probs * keep[best].unsqueeze(-1)    # hits on the other slots: unassigned
                 events.append((r["class_probs"][e, slots].float(), probs[:, slots], r["grouped"][e], real))
         n_hits = max(len(real) for *_, real in events)
         n_tracks = max(1, max(len(c) for c, *_ in events))
@@ -752,7 +749,7 @@ class DownstreamTrainer():
         est, tgt, ok, per_point = [], [], [], []
         chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
         pending = []        # loader batches waiting for VertexHead (CPU copies)
-        pool, job = ThreadPoolExecutor(max_workers=1), [None]
+        job = [None]
         # VertexHead on the GPU queues on its own stream, so the main loop's syncs and copies do not wait for it
         stream = torch.cuda.Stream(self.vertex_device) if self.vertex_device.type == "cuda" else None
 
@@ -761,10 +758,10 @@ class DownstreamTrainer():
             """Truth labels and VertexHead over these batches, then their metrics inputs and CSV rows (the background
             thread)."""
             t0 = time.perf_counter()
+            beam = self.vertex_head.beam_position
             for r in records:
                 # hits whose particle starts within truth_radius of the beam line (padded rows excluded: their zeros
                 # would pass); the truth PV: the origin shared by the most particles
-                beam = self.vertex_head.beam_position
                 r["truth"] = get_vertex_label(r["reg"], particle_id=r["label"], valid_tracks=(torch.hypot(
                     r["reg"][..., 3] - beam[0], r["reg"][..., 4] - beam[1]) < self.params.truth_radius) & r["mask"])
             t1 = time.perf_counter()
@@ -775,7 +772,7 @@ class DownstreamTrainer():
                 if save_csv:
                     truth_vertex = r["truth"]["vertex_target"].masked_fill(~r["truth"]["vertex_valid"][:, None],
                                                                            float("nan"))
-                    per_point.append(per_point_columns(sum(len(e) for e in est), r["grouped"], r["label"], r["reg"], r["mask"],
+                    per_point.append(per_point_columns(r["first_event"], r["grouped"], r["label"], r["reg"], r["mask"],
                                                        r["class_probs"], r["mask_probs"], vertex, truth_vertex,
                                                        r["truth"]["hit_vertex"]))
                 est.append(vertex)
@@ -797,14 +794,11 @@ class DownstreamTrainer():
 
         stages = ("data", "backbone", "track_head", "to_cpu", "waiting", "truth", "vertex_head", "csv")
         timing = dict.fromkeys(stages, 0.0)
-        for key in vertexhead.ACTS_TIMING:
-            vertexhead.ACTS_TIMING[key] = type(vertexhead.ACTS_TIMING[key])(0)
+        vertexhead.ACTS_TIMING.update(start_s=0.0, propagate_s=0.0, states=0)
         # the main loop's own stream only (VertexHead runs on another)
-        sync = (lambda: torch.cuda.current_stream().synchronize()) if torch.cuda.is_available() else (lambda: None)
+        sync = torch.cuda.current_stream().synchronize if torch.cuda.is_available() else (lambda: None)
         clock = [time.perf_counter()]
         start, n_seen = clock[0], 0
-        cpu = lambda v: v.cpu() if torch.is_tensor(v) else (  # noqa: E731
-            {k: cpu(x) for k, x in v.items()} if isinstance(v, dict) else v)
 
         def lap(stage):
             sync()
@@ -812,39 +806,39 @@ class DownstreamTrainer():
             timing[stage] += now - clock[0]
             clock[0] = now
 
-        for batch in tqdm(self.val_data_loader):
-            if len(batch) != 4:
-                raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
-                                   "set params.return_reg_test = True before launch()")
-            grouped, label, _, reg = batch
-            if max_events:      # the last batch: only the events still wanted
-                grouped, label, reg = (t[:max_events - n_seen] for t in (grouped, label, reg))
-            b, c = grouped.size(0), grouped.size(-1)
-            grouped = grouped.reshape(b, -1, c).to(self.device)
-            reg = reg.to(self.device)
-            mask = grouped[..., 0] != PAD_VALUE
-            lap("data")
+        with ThreadPoolExecutor(max_workers=1) as pool:     # shut down on errors too
+            for batch in tqdm(self.val_data_loader):
+                if len(batch) != 4:
+                    raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
+                                       "set params.return_reg_test = True before launch()")
+                grouped, label, _, reg = batch
+                if max_events:      # the last batch: only the events still wanted
+                    grouped, label, reg = (t[:max_events - n_seen] for t in (grouped, label, reg))
+                b, c = grouped.size(0), grouped.size(-1)
+                grouped = grouped.reshape(b, -1, c)
+                mask = grouped[..., 0] != PAD_VALUE
+                inputs, input_mask = grouped.to(self.device), mask.to(self.device)
+                lap("data")
 
-            if pretrain:
-                _, pre_embed, _ = self.model(grouped, return_z=True)
-                lap("backbone")
-                out = self.down_model(grouped, self._layer_features(pre_embed), pretrain=True, padding_mask=mask)
-            else:
-                out = self.down_model(grouped, feature=None)
-            lap("track_head")
+                if pretrain:
+                    _, pre_embed, _ = self.model(inputs, return_z=True)
+                    lap("backbone")
+                    out = self.down_model(inputs, self._layer_features(pre_embed), pretrain=True, padding_mask=input_mask)
+                else:
+                    out = self.down_model(inputs, feature=None)
+                lap("track_head")
 
-            pending.append(cpu({"grouped": grouped, "label": label, "reg": reg, "mask": mask,
-                                "class_probs": out["class_probs"], "mask_probs": out["mask_probs"]}))
-            lap("to_cpu")
-            n_seen += b
-            last = bool(max_events) and n_seen >= max_events
-            if last or sum(r["mask"].shape[0] for r in pending) >= chunk_events:
-                flush()
-            if last:
-                break
-        flush()              # the loader ended with a partial chunk
-        flush()              # and waits for it
-        pool.shutdown()
+                pending.append({"first_event": n_seen, "grouped": grouped, "label": label, "reg": reg, "mask": mask,
+                                "class_probs": out["class_probs"].cpu(), "mask_probs": out["mask_probs"].cpu()})
+                lap("to_cpu")
+                n_seen += b
+                last = bool(max_events) and n_seen >= max_events
+                if last or n_seen - pending[0]["first_event"] >= chunk_events:
+                    flush()
+                if last:
+                    break
+            flush()              # the loader ended with a partial chunk
+            flush()              # and waits for it
         timing["wall"] = wall = time.perf_counter() - start
 
         est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)

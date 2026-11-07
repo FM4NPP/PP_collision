@@ -240,8 +240,6 @@ def main():
         sys.exit(f"config {args.config!r} has no pretrained_ckpt; add one to the YAML or pass --pretrained_ckpt")
     params.limit_data = True
     params.limit_size = args.eventnumber
-    params.batch_size = args.eval_batch_size
-    params.valid_batch_size = args.eval_batch_size
     # [FIX B8] mirror the seed suffix used by train_track_finding.py
     seed_suffix = "" if args.no_seed_in_ckpt else f"_seed{args.seed}"
     pretrain_suffix = "" if args.usepretrain else "_nopretrain"
@@ -263,17 +261,14 @@ def main():
     params.num_embedder_layers = 0
     params.return_reg_test = True        # val loader then yields reg as a 4th element
     params.return_dict = False           # the trainer unpacks tuples, like track_finding_trainer
-    if args.bz is not None:
-        params.vertex_bz = args.bz
-    if args.vertex_chunk_events is not None:
-        params.vertex_chunk_events = args.vertex_chunk_events
-    if args.vertex_device is not None:
-        params.vertex_device = args.vertex_device
-    if args.detector is not None:
-        params.vertex_detector = os.path.abspath(args.detector)
-
-    params.no_output = args.no_output
-    params.truth_radius = args.truth_radius
+    # the run's settings, through params[...] so the run log records them (None: the model YAML's or the default)
+    for key, value in (("batch_size", args.eval_batch_size), ("valid_batch_size", args.eval_batch_size),
+                       ("vertex_bz", args.bz), ("vertex_chunk_events", args.vertex_chunk_events),
+                       ("vertex_device", args.vertex_device),
+                       ("vertex_detector", args.detector and os.path.abspath(args.detector)),
+                       ("truth_radius", args.truth_radius), ("no_output", args.no_output)):
+        if value is not None:
+            params[key] = value
     print(f"[vertex] backbone   : {params.pretrained_ckpt}")
     print(f"[vertex] track head : {checkpoint_path}")
 

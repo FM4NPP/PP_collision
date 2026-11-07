@@ -189,10 +189,10 @@ def _helix_from_hits(points, hit_r, track, assigned, n_tracks, Bz=1.4, scaling_f
         beam_position: (x, y) of the beam line, cm; arc length and beam_dca are measured from it.
 
     Returns:
-        dict, float64, NaN (or False) where fit_ok is False:
-            pT, beam_dca (closest approach of the circle to the beam line), fit_ok (B, T).
+        dict, float64, NaN for tracks without a fit:
+            pT, theta, qop, beam_dca (closest approach of the circle to the beam line) (B, T).
             circle_centre (B, T, 2), R_s, zslope, z0 (B, T): the circle and z line z = zslope * s + z0
-                (s from _arc_length).
+                (s from _arc_length); hit_s (B, N) each hit's s on its track.
             innermost (B, T): index of each track's innermost hit (0 for a track with none).
     """
     x, y, z = (points[..., k].double() for k in (1, 2, 3))
@@ -229,9 +229,9 @@ def _helix_from_hits(points, hit_r, track, assigned, n_tracks, Bz=1.4, scaling_f
                                             for v in (pT, theta, beam_dca, sign_Rs * radius, zslope, z0))
 
     return {
-        "pT": pT, "beam_dca": beam_dca, "fit_ok": fit_ok,
+        "pT": pT, "theta": theta, "qop": q * torch.sin(theta) / pT, "beam_dca": beam_dca,
         "circle_centre": torch.where(fit_ok.unsqueeze(-1), torch.stack([xc, yc], dim=-1), nan.unsqueeze(-1)),
-        "R_s": R_s, "zslope": zslope, "z0": z0, "innermost": i_in,
+        "R_s": R_s, "zslope": zslope, "z0": z0, "hit_s": s, "innermost": i_in,
     }
 
 def _track_covariance(s, track, assigned, n_tracks, theta, qop, s_reference, sigma_rphi, sigma_z, Bz=1.4,
@@ -913,7 +913,7 @@ class VertexHead(nn.Module):
                                                                           track_direction, params["track_sigma"]),
                                              fit["track_chi2"])}
         n_temperatures = len(self.annealing_temperatures)
-        done, previous_weight = torch.zeros_like(fit["fit_is_valid"]), None    # finished events keep their fit
+        done, previous_weight = torch.zeros_like(fit["fit_is_valid"]), torch.zeros_like(track_weight)    # finished events keep their fit
         for i in range(self.adaptive_max_iterations):
             # one annealing step per update, then the last temperature
             t2 = 2.0 * self.annealing_temperatures[min(i, n_temperatures - 1)]
@@ -922,9 +922,7 @@ class VertexHead(nn.Module):
             competing = 0.0 if competing_chi2 is None else torch.exp((chi2.unsqueeze(-1) - competing_chi2) / t2).sum(dim=-1)
             vertex_weight = (1.0 / (1.0 + torch.exp((chi2 - self.annealing_cut_off) / t2) + competing)).nan_to_num(0.0)
             vertex_weight = vertex_weight.masked_fill(vertex_weight <= self.min_track_weight, 0.0).to(track_weight.dtype)
-            if previous_weight is not None:
-                vertex_weight = torch.where(done.unsqueeze(-1), previous_weight, vertex_weight)
-            previous_weight = vertex_weight
+            vertex_weight = previous_weight = torch.where(done.unsqueeze(-1), previous_weight, vertex_weight)
             new = self._fit(track_position, track_direction, track_weight * vertex_weight, params,
                             start=fit["vertex_estimate"], single_step=True)
             valid = new["fit_is_valid"]
@@ -1107,14 +1105,10 @@ class VertexHead(nn.Module):
             helix = _helix_from_hits(hits, hit_r, track, assigned, n_tracks, Bz=self.Bz, scaling_factor=self.scaling_factor,
                                    min_hits=self.min_hits, beam_position=self.beam_position,
                                    field=track_bz.abs() if torch.is_tensor(track_bz) else None)
-            centre, R_s, zslope = helix["circle_centre"], helix["R_s"], helix["zslope"]
-            theta = torch.atan2(torch.ones_like(zslope), zslope)        # cot(theta) = dz/ds
-            qop = torch.sign(R_s) * (1.0 if self.Bz >= 0 else -1.0) * torch.sin(theta) / helix["pT"]
+            centre, R_s, zslope, theta, qop = (helix[k] for k in ("circle_centre", "R_s", "zslope", "theta", "qop"))
             # the hit fit's covariance at a point s_reference along each helix (cm, from the hit errors)
-            hit_s = _arc_length(hits[..., 1].double(), hits[..., 2].double(), centre[..., 0].gather(1, track),
-                                centre[..., 1].gather(1, track), R_s.gather(1, track), self.beam_position)
             hit_covariance = lambda s_reference, curvilinear: _track_covariance(  # noqa: E731
-                hit_s, track, assigned, n_tracks, theta, qop, s_reference, self.hit_sigma_rphi, self.hit_sigma_z,
+                helix["hit_s"], track, assigned, n_tracks, theta, qop, s_reference, self.hit_sigma_rphi, self.hit_sigma_z,
                 track_bz, self.scaling_factor, curvilinear, self.min_hits)
             if self.use_acts:
                 # ACTS propagates the helix state at the innermost hit (mm) back to the beam spot
@@ -1143,8 +1137,10 @@ class VertexHead(nn.Module):
                 track_covariance = torch.from_numpy(acts_out[2]).reshape(*qop.shape, 6, 6).to(hits.device)
                 track_weight = torch.ones_like(total_hit_weight)
             else:
-                # the hit fit as perigee tracks (cm); its circle comes back with the field its pT came from
-                perigee, perigee_bz = _perigee_from_circle(centre, R_s, theta, helix["z0"], qop, self.beam_position), track_bz
+                # the hit fit as perigee tracks (cm); its circle comes back with the field its pT came from, signed as
+                # Bz (which gave its charge)
+                perigee = _perigee_from_circle(centre, R_s, theta, helix["z0"], qop, self.beam_position)
+                perigee_bz = track_bz.abs() * (1.0 if self.Bz >= 0 else -1.0) if torch.is_tensor(track_bz) else track_bz
                 covariance = hit_covariance(torch.zeros_like(theta), False)
                 track_sigma = torch.stack([covariance[..., 0, 0], covariance[..., 1, 1]], dim=-1).sqrt()
                 base_weight = class_probs[..., 1].clone()
@@ -1165,17 +1161,18 @@ class VertexHead(nn.Module):
                                       ).double().sqrt() * self.track_parameter_length_scale
         # every route: perigee tracks (cm) -> circle, z line, pT and usability
         dtype = base_weight.dtype
-        fit_ok = torch.isfinite(perigee[..., :5]).all(dim=-1)
+        bad = ~torch.isfinite(perigee[..., :5]).all(dim=-1)          # tracks without a fit
         circle_centre, R_s, zslope, z0, pT, beam_dca = _circle_from_perigee(
             perigee, perigee_bz, self.scaling_factor, self.beam_position)
-        params = {"circle_centre": circle_centre.to(dtype), "R_s": R_s.to(dtype), "zslope": zslope.to(dtype),
-                  "z0": z0.to(dtype), "pT": pT, "beam_dca": beam_dca, "fit_ok": fit_ok,
-                  "usable": fit_ok & self._usable(pT, beam_dca)}
+        # the helix for the fit, with finite stand-ins for tracks without one (weight 0; their outputs are masked below)
+        params = {"pT": pT, "beam_dca": beam_dca, "usable": ~bad & self._usable(pT, beam_dca),
+                  "helix": (circle_centre.to(dtype).masked_fill(bad.unsqueeze(-1), 0.0), R_s.to(dtype).masked_fill(bad, 1.0),
+                            zslope.to(dtype).masked_fill(bad, 0.0), z0.to(dtype).masked_fill(bad, 0.0))}
         # tracks without a usable covariance get no weight (and a finite stand-in error)
         has_sigma = torch.isfinite(track_sigma).all(dim=-1) & (track_sigma > 0).all(dim=-1)
         base_weight = base_weight * has_sigma.to(dtype)
         params["track_sigma"] = torch.where(has_sigma.unsqueeze(-1), track_sigma * self.track_error_scale, 1.0).to(dtype)
-        perigee = perigee.masked_fill(~params["fit_ok"].unsqueeze(-1), float("nan"))
+        perigee = perigee.masked_fill(bad.unsqueeze(-1), float("nan"))
 
         # straight line of each track at its perigee; tracks without a fit get a finite stand-in (weight 0)
         d0, z0, phi, theta = perigee[..., 0], perigee[..., 1], perigee[..., 2], perigee[..., 3]
@@ -1183,9 +1180,8 @@ class VertexHead(nn.Module):
                                       self.beam_position[1] + d0 * torch.cos(phi), z0], dim=-1)
         track_direction = torch.stack([torch.sin(theta) * torch.cos(phi), torch.sin(theta) * torch.sin(phi),
                                        torch.cos(theta)], dim=-1)
-        fit_ok = params["fit_ok"].unsqueeze(-1)
-        track_position = torch.where(fit_ok, track_position, 0.0).to(dtype)
-        track_direction = torch.where(fit_ok, track_direction, track_direction.new_tensor([1.0, 0.0, 0.0])).to(dtype)
+        track_position = torch.where(bad.unsqueeze(-1), 0.0, track_position).to(dtype)
+        track_direction = torch.where(bad.unsqueeze(-1), track_direction.new_tensor([1.0, 0.0, 0.0]), track_direction).to(dtype)
 
         if self.learn_weights:
             # features: class_probs (2) + (q/(pT+1), theta, sin phi, cos phi) at the perigee; filler without a fit
@@ -1208,10 +1204,6 @@ class VertexHead(nn.Module):
             usable = hard + soft - soft.detach()
         track_weight = track_weight * usable
 
-        # finite stand-ins for unfitted tracks (weight 0; their outputs are masked below)
-        bad = ~params["fit_ok"]
-        params["helix"] = (params["circle_centre"].masked_fill(bad.unsqueeze(-1), 0.0), params["R_s"].masked_fill(bad, 1.0),
-                           params["zslope"].masked_fill(bad, 0.0), params["z0"].masked_fill(bad, 0.0))
         # primary vertices, as ACTS AMVF iterates: seed, z window and adaptive fit on the tracks not yet used, up to
         # max_vertices; a later vertex needs min_vertex_tracks tracks of fit weight >= 0.5, and the tracks it uses
         # leave the pool (weight x (1 - fit weight))
@@ -1229,20 +1221,20 @@ class VertexHead(nn.Module):
                 for earlier in candidates:
                     dz = vertex_fit["vertex_estimate"][:, 2] - earlier[0]["vertex_estimate"][:, 2]
                     sigma = (vertex_fit["vertex_covariance"][:, 2, 2] + earlier[0]["vertex_covariance"][:, 2, 2]).sqrt()
-                    valid = valid & ~(earlier[6] & (dz.abs() < self.max_merge_significance * sigma))
-            candidates.append((vertex_fit, annealing, seed, window, available * window, fit_weight, valid))
+                    valid = valid & ~(earlier[5] & (dz.abs() < self.max_merge_significance * sigma))
+            candidates.append((vertex_fit, annealing, window, available * window, fit_weight, valid))
             # the candidate's tracks leave the pool whether or not it is kept, so its seed is not found again
             used = vertex_fit["fit_is_valid"].unsqueeze(-1).to(fit_weight.dtype)
             available = available * (1 - fit_weight * used).clamp(min=0.0)
         # the PV: the valid vertex with the highest sum of fit weight x pT^2 (the first without a valid one)
         pT2 = params["pT"].nan_to_num(0.0).to(dtype) ** 2
-        pv_index = torch.stack([(c[5] * pT2).sum(dim=-1).masked_fill(~c[6], -torch.inf) for c in candidates],
+        pv_index = torch.stack([(c[4] * pT2).sum(dim=-1).masked_fill(~c[5], -torch.inf) for c in candidates],
                                dim=1).argmax(dim=1)
         pick = lambda values: torch.stack(values, dim=1)[torch.arange(len(pv_index), device=pv_index.device), pv_index]  # noqa: E731
         fit = {key: pick([c[0][key] for c in candidates]) for key in candidates[0][0]}
-        vertex_weight, window, pv_weight = (pick([c[i] for c in candidates]) for i in (1, 3, 4))
+        vertex_weight, window, pv_weight = (pick([c[i] for c in candidates]) for i in (1, 2, 3))
         # SV finding keeps track_weight, minus the tracks of the other primary vertices
-        others = torch.stack([c[5] * c[6].unsqueeze(-1) for c in candidates], dim=1).masked_fill(
+        others = torch.stack([c[4] * c[5].unsqueeze(-1) for c in candidates], dim=1).masked_fill(
             torch.nn.functional.one_hot(pv_index, len(candidates)).bool().unsqueeze(-1), 0.0)
         sv_weight = track_weight * (1 - others.max(dim=1).values)
 
@@ -1252,12 +1244,12 @@ class VertexHead(nn.Module):
             "track_direction": track_direction,
             "track_weight": track_weight,
             "track_quality_mask": params["usable"],
+            "track_sigma": params["track_sigma"],
         }
         if acts_failed is not None:
             result["acts_failed"] = acts_failed
         if track_covariance is not None:
             result["track_covariance"] = track_covariance
-        result["track_sigma"] = params["track_sigma"]
         if self.find_secondary:
             secondary = self._find_secondary_vertices(fit, track_position, track_direction, sv_weight, params, pv_weight)
             refit = secondary.pop("pv_refit", None)
@@ -1290,8 +1282,8 @@ class VertexHead(nn.Module):
         })
         if len(candidates) > 1:
             # all primary vertices (pileup), each track's (fit weight >= 0.5, else -1) and which one is the PV
-            valid = torch.stack([c[6] for c in candidates], dim=1)
-            fit_weight = torch.stack([c[5] for c in candidates], dim=1) * valid.unsqueeze(-1).to(dtype)
+            valid = torch.stack([c[5] for c in candidates], dim=1)
+            fit_weight = torch.stack([c[4] for c in candidates], dim=1) * valid.unsqueeze(-1).to(dtype)
             best, index = fit_weight.max(dim=1)
             result.update({
                 "primary_vertices": torch.stack([c[0]["vertex_estimate"] for c in candidates], dim=1).masked_fill(

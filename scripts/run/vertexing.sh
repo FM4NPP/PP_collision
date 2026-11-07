@@ -68,26 +68,25 @@ case "$COMMAND" in
         # line's value (its comment kept) or is added (to its section)
         python - "$DETECTOR" "$detector_dir/sphenix.yaml" "acts.image=$image" ${settings[@]+"${settings[@]}"} <<'EOF'
 import os, re, sys
+import yaml
 path, template, settings = sys.argv[1], sys.argv[2], sys.argv[3:]
 
 
-def entries(lines):
-    """key -> value of each top-level setting, section.key -> value of each setting in a section."""
-    found, section = {}, None
-    for line in lines:
-        if m := re.match(r"(\w+):\s*(.*?)\s*(#.*)?$", line):
-            section = m[1]
-            if m[2]:
-                found[m[1]] = m[2]
-        elif (m := re.match(r"  (\w+):\s*(.*?)\s*(#.*)?$", line)) and section:
-            found[f"{section}.{m[1]}"] = m[2]
+def entries(file):
+    """key -> value of each top-level setting, section.key -> value of each setting in a section (parsed YAML)."""
+    found = {}
+    for key, value in (yaml.safe_load(open(file)) or {}).items():
+        found.update({f"{key}.{k}": v for k, v in value.items()} if isinstance(value, dict) else {key: value})
     return found
 
 
 lines = open(template).read().splitlines()
 if os.path.exists(path):
-    defaults = entries(lines)
-    kept = [f"{k}={v}" for k, v in entries(open(path).read().splitlines()).items() if v and v != defaults.get(k)]
+    defaults = entries(template)
+    sections = {k for k, v in (yaml.safe_load(open(template)) or {}).items() if isinstance(v, dict)}
+    text = lambda v: yaml.safe_dump(v, default_flow_style=True, width=float("inf")).splitlines()[0]  # noqa: E731
+    kept = [f"{k}={text(v)}" for k, v in entries(path).items()
+            if k not in sections and (k not in defaults or v != defaults[k])]
     settings = settings[:1] + kept + settings[1:]
 else:
     print(f"writing {path}")
