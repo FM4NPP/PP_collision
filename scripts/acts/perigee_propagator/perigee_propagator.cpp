@@ -51,7 +51,8 @@ class PerigeePropagator {
         m_surface(Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3(reference[0], reference[1], reference[2]))),
         m_energyLoss(energyLoss),
         m_maxSteps(maxSteps) {
-    auto logger = [](const char* name) { return Acts::getDefaultLogger(name, Acts::Logging::WARNING); };
+    // errors only: per-state warnings (e.g. a field lookup outside the map) are counted in the worker's failure summary
+    auto logger = [](const char* name) { return Acts::getDefaultLogger(name, Acts::Logging::ERROR); };
     if (m_geometry) {
       Acts::Navigator::Config config;
       config.trackingGeometry = m_geometry;
