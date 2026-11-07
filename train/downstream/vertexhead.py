@@ -656,7 +656,7 @@ class VertexHead(nn.Module):
         density_seed: the adaptive fit's first weights from compatibility with the track-density seed on the beam line
             (ACTS's Gaussian seeder), not the all-track fit; seed_d0_significance, seed_z0_significance: its cuts.
         seed_z_window, seed_z_window_softness (cm): the PV fit's track weights x sigmoid((window - |z0 - z_seed|) /
-            softness), a soft form of ACTS AMVF's 1 mm z preselection (sharper x-y, softer z); None: off.
+            softness), a soft form of ACTS AMVF's 1 mm z preselection; None: off.
         use_acts: ACTS builds each track's perigee parameters and covariance (tracks it fails on are dropped);
             acts_image or acts_command, acts_geometry + acts_geometry_config, acts_material_map, acts_energy_loss,
             acts_max_steps configure it.
@@ -701,8 +701,8 @@ class VertexHead(nn.Module):
         density_seed: bool = True,
         seed_d0_significance: float = 3.5,
         seed_z0_significance: float = 12.0,
-        seed_z_window: float = None,
-        seed_z_window_softness: float = 0.02,
+        seed_z_window: float = 0.2,
+        seed_z_window_softness: float = 0.05,
         sv_min_track_pv_chi2: float = 9.0,
         sv_min_track_beam_significance: float = 0.0,
         sv_max_track_chi2: float = 9.0,
@@ -1056,7 +1056,8 @@ class VertexHead(nn.Module):
 
         Returns:
             dict (the PV: the refit where used_refit):
-                vertex_estimate (B, 3), chi_square, fit_is_valid (B,), vertex_covariance (B, 3, 3).
+                vertex_estimate (B, 3), chi_square, fit_is_valid (B,), vertex_covariance (B, 3, 3); its quality:
+                vertex_n_tracks (B,) tracks with annealing weight >= 0.5, vertex_ndf (B,) 2 sum(weights) - 3 (ACTS).
                 track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
                 track_quality_mask, track_sigma (B, T, 2), track_vertex_weight, track_chi2, track_dca (B, T),
                 track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS;
@@ -1244,6 +1245,8 @@ class VertexHead(nn.Module):
                 used_refit = torch.zeros_like(used_refit)
             result["used_refit"] = used_refit
         fit = masked(fit)
+        # vertex quality, as ACTS judges it: the fitted tracks' annealing weights (tracks with track_weight > 0)
+        weight = vertex_weight.masked_fill(bad | (track_weight <= 0), 0.0)
         result.update({
             "vertex_estimate": fit["vertex_estimate"],
             "chi_square": fit["chi_square"],
@@ -1253,5 +1256,7 @@ class VertexHead(nn.Module):
             "track_vertex_weight": vertex_weight.masked_fill(bad, 0.0),
             "track_chi2": fit["track_chi2"],
             "vertex_covariance": fit["vertex_covariance"],
+            "vertex_n_tracks": (weight >= 0.5).sum(dim=-1),
+            "vertex_ndf": 2 * weight.sum(dim=-1) - 3,
         })
         return result

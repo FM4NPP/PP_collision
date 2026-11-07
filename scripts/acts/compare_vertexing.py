@@ -8,7 +8,9 @@ eval_vertex_reconstruction.py:
 
 VertexHead runs with the detector file's settings (PV and SVs). ACTS's finder as shipped (acts_vertexing.py: AMVF,
 Gaussian seeder; its first vertex as the PV) runs on the same tracks with the same errors (x track_error_scale);
-it needs the detector file's ACTS image; "VH on ACTS" is VertexHead on the events where ACTS found a vertex. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
+it needs the detector file's ACTS image. "VH on ACTS": VertexHead on the events where ACTS found a vertex; "VH 2+
+tracks": its vertices with >= 2 tracks of annealing weight >= 0.5 (ACTS's good-vertex criterion). Tracks: the track
+finder's (pred_assignment) or truth tracks (seg_target).
 Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); VertexHead's SVs against
 truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*).
 """
@@ -197,11 +199,14 @@ def main():
                 times.append(time.perf_counter() - t0)
         timing["VertexHead"] += sum(times)
         # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
-        ndf = [2 * float((o["track_weight"] > 0).double().mul(o["track_vertex_weight"].double()).sum()) - 3 for o in outs]
-        chi2 = [o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()]
+        chi2 = [o["chi_square"].item() / float(o["vertex_ndf"]) for o in outs
+                if float(o["vertex_ndf"]) > 0 and o["fit_is_valid"].all()]
         vertices = np.array([o["vertex_estimate"][0].double().numpy() for o in outs])
         runs = [("VertexHead", vertices, f"{np.median(chi2):8.2f}" if chi2 else "",
                  sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)]
+        # VertexHead's vertices that are good by ACTS's criterion (>= 2 tracks with annealing weight >= 0.5)
+        good = np.array([int(o["vertex_n_tracks"]) >= 2 for o in outs])
+        runs.append(("VH 2+ tracks", np.where(good[:, None], vertices, np.nan), "", runs[0][3], None))
         if head.use_acts:
             t0 = time.perf_counter()
             acts_pv, n_found = acts_vertices(head, outs)
