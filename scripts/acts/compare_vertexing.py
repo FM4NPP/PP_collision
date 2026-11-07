@@ -8,9 +8,7 @@ eval_vertex_reconstruction.py:
 
 VertexHead runs with the detector file's settings (PV and SVs). ACTS's finder as shipped (acts_vertexing.py: AMVF,
 Gaussian seeder; its first vertex as the PV) runs on the same tracks with the same errors (x track_error_scale);
-it needs the detector file's ACTS image. "VH on ACTS": VertexHead on the events where ACTS found a vertex; "VH 2+
-tracks": its vertices with >= 2 tracks of annealing weight >= 0.5 (ACTS's good-vertex criterion). Tracks: the track
-finder's (pred_assignment) or truth tracks (seg_target).
+it needs the detector file's ACTS image. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
 Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); VertexHead's SVs against
 truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*).
 """
@@ -46,8 +44,10 @@ def read_columns(path, max_events):
         return _COLUMN_CACHE[(path, max_events)]
     with open(path) as f:
         header = f.readline().strip().split(",")
-        names = [c for c in COLUMNS if c in header]
-        use = [header.index(c) for c in names]
+        missing = [c for c in COLUMNS if c not in header]
+        if missing:
+            sys.exit(f"{path}: no column(s) {missing}; rerun the eval (eval_vertex_reconstruction.py)")
+        use = [header.index(c) for c in COLUMNS]
         blocks, events = [], set()
         while True:
             lines = f.readlines(64 << 20)
@@ -63,7 +63,7 @@ def read_columns(path, max_events):
     data = np.concatenate(blocks)
     first = np.unique(data[:, 0])[:max_events] if max_events else np.unique(data[:, 0])
     data = data[np.isin(data[:, 0], first)]
-    _COLUMN_CACHE[(path, max_events)] = {c: data[:, k] for k, c in enumerate(names)}
+    _COLUMN_CACHE[(path, max_events)] = {c: data[:, k] for k, c in enumerate(COLUMNS)}
     return _COLUMN_CACHE[(path, max_events)]
 
 
@@ -71,8 +71,8 @@ def load_events(path, max_events, tracks="finder"):
     """
     Per event: a function giving (class_probs, mask_probs, points, padding_mask) as VertexHead takes them (built on
     demand), the true vertex, per track slot whether it is a Geant secondary and its particle's truth production
-    vertex, the number of primary vertices (test_truth_pv_index; NaN in older CSVs) and their truth positions
-    (V, 3), ranked as get_vertex_label ranks them (None in older CSVs).
+    vertex, the number of primary vertices (test_truth_pv_index) and their truth positions (V, 3), ranked as
+    get_vertex_label ranks them.
     """
     col = read_columns(path, max_events)
     nan_to = lambda name, value: np.where(np.isnan(col[name]), value, col[name]).astype(np.int64)  # noqa: E731
@@ -81,7 +81,7 @@ def load_events(path, max_events, tracks="finder"):
     points = np.stack([col[k] for k in ("E_norm", "eta_norm", "phi_norm", "r_norm")], axis=1)
     true_vertex = np.stack([col[f"test_truth_vtx_{a}"] for a in "xyz"], axis=1)
     origin_all = np.stack([col[f"vtx_{a}"] for a in "xyz"], axis=1)
-    pv_index = col.get("test_truth_pv_index")
+    pv_index = col["test_truth_pv_index"]
     # each event's rows: one stable sort, then slices
     order = np.argsort(col["batch_idx"], kind="stable")
     _, starts = np.unique(col["batch_idx"][order], return_index=True)
@@ -107,9 +107,8 @@ def load_events(path, max_events, tracks="finder"):
             class_probs[..., 1] = 0.8
             return (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
                     torch.ones(1, len(hits), dtype=torch.bool))
-        n_pv = np.nanmax(pv_index[hits], initial=-1) + 1 if pv_index is not None else np.nan
-        truth_pvs = None if pv_index is None else np.array(
-            [origin_all[hits][pv_index[hits] == k].mean(axis=0) for k in range(int(n_pv))]).reshape(-1, 3)
+        n_pv = int(np.nanmax(pv_index[hits], initial=-1)) + 1
+        truth_pvs = np.array([origin_all[hits][pv_index[hits] == k].mean(axis=0) for k in range(n_pv)]).reshape(-1, 3)
         events.append((inputs, true_vertex[hits[0]], secondary, origin, n_pv, truth_pvs))
     return events
 
@@ -133,9 +132,6 @@ def run_chunk(head, inputs):
         tracks = i[0].shape[1]
         one = {}
         for key, value in out.items():
-            if not torch.is_tensor(value):
-                one[key] = {k: v[b:b + 1] for k, v in value.items()}      # pv_original: per-event PV values only
-                continue
             value = value[b:b + 1]
             if key in TRACK_KEYS:
                 value = value[:, :tracks]
@@ -149,7 +145,7 @@ def run_chunk(head, inputs):
 def acts_vertices(head, outs):
     """ACTS's own vertex finder (acts_vertexing.py) on each event's VertexHead input tracks (weight > 0), errors
     scaled by track_error_scale: the first vertex found per event (E, 3) cm (NaN without one), vertices per event."""
-    with tempfile.TemporaryDirectory(dir=os.path.expanduser("~")) as tmp:      # the home is visible in the image
+    with tempfile.TemporaryDirectory() as tmp:
         for e, o in enumerate(outs):
             params = o["track_parameters"][0].double().numpy().copy()
             params[:, :2] /= head.track_parameter_length_scale                   # d0, z0: cm -> mm
@@ -241,29 +237,23 @@ def main():
         vertices = np.array([o["vertex_estimate"][0].double().numpy() for o in outs])
         runs = [("VertexHead", vertices, f"{np.median(chi2):8.2f}" if chi2 else "",
                  sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)]
-        # VertexHead's vertices that are good by ACTS's criterion (>= 2 tracks with annealing weight >= 0.5)
-        good = np.array([int(o["vertex_n_tracks"]) >= 2 for o in outs])
-        runs.append(("VH 2+ tracks", np.where(good[:, None], vertices, np.nan), "", runs[0][3], None))
         if head.use_acts:
             t0 = time.perf_counter()
             acts_pv, n_found = acts_vertices(head, outs)
             timing["ACTS AMVF"] += time.perf_counter() - t0
             runs.append(("ACTS AMVF", acts_pv, "", runs[0][3], None))
-            # VertexHead on the events where ACTS found a vertex: the like-for-like comparison
-            runs.append(("VH on ACTS", np.where(np.isfinite(acts_pv), vertices, np.nan), "", runs[0][3], None))
             distance = np.linalg.norm(acts_pv - vertices, axis=1)
             notes.append(f"{tracks} tracks: ACTS AMVF found {np.mean(n_found):.2f} vertices per event, none in "
                          f"{n_found.count(0)}; its first vertex - VertexHead's PV: median {np.nanmedian(distance):.4f} cm, "
                          f"90% {np.nanpercentile(distance, 90):.4f} cm")
         n_pv = np.array([e[4] for e in events])
-        if np.isfinite(n_pv).all():
-            error = np.linalg.norm(vertices - np.array([e[1] for e in events]), axis=1)
-            text = lambda sel: (f"median {np.nanmedian(error[sel]):.4f}, 90% {np.nanpercentile(error[sel], 90):.4f} cm"  # noqa: E731
-                                if np.isfinite(error[sel]).any() else "-")
-            notes.append(f"{tracks} tracks: {(n_pv >= 2).sum()} of {len(n_pv)} events have >= 2 primary vertices "
-                         f"(pileup; most {int(n_pv.max())}); VertexHead's PV error with pileup {text(n_pv >= 2)}, "
-                         f"without {text(n_pv < 2)}")
-        if "primary_vertices" in outs[0] and np.isfinite(n_pv).all():
+        error = np.linalg.norm(vertices - np.array([e[1] for e in events]), axis=1)
+        text = lambda sel: (f"median {np.nanmedian(error[sel]):.4f}, 90% {np.nanpercentile(error[sel], 90):.4f} cm"  # noqa: E731
+                            if np.isfinite(error[sel]).any() else "-")
+        notes.append(f"{tracks} tracks: {(n_pv >= 2).sum()} of {len(n_pv)} events have >= 2 primary vertices "
+                     f"(pileup; most {int(n_pv.max())}); VertexHead's PV error with pileup {text(n_pv >= 2)}, "
+                     f"without {text(n_pv < 2)}")
+        if "primary_vertices" in outs[0]:
             # pileup vertices (truth rank >= 1) VertexHead found (a non-PV vertex within 2 mm in z), and its extra
             # vertices matching no truth vertex
             found = total = fakes = 0

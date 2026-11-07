@@ -8,9 +8,14 @@ Reads <dir>/event<N:09>-tracks.csv (CsvTrackParameterReader: perigee at the orig
 found to <dir>/event<N:09>-vertices.csv (CsvVertexWriter: x, y, z, T in mm, in the order ACTS found them).
 """
 import argparse
+import os
+import sys
 
 import acts
 import acts.examples
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from acts_worker import build_field  # noqa: E402
 
 
 def main():
@@ -21,12 +26,7 @@ def main():
     parser.add_argument("--field_map_kind", default="xyz", choices=("xyz", "rz"))
     args = parser.parse_args()
 
-    u = acts.UnitConstants
-    if args.field_map:
-        loader = {"xyz": acts.MagneticFieldMapXyz, "rz": acts.MagneticFieldMapRz}[args.field_map_kind]
-        field = loader(args.field_map, lengthUnit=u.mm, bFieldUnit=u.T)
-    else:
-        field = acts.ConstantBField(acts.Vector3(0.0, 0.0, args.bz_tesla * u.T))
+    field = build_field(args.bz_tesla, args.field_map, args.field_map_kind)
     level = acts.logging.WARNING
     sequencer = acts.examples.Sequencer(numThreads=1, logLevel=level)
     sequencer.addReader(acts.examples.CsvTrackParameterReader(

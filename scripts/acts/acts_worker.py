@@ -22,15 +22,20 @@ import numpy as np
 
 import acts
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perigee_propagator", "build", "install"))
-import acts_perigee_propagator  # noqa: E402
+
+def build_field(bz_tesla, field_map, field_map_kind):
+    """ACTS field: the text field map (mm, T; field_map_kind xyz or rz) if given, else uniform Bz (T)."""
+    u = acts.UnitConstants
+    if field_map:
+        return {"xyz": acts.MagneticFieldMapXyz, "rz": acts.MagneticFieldMapRz}[field_map_kind](
+            field_map, lengthUnit=u.mm, bFieldUnit=u.T)
+    return acts.ConstantBField(acts.Vector3(0.0, 0.0, float(bz_tesla) * u.T))
 
 
 def build_tracking_geometry(geometry, geometry_config, material_map=None, quiet=False):
     """ACTS tracking geometry from TGeo (TGeoDetector with its JSON configuration), with a JSON material map if
-    given. quiet: ACTS logs only fatal errors while building, as sPHENIX's MakeActsGeometry does (sPHENIX's layers
-    overlap by design; check_geometry.py shows the full log). Returns (detector, geometry): the detector owns the
-    detector elements and must be kept alive."""
+    given. quiet: ACTS logs fatal errors only while building (README: sPHENIX inputs). Returns (detector, geometry):
+    the detector owns the detector elements and must be kept alive."""
     import acts.examples.tgeo
     import acts.json
     config = acts.examples.tgeo.TGeoDetector.Config()
@@ -48,26 +53,23 @@ def build_tracking_geometry(geometry, geometry_config, material_map=None, quiet=
 
 def build_propagator(config):
     """(PerigeePropagator, objects to keep alive) from a config dict (see the module docstring)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perigee_propagator", "build", "install"))
+    import acts_perigee_propagator
     # ACTS reads a missing file as empty input ("parse error ... empty input"): name it instead
     missing = [f"{k}={config[k]}" for k in ("field_map", "geometry", "geometry_config", "material_map")
-               if config.get(k) and not os.path.isfile(config[k])]
+               if config[k] and not os.path.isfile(config[k])]
     if missing:
         raise FileNotFoundError(f"not visible inside the container: {', '.join(missing)} (a wrong path, or its "
-                                "directory not bound: --bind / SINGULARITY_BIND)")
-    u = acts.UnitConstants
-    if config.get("field_map"):
-        loader = {"xyz": acts.MagneticFieldMapXyz, "rz": acts.MagneticFieldMapRz}[config.get("field_map_kind", "xyz")]
-        field = loader(config["field_map"], lengthUnit=u.mm, bFieldUnit=u.T)
-    else:
-        field = acts.ConstantBField(acts.Vector3(0.0, 0.0, float(config["bz_tesla"]) * u.T))
+                                "directory not bound into the container)")
+    field = build_field(config["bz_tesla"], config["field_map"], config["field_map_kind"])
     detector = geometry = None
-    if config.get("geometry"):
+    if config["geometry"]:
         detector, geometry = build_tracking_geometry(config["geometry"], config["geometry_config"],
-                                                     config.get("material_map"), quiet=True)
+                                                     config["material_map"], quiet=True)
     propagator = acts_perigee_propagator.PerigeePropagator(
-        field=field, reference=[float(v) for v in config.get("reference", (0.0, 0.0, 0.0))], geometry=geometry,
-        energy_loss=bool(config.get("energy_loss", True)), max_steps=int(config.get("max_steps") or 0),
-        threads=int(config.get("threads") or 0))
+        field=field, reference=[float(v) for v in config["reference"]], geometry=geometry,
+        energy_loss=bool(config["energy_loss"]), max_steps=int(config["max_steps"] or 0),
+        threads=int(config["threads"] or 0))
     return propagator, (field, detector, geometry)
 
 

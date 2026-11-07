@@ -1074,7 +1074,8 @@ class VertexHead(nn.Module):
                 (track_parameter_length_scale units); track_weight: (B, T), default 1.
 
         Returns:
-            dict (the PV: the refit where used_refit):
+            dict (the PV: with find_secondary, refitted with the SV tracks shared where an event has an SV and the
+            refit is valid):
                 vertex_estimate (B, 3), chi_square, fit_is_valid (B,), vertex_covariance (B, 3, 3); its quality:
                 vertex_n_tracks (B,) tracks with fit weight (annealing x z window) >= 0.5, vertex_ndf (B,) 2 sum(weights) - 3.
                 With max_vertices > 1: primary_vertices (B, V, 3), primary_vertex_valid, primary_vertex_n_tracks (B, V),
@@ -1084,8 +1085,7 @@ class VertexHead(nn.Module):
                 track_closest_approach_point (B, T, 3); acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS;
                 track_covariance (B, T, 6, 6): the ACTS perigee covariance (mm), with use_acts or given.
                 With find_secondary: sv_estimate (B, K, 3), sv_is_valid, sv_chi2, sv_chi2_per_dof, sv_displacement,
-                sv_n_tracks (B, K), sv_track_mask, sv_track_dca (B, K, T), displaced_mask, displaced_weight (B, T),
-                pv_original (dict), used_refit (B,).
+                sv_n_tracks (B, K), sv_track_mask, sv_track_dca (B, K, T), displaced_mask, displaced_weight (B, T).
         """
         acts_failed = track_sigma = None
         if track_parameters is None:
@@ -1241,7 +1241,6 @@ class VertexHead(nn.Module):
         pick = lambda values: torch.stack(values, dim=1)[torch.arange(len(pv_index), device=pv_index.device), pv_index]  # noqa: E731
         fit = {key: pick([c[0][key] for c in candidates]) for key in candidates[0][0]}
         vertex_weight, window, pv_weight = (pick([c[i] for c in candidates]) for i in (1, 3, 4))
-        seed = None if candidates[0][2] is None else pick([c[2] for c in candidates])
         # SV finding keeps track_weight, minus the tracks of the other primary vertices
         others = torch.stack([c[5] * c[6].unsqueeze(-1) for c in candidates], dim=1).masked_fill(
             torch.nn.functional.one_hot(pv_index, len(candidates)).bool().unsqueeze(-1), 0.0)
@@ -1258,33 +1257,22 @@ class VertexHead(nn.Module):
             result["acts_failed"] = acts_failed
         if track_covariance is not None:
             result["track_covariance"] = track_covariance
-        if seed is not None:
-            result["pv_seed"] = seed
         result["track_sigma"] = params["track_sigma"]
-        # per-track outputs of unfitted tracks (bad) come from their finite stand-ins: NaN in what is reported
-        def masked(f):
-            return {**f, "track_dca": f["track_dca"].masked_fill(bad, float("nan")),
-                    "track_chi2": f["track_chi2"].masked_fill(bad, float("nan")),
-                    "track_closest_approach_point": f["track_closest_approach_point"].masked_fill(
-                        bad.unsqueeze(-1), float("nan"))}
-
         if self.find_secondary:
             secondary = self._find_secondary_vertices(fit, track_position, track_direction, sv_weight, params, pv_weight)
             refit = secondary.pop("pv_refit", None)
             refit_vertex_weight = secondary.pop("pv_refit_vertex_weight", None)
             secondary["sv_track_dca"] = secondary["sv_track_dca"].masked_fill(bad.unsqueeze(1), float("nan"))
             result.update(secondary)
-            result["pv_original"] = masked(fit)
             # the refit PV where the event has an SV and the refit is valid; else the original PV fit
-            used_refit = secondary["sv_is_valid"].any(dim=1)
             if refit is not None:
-                used_refit = used_refit & refit["fit_is_valid"]
-                fit = {k: torch.where(used_refit.view(-1, *[1] * (v.dim() - 1)), refit[k], v) for k, v in fit.items()}
-                vertex_weight = torch.where(used_refit.unsqueeze(-1), refit_vertex_weight, vertex_weight)
-            else:
-                used_refit = torch.zeros_like(used_refit)
-            result["used_refit"] = used_refit
-        fit = masked(fit)
+                used = secondary["sv_is_valid"].any(dim=1) & refit["fit_is_valid"]
+                fit = {k: torch.where(used.view(-1, *[1] * (v.dim() - 1)), refit[k], v) for k, v in fit.items()}
+                vertex_weight = torch.where(used.unsqueeze(-1), refit_vertex_weight, vertex_weight)
+        # per-track outputs of unfitted tracks (bad) come from their finite stand-ins: NaN in what is reported
+        fit = {**fit, "track_dca": fit["track_dca"].masked_fill(bad, float("nan")),
+               "track_chi2": fit["track_chi2"].masked_fill(bad, float("nan")),
+               "track_closest_approach_point": fit["track_closest_approach_point"].masked_fill(bad.unsqueeze(-1), float("nan"))}
         # vertex quality, as ACTS judges it: each fitted track's weight in the fit, its annealing weight x the z window
         # (tracks with track_weight > 0)
         weight = (vertex_weight * window).masked_fill(bad | (track_weight <= 0), 0.0)

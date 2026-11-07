@@ -30,10 +30,9 @@ acts:                          # use_acts is on when image (or command) is set
   geometry: null               # TGeo file from export_sphenix_geometry.C, e.g. sphenix_ana559_tgeo.root
   geometry_config: null        # ACTS TGeo JSON configuration, CDB key ACTSGEOMETRYCONFIG
   material_map: null           # ACTS JSON material map, CDB key ACTSMATERIALMAP
-  energy_loss: false           # neutral to slightly worse on the 100 test events (2026-11-04)
+  energy_loss: false           # energy loss in the material map's material
   max_steps: null              # ACTS's propagation step limit (null: ACTS's default)
   threads: null                # propagation threads (null: all cores)
 
-# any other VertexHead argument (VertexHead's defaults otherwise; with ACTS and the material map the PV median was
-# 0.234 cm on 1000 test events, 0.247 cm with the own hit fit)
+# any other VertexHead argument (VertexHead's defaults otherwise)
 vertex_head: {}

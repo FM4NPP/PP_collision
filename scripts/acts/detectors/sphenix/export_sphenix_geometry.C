@@ -2,9 +2,6 @@
 // Tracking_Geometry, a PHOOL file) in portable form for the ACTS container, which has no sPHENIX code:
 //   <prefix>_tgeo.root        the detector geometry as a plain ROOT TGeoManager (from RUN#GEOMETRY_IO), with
 //                             the TPC measurement boxes ACTS builds its TPC surfaces from (see below)
-//   <prefix>_tpc_layers.txt   the TPC layout: layer, radius, thickness in cm (from TPCGEOMCONTAINER), and the
-//                             maximum drift length
-//   <prefix>_volumes.txt      the geometry's volume tree (names, 4 levels), for checking the ACTS config
 // Run ONCE, on a machine with the sPHENIX software set up (it needs sPHENIX's class dictionaries):
 //   root -l -b -q 'scripts/acts/detectors/sphenix/export_sphenix_geometry.C("<Tracking_Geometry file>.root", "sphenix_ana559")'
 // sPHENIX's classes are used through the interpreter (by name), so no sPHENIX headers are needed here.
@@ -31,27 +28,12 @@
 #include <TTree.h>
 
 #include <cmath>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 
 namespace
 {
-  void write_volumes(std::ofstream &out, TGeoNode *node, int depth, int max_depth)
-  {
-    out << std::string(2 * depth, ' ') << node->GetName() << "  [" << node->GetVolume()->GetName() << ", "
-        << node->GetVolume()->GetShape()->ClassName() << ", " << node->GetNdaughters() << " daughters]\n";
-    if (depth >= max_depth)
-    {
-      return;
-    }
-    for (int i = 0; i < node->GetNdaughters(); ++i)
-    {
-      write_volumes(out, node->GetDaughter(i), depth + 1, max_depth);
-    }
-  }
-
   TGeoVolume *daughter_volume(TGeoVolume *mother, const char *name_start)
   {
     for (int i = 0; i < mother->GetNdaughters(); ++i)
@@ -157,44 +139,26 @@ void export_sphenix_geometry(const char *input, const char *prefix = "sphenix_ge
       gROOT->ProcessLine(Form("((PHGeomIOTGeo *) %p)->ConstructTGeoManager();", geometry_io)));
   if (!manager)
   {
-    // older interface: a copy of the top volume, closed into a new geometry
-    auto *top = reinterpret_cast<TGeoVolume *>(
-        gROOT->ProcessLine(Form("((PHGeomIOTGeo *) %p)->GetGeometryCopy();", geometry_io)));
-    if (!top)
-    {
-      std::cout << "ERROR: PHGeomIOTGeo gave no geometry (neither ConstructTGeoManager nor GetGeometryCopy)" << std::endl;
-      return;
-    }
-    manager = new TGeoManager("sPHENIX", "sPHENIX tracking geometry");
-    manager->SetTopVolume(top);
-    manager->CloseGeometry();
+    std::cout << "ERROR: PHGeomIOTGeo gave no geometry (ConstructTGeoManager)" << std::endl;
+    return;
   }
 
   // the TPC layout, layer by layer, by sPHENIX's own PHG4TpcGeom accessors (layer numbers in order); the
   // maximum drift length (the same for all layers) from layer 20
-  std::vector<int> layers;
   std::vector<double> radius, thickness;
   double max_driftlength = 0.0;
   gROOT->ProcessLine(Form(
-      "{ auto *c = (PHG4TpcGeomContainer *) %p; auto *l = (std::vector<int> *) %p; auto *r = (std::vector<double> *) %p;"
+      "{ auto *c = (PHG4TpcGeomContainer *) %p; auto *r = (std::vector<double> *) %p;"
       "  auto *t = (std::vector<double> *) %p; auto range = c->get_begin_end();"
       "  for (auto it = range.first; it != range.second; ++it) {"
-      "    l->push_back(it->first); r->push_back(it->second->get_radius()); t->push_back(it->second->get_thickness());"
+      "    r->push_back(it->second->get_radius()); t->push_back(it->second->get_thickness());"
       "    if (it->first == 20) *(double *) %p = it->second->get_max_driftlength(); } }",
-      tpc_container, (void *) &layers, (void *) &radius, (void *) &thickness, (void *) &max_driftlength));
+      tpc_container, (void *) &radius, (void *) &thickness, (void *) &max_driftlength));
   if (radius.empty())
   {
     std::cout << "ERROR: no TPC layers read from TPCGEOMCONTAINER" << std::endl;
     return;
   }
-  const TString tpc_path = TString(prefix) + "_tpc_layers.txt";
-  std::ofstream tpc(tpc_path.Data());
-  tpc << "# max_driftlength_cm " << max_driftlength << "\n# layer radius_cm thickness_cm\n";
-  for (size_t i = 0; i < layers.size(); ++i)
-  {
-    tpc << layers[i] << " " << radius[i] << " " << thickness[i] << "\n";
-  }
-  tpc.close();
 
   if (add_tpc_boxes)
   {
@@ -217,12 +181,7 @@ void export_sphenix_geometry(const char *input, const char *prefix = "sphenix_ge
   const TString geometry_path = TString(prefix) + "_tgeo.root";
   manager->Export(geometry_path);
 
-  const TString volumes_path = TString(prefix) + "_volumes.txt";
-  std::ofstream volumes(volumes_path.Data());
-  write_volumes(volumes, manager->GetTopNode(), 0, 4);
-  volumes.close();
-
-  std::cout << "wrote " << geometry_path << ", " << tpc_path << ", " << volumes_path << std::endl;
+  std::cout << "wrote " << geometry_path << std::endl;
   std::cout << "top volume " << manager->GetTopVolume()->GetName() << " with " << manager->GetTopNode()->GetNdaughters()
             << " daughters; " << manager->GetListOfVolumes()->GetEntries() << " volumes in total; maximum drift length "
             << max_driftlength << " cm" << std::endl;

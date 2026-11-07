@@ -44,7 +44,8 @@ case "$COMMAND" in
                 --field_kind) field_kind=${2:?--field_kind needs xyz or rz}; shift 2 ;;
                 --field_rescale) convert_args+=(--rescale "${2:?--field_rescale needs a factor}"); shift 2 ;;
                 --set) settings+=("${2:?--set needs section.key=value}"); shift 2 ;;
-                *) build_args+=("$1"); shift ;;
+                --rebuild-base) build_args+=("$1"); shift ;;
+                *) echo "setup: unknown option $1 (see the usage at the top of $0)" >&2; exit 1 ;;
             esac
         done
         # the field map belongs to the detector: a ROOT map (sPHENIX's conditions database) becomes ACTS's text map
@@ -127,7 +128,7 @@ EOF
         csv=$(find "$ROOT_DIR" -name '*_per_point_data.csv' -printf '%T@ %p\n' 2> /dev/null | sort -n | tail -1 | cut -d' ' -f2-)
         [[ -n "$csv" ]] || { echo "no per-point CSV under $ROOT_DIR: run 'eval' first" >&2; exit 1; }
         echo "comparing on $csv"
-        python "$REPO/scripts/acts/compare_vertexing.py" --csv "$csv" --detector "$DETECTOR" --tracks both "$@"
+        python "$REPO/scripts/acts/compare_vertexing.py" --csv "$csv" --detector "$DETECTOR" "$@"
         ;;
     *)
         sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'

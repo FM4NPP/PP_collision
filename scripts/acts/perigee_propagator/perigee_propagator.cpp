@@ -50,24 +50,23 @@ class PerigeePropagator {
   PerigeePropagator(std::shared_ptr<Acts::MagneticFieldProvider> field, std::array<double, 3> reference,
                     std::shared_ptr<Acts::TrackingGeometry> geometry, bool energyLoss, std::size_t maxSteps,
                     std::size_t threads)
-      : m_field(std::move(field)),
-        m_geometry(std::move(geometry)),
-        m_surface(Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3(reference[0], reference[1], reference[2]))),
+      : m_surface(Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3(reference[0], reference[1], reference[2]))),
         m_energyLoss(energyLoss),
         m_maxSteps(maxSteps),
         m_threads(threads > 0 ? threads : std::max(1u, std::thread::hardware_concurrency())) {
     // errors only: per-state warnings (e.g. a field lookup outside the map) are counted in the worker's failure summary
     auto logger = [](const char* name) { return Acts::getDefaultLogger(name, Acts::Logging::ERROR); };
-    if (m_geometry) {
+    // the stepper and the navigator keep the field and the geometry alive
+    if (geometry) {
       Acts::Navigator::Config config;
-      config.trackingGeometry = m_geometry;
+      config.trackingGeometry = geometry;
       config.resolveMaterial = true;
       config.resolveSensitive = true;
       config.resolvePassive = false;
-      m_geometryPropagator.emplace(Acts::EigenStepper<>(m_field), Acts::Navigator(config, logger("Navigator")),
+      m_geometryPropagator.emplace(Acts::EigenStepper<>(field), Acts::Navigator(config, logger("Navigator")),
                                    logger("PerigeePropagator"));
     } else {
-      m_fieldPropagator.emplace(Acts::EigenStepper<>(m_field), Acts::VoidNavigator(), logger("PerigeePropagator"));
+      m_fieldPropagator.emplace(Acts::EigenStepper<>(field), Acts::VoidNavigator(), logger("PerigeePropagator"));
     }
   }
 
@@ -121,11 +120,10 @@ class PerigeePropagator {
             ++errors[error];
             continue;
           }
+          // the start covariance is always transported
+          Eigen::Map<RowMatrix6>(cov + 36 * i) = end->covariance().value();
           Eigen::Map<Acts::BoundVector>(out + 6 * i) = end->parameters();
           good[i] = end->parameters().allFinite();
-          if (end->covariance().has_value()) {
-            Eigen::Map<RowMatrix6>(cov + 36 * i) = *end->covariance();
-          }
         } catch (const std::exception& e) {
           ++errors[e.what()];
         }
@@ -170,8 +168,6 @@ class PerigeePropagator {
     return *result.value().endParameters;
   }
 
-  std::shared_ptr<Acts::MagneticFieldProvider> m_field;
-  std::shared_ptr<Acts::TrackingGeometry> m_geometry;
   Acts::GeometryContext m_geometryContext = Acts::GeometryContext::dangerouslyDefaultConstruct();
   Acts::MagneticFieldContext m_fieldContext{};
   std::optional<FieldPropagator> m_fieldPropagator;
@@ -188,8 +184,8 @@ PYBIND11_MODULE(acts_perigee_propagator, m) {
   py::class_<PerigeePropagator>(m, "PerigeePropagator")
       .def(py::init<std::shared_ptr<Acts::MagneticFieldProvider>, std::array<double, 3>,
                     std::shared_ptr<Acts::TrackingGeometry>, bool, std::size_t, std::size_t>(),
-           py::arg("field"), py::arg("reference"), py::arg("geometry") = py::none(), py::arg("energy_loss") = true,
-           py::arg("max_steps") = 0, py::arg("threads") = 0)
+           py::arg("field"), py::arg("reference"), py::arg("geometry"), py::arg("energy_loss"), py::arg("max_steps"),
+           py::arg("threads"))
       .def("propagate", &PerigeePropagator::propagate, py::arg("position"), py::arg("direction"), py::arg("qop"),
            py::arg("covariance"));
 }

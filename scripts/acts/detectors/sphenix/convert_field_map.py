@@ -5,7 +5,6 @@ Runs in the training environment (needs uproot and numpy, not ACTS or ROOT).
 
     python scripts/acts/detectors/sphenix/convert_field_map.py sphenix3dtrackingmapxyz.root field_xyz.txt
     python scripts/acts/detectors/sphenix/convert_field_map.py map2d.root field_rz.txt --kind rz
-    python scripts/acts/detectors/sphenix/convert_field_map.py --uniform 1.4 uniform_xyz.txt     (a test map: constant Bz)
 
 Input: cartesian ntuple branches x, y, z (cm), bx, by, bz (T); or r-z ntuple branches r, z (cm), br, bz
 (T; an old "map" ntuple is in Gauss: --field_unit 1e-4). --rescale multiplies the field, as sPHENIX's
@@ -31,35 +30,20 @@ def regular_axis(values, name):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("input", nargs="?", help="sPHENIX ROOT field map")
+    parser.add_argument("input", help="sPHENIX ROOT field map")
     parser.add_argument("output", help="text map for ACTS")
     parser.add_argument("--kind", default="xyz", choices=("xyz", "rz"))
     parser.add_argument("--tree", default="fieldmap", help="ntuple name")
     parser.add_argument("--length_unit", type=float, default=10.0, help="mm per file length unit (cm: 10)")
     parser.add_argument("--field_unit", type=float, default=1.0, help="T per file field unit (Gauss: 1e-4)")
     parser.add_argument("--rescale", type=float, default=1.0, help="field scale factor (sPHENIX magfield_rescale)")
-    parser.add_argument("--uniform", type=float, default=None, help="instead of an input: constant Bz (T) test map")
-    parser.add_argument("--uniform_extent", type=float, nargs=2, default=(1000.0, 1500.0),
-                        help="test map half-sizes in mm: transverse, z")
-    parser.add_argument("--uniform_bins", type=int, default=21, help="test map points per axis")
     args = parser.parse_args()
 
-    if args.uniform is not None:
-        t, zl = args.uniform_extent
-        if args.kind == "xyz":
-            x, y, z = np.meshgrid(*(np.linspace(-h, h, args.uniform_bins) for h in (t, t, zl)), indexing="ij")
-            columns = {"x": x.ravel(), "y": y.ravel(), "z": z.ravel(), "bx": 0 * x.ravel(), "by": 0 * x.ravel(),
-                       "bz": np.full(x.size, args.uniform)}
-        else:
-            r, z = np.meshgrid(np.linspace(0, t, args.uniform_bins), np.linspace(-zl, zl, args.uniform_bins), indexing="ij")
-            columns = {"r": r.ravel(), "z": z.ravel(), "br": 0 * r.ravel(), "bz": np.full(r.size, args.uniform)}
-        length, field = 1.0, args.rescale
-    else:
-        import uproot
-        names = ("x", "y", "z", "bx", "by", "bz") if args.kind == "xyz" else ("r", "z", "br", "bz")
-        with uproot.open(args.input) as f:
-            columns = {k: np.asarray(v, dtype=np.float64) for k, v in f[args.tree].arrays(list(names), library="np").items()}
-        length, field = args.length_unit, args.field_unit * args.rescale
+    import uproot
+    names = ("x", "y", "z", "bx", "by", "bz") if args.kind == "xyz" else ("r", "z", "br", "bz")
+    with uproot.open(args.input) as f:
+        columns = {k: np.asarray(v, dtype=np.float64) for k, v in f[args.tree].arrays(list(names), library="np").items()}
+    length, field = args.length_unit, args.field_unit * args.rescale
 
     coords = ("x", "y", "z") if args.kind == "xyz" else ("z", "r")       # ACTS order: slowest first
     for c in coords:

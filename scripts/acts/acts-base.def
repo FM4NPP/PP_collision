@@ -57,9 +57,7 @@ From: ubuntu:24.04
     cmake --build /opt/acts-build -j ${JOBS} || cmake --build /opt/acts-build -j 1
     cmake --install /opt/acts-build --prefix /opt/acts > /dev/null
 
-    # not fatal: a launcher problem must not throw away the compile (README: run without the launcher)
     chmod 755 /usr/local/bin/acts-python
-    acts-python -c "import acts, acts.examples; print('acts OK:', acts.__file__)" || echo "WARNING: acts import check failed"
 
 %environment
     # ROOT_INCLUDE_PATH: HepMC3's ROOT dictionaries find their headers (else harmless cling autoload errors)
