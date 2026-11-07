@@ -32,35 +32,63 @@ TRACK_COLUMNS = ["trackId", *PARAMS, *(f"var_{a}" for a in PARAMS),
                  *(f"cov_{a}{b}" for a in PARAMS for b in PARAMS if a != b)]   # CsvTrackParameterReader's columns
 
 
+COLUMNS = ("batch_idx", "E_norm", "eta_norm", "phi_norm", "r_norm", "pred_assignment", "seg_target", "vtx_x", "vtx_y",
+           "vtx_z", "test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z", "test_truth_pv_index")
+_COLUMN_CACHE = {}
+
+
+def read_columns(path, max_events):
+    """The CSV columns compare_vertexing uses (empty fields NaN) for the first max_events events, read once, in
+    ~64 MB blocks with numpy's parser."""
+    if (path, max_events) in _COLUMN_CACHE:
+        return _COLUMN_CACHE[(path, max_events)]
+    with open(path) as f:
+        header = f.readline().strip().split(",")
+        names = [c for c in COLUMNS if c in header]
+        use = [header.index(c) for c in names]
+        blocks, events = [], set()
+        while True:
+            lines = f.readlines(64 << 20)
+            if not lines:
+                break
+            # numpy's parser has no empty fields: NaN for them (a field can be empty only between or after commas)
+            text = "".join(lines).replace("\r\n", "\n").replace(",,", ",nan,").replace(",,", ",nan,").replace(",\n", ",nan\n")
+            block = np.loadtxt(text.splitlines(), delimiter=",", usecols=use, ndmin=2)
+            blocks.append(block)
+            events.update(np.unique(block[:, 0]).tolist())
+            if max_events and len(events) > max_events:
+                break
+    data = np.concatenate(blocks)
+    first = np.unique(data[:, 0])[:max_events] if max_events else np.unique(data[:, 0])
+    data = data[np.isin(data[:, 0], first)]
+    _COLUMN_CACHE[(path, max_events)] = {c: data[:, k] for k, c in enumerate(names)}
+    return _COLUMN_CACHE[(path, max_events)]
+
+
 def load_events(path, max_events, tracks="finder"):
     """
-    Per event: (class_probs, mask_probs, points, padding_mask) as VertexHead takes them, the true vertex, per
-    track slot whether it is a Geant secondary and its particle's truth production vertex, and the number of
-    primary vertices (test_truth_pv_index; NaN in older CSVs).
+    Per event: a function giving (class_probs, mask_probs, points, padding_mask) as VertexHead takes them (built on
+    demand), the true vertex, per track slot whether it is a Geant secondary and its particle's truth production
+    vertex, and the number of primary vertices (test_truth_pv_index; NaN in older CSVs).
     """
-    with open(path, newline="") as f:
-        rows = list(csv.reader(f))
-    col = dict(zip(rows[0], map(np.array, zip(*rows[1:]))))
-    num = lambda name, empty="nan": np.array([float(v or empty) for v in col[name]])  # noqa: E731
-    event = num("batch_idx").astype(int)
-    label = num("pred_assignment" if tracks == "finder" else "seg_target", "-999999").astype(int)
-    truth_id = num("seg_target", "0").astype(int)
-    points = np.stack([num(k) for k in ("E_norm", "eta_norm", "phi_norm", "r_norm")], axis=1)
-    true_vertex = np.stack([num(f"test_truth_vtx_{a}") for a in "xyz"], axis=1)
-    origin_all = np.stack([num(f"vtx_{a}") for a in "xyz"], axis=1)
-    pv_index = num("test_truth_pv_index") if "test_truth_pv_index" in col else None
+    col = read_columns(path, max_events)
+    nan_to = lambda name, value: np.where(np.isnan(col[name]), value, col[name]).astype(np.int64)  # noqa: E731
+    label = nan_to("pred_assignment" if tracks == "finder" else "seg_target", -999999)
+    truth_id = nan_to("seg_target", 0)
+    points = np.stack([col[k] for k in ("E_norm", "eta_norm", "phi_norm", "r_norm")], axis=1)
+    true_vertex = np.stack([col[f"test_truth_vtx_{a}"] for a in "xyz"], axis=1)
+    origin_all = np.stack([col[f"vtx_{a}"] for a in "xyz"], axis=1)
+    pv_index = col.get("test_truth_pv_index")
+    # each event's rows: one stable sort, then slices
+    order = np.argsort(col["batch_idx"], kind="stable")
+    _, starts = np.unique(col["batch_idx"][order], return_index=True)
     events = []
-    for e in np.unique(event)[:max_events]:
-        hits = np.flatnonzero(event == e)
+    for hits in np.split(order, starts[1:]):
         keep = (label[hits] != -999999) & ((label[hits] != -1) if tracks == "finder" else True)
         if not keep.any():
             continue
         _, slot = np.unique(label[hits][keep], return_inverse=True)
         n_slots = slot.max() + 1
-        mask = torch.zeros(1, len(hits), n_slots)
-        mask[0, torch.tensor(np.flatnonzero(keep)), torch.tensor(slot)] = 0.9
-        class_probs = torch.zeros(1, n_slots, 2)
-        class_probs[..., 1] = 0.8
         # per track slot: secondary (majority truth ID < 0) and that particle's production vertex (first such hit)
         ids_kept, origin_kept = truth_id[hits][keep], origin_all[hits][keep]
         secondary, origin = np.zeros(n_slots, dtype=bool), np.full((n_slots, 3), np.nan)
@@ -68,9 +96,15 @@ def load_events(path, max_events, tracks="finder"):
             ids, counts = np.unique(ids_kept[slot == t], return_counts=True)
             secondary[t] = ids[counts.argmax()] < 0
             origin[t] = origin_kept[np.flatnonzero((slot == t) & (ids_kept == ids[counts.argmax()]))[0]]
-        inputs = (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
-                  torch.ones(1, len(hits), dtype=torch.bool))
-        n_pv = np.nanmax(pv_index[hits], initial=-1) + 1 if "test_truth_pv_index" in col else np.nan
+
+        def inputs(hits=hits, keep=keep, slot=slot, n_slots=n_slots):
+            mask = torch.zeros(1, len(hits), n_slots)
+            mask[0, torch.tensor(np.flatnonzero(keep)), torch.tensor(slot)] = 0.9
+            class_probs = torch.zeros(1, n_slots, 2)
+            class_probs[..., 1] = 0.8
+            return (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
+                    torch.ones(1, len(hits), dtype=torch.bool))
+        n_pv = np.nanmax(pv_index[hits], initial=-1) + 1 if pv_index is not None else np.nan
         events.append((inputs, true_vertex[hits[0]], secondary, origin, n_pv))
     return events
 
@@ -147,8 +181,11 @@ def main():
 
     head = vh.VertexHead.from_detector(args.detector, find_secondary=True).eval()
     pv_rows, axis_rows, sv_rows, notes = [], [], [], []
+    timing = dict.fromkeys(("reading the CSV", "VertexHead", "ACTS AMVF"), 0.0)
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
+        t0 = time.perf_counter()
         events = load_events(args.csv, args.max_events, tracks)
+        timing["reading the CSV"] += time.perf_counter() - t0
         n_truth = sum(bool(np.isfinite(e[1]).all()) for e in events)
         print(f"{tracks} tracks: {len(events)} events ({n_truth} with a true vertex) from {args.csv}; detector "
               f"{args.detector}", flush=True)
@@ -156,8 +193,9 @@ def main():
         with torch.no_grad():
             for inputs, *_ in events:
                 t0 = time.perf_counter()
-                outs.append(head(*inputs))
+                outs.append(head(*inputs()))
                 times.append(time.perf_counter() - t0)
+        timing["VertexHead"] += sum(times)
         # ndf = 2 sum(w) - 3 (ACTS: tracks count by their annealing weight)
         ndf = [2 * float((o["track_weight"] > 0).double().mul(o["track_vertex_weight"].double()).sum()) - 3 for o in outs]
         chi2 = [o["chi_square"].item() / d for o, d in zip(outs, ndf) if d > 0 and o["fit_is_valid"].all()]
@@ -165,7 +203,9 @@ def main():
         runs = [("VertexHead", vertices, f"{np.median(chi2):8.2f}" if chi2 else "",
                  sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)]
         if head.use_acts:
+            t0 = time.perf_counter()
             acts_pv, n_found = acts_vertices(head, outs)
+            timing["ACTS AMVF"] += time.perf_counter() - t0
             runs.append(("ACTS AMVF", acts_pv, "", runs[0][3], None))
             # VertexHead on the events where ACTS found a vertex: the like-for-like comparison
             runs.append(("VH on ACTS", np.where(np.isfinite(acts_pv), vertices, np.nan), "", runs[0][3], None))
@@ -200,6 +240,7 @@ def main():
           *sv_rows, sep="\n")
     if notes:
         print("", *notes, sep="\n")
+    print("\ntime: " + ", ".join(f"{name} {seconds:.1f} s" for name, seconds in timing.items()))
     return 0
 
 
