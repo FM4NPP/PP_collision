@@ -7,7 +7,7 @@ Evaluate VertexHead after a trained track-finding head. Run from train/downstrea
 
 Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
 --checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events. Speed:
---eval_batch_size, --precision.
+--eval_batch_size.
 Outputs in <root_dir>/<backbone checkpoint>/<track-head checkpoint>/e<events>/: data/vertex_eval_<N>_per_point_data.csv,
 logs/vertex_eval_<N>.log (parameters, metrics) and metrics/vertex_eval_<N>.json (inputs, fit settings, metrics).
 --no_output writes nothing.
@@ -176,6 +176,12 @@ def main():
              "ACTS inputs and fit settings (default: YAML vertex_detector, else the built-in sPHENIX defaults)",
     )
     parser.add_argument(
+        "--truth_radius",
+        type=float,
+        default=1.0,
+        help="cm: hits whose particle starts within this of the beam line make the truth vertex",
+    )
+    parser.add_argument(
         "--no_output",
         action="store_true",
         help="Test run: write no files or run folder; the metrics and timing are only printed. "
@@ -187,13 +193,6 @@ def main():
         default=None,
         help="Events per VertexHead call (default: YAML vertex_chunk_events, else 32; 1 = per loader batch); "
              "the backbone and track head still run per loader batch",
-    )
-    parser.add_argument(
-        "--precision",
-        choices=("bf16", "fp16", "tf32", "fp32"),
-        default=None,
-        help="Backbone and track-head arithmetic: full fp32 (default; bf16 cost vertex accuracy: 0.9072 against "
-             "0.9109 within 0.5 cm), fp32 with TF32 matrix multiplies, or bf16 / fp16 autocast",
     )
     parser.add_argument(
         "--vertex_device",
@@ -270,12 +269,11 @@ def main():
         params.vertex_chunk_events = args.vertex_chunk_events
     if args.vertex_device is not None:
         params.vertex_device = args.vertex_device
-    if args.precision is not None:
-        params.eval_precision = args.precision
     if args.detector is not None:
         params.vertex_detector = os.path.abspath(args.detector)
 
     params.no_output = args.no_output
+    params.truth_radius = args.truth_radius
     print(f"[vertex] backbone   : {params.pretrained_ckpt}")
     print(f"[vertex] track head : {checkpoint_path}")
 

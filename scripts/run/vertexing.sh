@@ -6,7 +6,7 @@
 #   scripts/run/vertexing.sh compare [options]    VertexHead vs ACTS's vertex finder on the newest CSV in root_dir
 # setup options: --geometry, --geometry_config, --material_map <file> (ACTS inputs, must exist);
 # --field_map <file> (a ROOT map, converted into the detector folder and then used by every site file, or an ACTS
-# text map; with --field_kind xyz|rz, --field_rescale <factor>); --set <section.key>=<value> for any other detector-file setting (e.g.
+# text map; with --field_kind xyz|rz, --field_rescale <factor>); --set [section.]key=<value> for any other detector-file setting (e.g.
 # --set acts.energy_loss=true, --set vertex_head.track_error_scale=2.5); --rebuild-base. Other commands pass
 # options to the Python script.
 # RUN_CONFIG picks the run (default scripts/configs/vertex_m5_gpuserver0.yaml); its detector: key names the site
@@ -64,19 +64,21 @@ case "$COMMAND" in
         [[ -z $field_map ]] || settings+=("field.map=$field_map" "field.map_kind=$field_kind")
         image=$(realpath --relative-to="$(dirname "$DETECTOR")" "$REPO/scripts/acts/acts-base-48.2.0.sif")
         # the site file is rewritten from the template each time (new keys and comments), keeping the site's own
-        # values (any section.key differing from the template); then each section.key=value replaces that line's
-        # value (its comment kept) or is added to its section
+        # values (any key or section.key differing from the template); then each [section.]key=value replaces that
+        # line's value (its comment kept) or is added (to its section)
         python - "$DETECTOR" "$detector_dir/sphenix.yaml" "acts.image=$image" ${settings[@]+"${settings[@]}"} <<'EOF'
 import os, re, sys
 path, template, settings = sys.argv[1], sys.argv[2], sys.argv[3:]
 
 
 def entries(lines):
-    """section.key -> value of each two-level setting."""
+    """key -> value of each top-level setting, section.key -> value of each setting in a section."""
     found, section = {}, None
     for line in lines:
-        if re.match(r"\w+:", line):
-            section = line.split(":")[0]
+        if m := re.match(r"(\w+):\s*(.*?)\s*(#.*)?$", line):
+            section = m[1]
+            if m[2]:
+                found[m[1]] = m[2]
         elif (m := re.match(r"  (\w+):\s*(.*?)\s*(#.*)?$", line)) and section:
             found[f"{section}.{m[1]}"] = m[2]
     return found
@@ -93,18 +95,23 @@ for setting in settings:
     name, sep, value = setting.partition("=")
     section, _, key = name.rpartition(".")
     if not sep or not key:
-        sys.exit(f"--set {setting}: expected section.key=value")
-    start = next((i for i, l in enumerate(lines) if re.match(rf"{re.escape(section)}:(\s|$)", l)), None) if section else -1
-    if start is None:
-        sys.exit(f"--set {setting}: no section {section!r} in {path}")
-    lines[start] = re.sub(r":\s*\{\}", ":", lines[start]) if section else lines[start]
-    end = next((i for i in range(start + 1, len(lines)) if lines[i] and not lines[i][0].isspace() and not lines[i].startswith("#")),
-               len(lines))
-    indent = "  " if section else ""
-    hit = next((i for i in range(start + 1, end) if re.match(rf"{indent}{re.escape(key)}:(\s|$)", lines[i])), None)
+        sys.exit(f"--set {setting}: expected [section.]key=value")
+    if section:
+        start = next((i for i, l in enumerate(lines) if re.match(rf"{re.escape(section)}:(\s|$)", l)), None)
+        if start is None:
+            sys.exit(f"--set {setting}: no section {section!r} in {path}")
+        lines[start] = re.sub(r":\s*\{\}", ":", lines[start])
+        end = next((i for i in range(start + 1, len(lines))
+                    if lines[i] and not lines[i][0].isspace() and not lines[i].startswith("#")), len(lines))
+        indent = "  "
+        hit = next((i for i in range(start + 1, end) if re.match(rf"  {re.escape(key)}:(\s|$)", lines[i])), None)
+        at = max((i for i in range(start, end) if lines[i].startswith(indent) and lines[i].strip()), default=start) + 1
+    else:
+        indent = ""
+        hit = next((i for i, l in enumerate(lines) if re.match(rf"{re.escape(key)}:(\s|$)", l)), None)
+        at = len(lines)
     if hit is None:
-        last = max((i for i in range(start, end) if lines[i].startswith(indent) and lines[i].strip()), default=start)
-        lines.insert(last + 1, f"{indent}{key}: {value}")
+        lines.insert(at, f"{indent}{key}: {value}")
     else:
         old = lines[hit]
         comment = old[old.index("#"):] if "#" in old else ""

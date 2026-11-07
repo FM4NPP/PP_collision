@@ -19,7 +19,6 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 import gc, torch, torch.distributed as dist
-from torch.amp import autocast
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 
@@ -589,7 +588,7 @@ class DownstreamTrainer():
     
             
     def restore_checkpoint(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location='cuda:{}'.format(self.device), weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         new_state_dict = {k.replace('module.', ''): v for k, v in checkpoint['model_state'].items()}
         #try:
             #self.model.load_state_dict(checkpoint['model_state'])
@@ -707,6 +706,9 @@ class DownstreamTrainer():
             checkpoint_path: track-head checkpoint; pretrain: backbone features (True) or raw points.
             save_csv, csv_output_path: the per-point CSV.
         """
+        if self.world_size > 1:
+            raise RuntimeError("the vertex eval runs in one process (its metrics are not gathered across ranks): "
+                               "run it with python, not torchrun")
         self.setup_vertexing(checkpoint_path)
         result = self.run_vertexing(pretrain=pretrain, max_events=getattr(self, "max_eval_events", 20000),
                                     save_csv=save_csv)
@@ -745,12 +747,8 @@ class DownstreamTrainer():
             save_csv).
         """
         self.model.eval()
-        # eval_precision: fp32 (default), tf32 (fp32 with TF32 matrix multiplies, global while this runs), bf16 / fp16
-        # autocast
-        precision = getattr(self.params, "eval_precision", None) or "fp32"
-        amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision) if torch.cuda.is_available() else None
-        tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = precision == "tf32"
+        # full fp32: no TF32 in matrix multiplies or convolutions
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
         est, tgt, ok, per_point = [], [], [], []
         chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
         pending = []        # loader batches waiting for VertexHead (CPU copies)
@@ -758,15 +756,17 @@ class DownstreamTrainer():
         # VertexHead on the GPU queues on its own stream, so the main loop's syncs and copies do not wait for it
         stream = torch.cuda.Stream(self.vertex_device) if self.vertex_device.type == "cuda" else None
 
+        @torch.no_grad()        # grad mode is per thread: this one runs in the pool
         def finish(records):
             """Truth labels and VertexHead over these batches, then their metrics inputs and CSV rows (the background
             thread)."""
             t0 = time.perf_counter()
             for r in records:
-                # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them. The truth PV: the
-                # origin shared by the most particles
-                r["truth"] = get_vertex_label(r["reg"], particle_id=r["label"], valid_tracks=(
-                    torch.hypot(r["reg"][..., 3], r["reg"][..., 4]) < 1.0) & r["mask"])
+                # hits whose particle starts within truth_radius of the beam line (padded rows excluded: their zeros
+                # would pass); the truth PV: the origin shared by the most particles
+                beam = self.vertex_head.beam_position
+                r["truth"] = get_vertex_label(r["reg"], particle_id=r["label"], valid_tracks=(torch.hypot(
+                    r["reg"][..., 3] - beam[0], r["reg"][..., 4] - beam[1]) < self.params.truth_radius) & r["mask"])
             t1 = time.perf_counter()
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
                 fitted = self._vertex_head_chunk(records)
@@ -817,20 +817,21 @@ class DownstreamTrainer():
                 raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
                                    "set params.return_reg_test = True before launch()")
             grouped, label, _, reg = batch
+            if max_events:      # the last batch: only the events still wanted
+                grouped, label, reg = (t[:max_events - n_seen] for t in (grouped, label, reg))
             b, c = grouped.size(0), grouped.size(-1)
             grouped = grouped.reshape(b, -1, c).to(self.device)
             reg = reg.to(self.device)
             mask = grouped[..., 0] != PAD_VALUE
             lap("data")
 
-            with autocast("cuda", dtype=amp_dtype) if amp_dtype else nullcontext():
-                if pretrain:
-                    _, pre_embed, _ = self.model(grouped, return_z=True)
-                    lap("backbone")
-                    out = self.down_model(grouped, self._layer_features(pre_embed), pretrain=True, padding_mask=mask)
-                else:
-                    out = self.down_model(grouped, feature=None)
-                lap("track_head")
+            if pretrain:
+                _, pre_embed, _ = self.model(grouped, return_z=True)
+                lap("backbone")
+                out = self.down_model(grouped, self._layer_features(pre_embed), pretrain=True, padding_mask=mask)
+            else:
+                out = self.down_model(grouped, feature=None)
+            lap("track_head")
 
             pending.append(cpu({"grouped": grouped, "label": label, "reg": reg, "mask": mask,
                                 "class_probs": out["class_probs"], "mask_probs": out["mask_probs"]}))
@@ -844,7 +845,6 @@ class DownstreamTrainer():
         flush()              # the loader ended with a partial chunk
         flush()              # and waits for it
         pool.shutdown()
-        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
         timing["wall"] = wall = time.perf_counter() - start
 
         est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)

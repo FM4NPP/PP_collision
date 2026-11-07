@@ -4,7 +4,7 @@ seeder), on per-event perigee tracks; a reference for VertexHead, run by compare
 
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_vertexing.py <dir> --bz_tesla 1.4 [--field_map <field.txt>]
 
-Reads <dir>/event<N:09>-tracks.csv (CsvTrackParameterReader: perigee at the origin, mm) and writes the vertices
+Reads <dir>/event<N:09>-tracks.csv (CsvTrackParameterReader: perigee at --beamspot, mm) and writes the vertices
 found to <dir>/event<N:09>-vertices.csv (CsvVertexWriter: x, y, z, T in mm, in the order ACTS found them).
 """
 import argparse
@@ -24,14 +24,15 @@ def main():
     parser.add_argument("--bz_tesla", type=float, required=True, help="uniform field, without --field_map")
     parser.add_argument("--field_map", default=None, help="ACTS text field map (mm, T), as the worker loads it")
     parser.add_argument("--field_map_kind", default="xyz", choices=("xyz", "rz"))
+    parser.add_argument("--beamspot", type=float, nargs=3, required=True, help="the tracks' perigee reference, mm")
     args = parser.parse_args()
 
     field = build_field(args.bz_tesla, args.field_map, args.field_map_kind)
     level = acts.logging.WARNING
-    sequencer = acts.examples.Sequencer(numThreads=1, logLevel=level)
+    sequencer = acts.examples.Sequencer(numThreads=1, logLevel=level, trackFpes=False)   # no FPE-mask summary
     sequencer.addReader(acts.examples.CsvTrackParameterReader(
         level=level, inputDir=args.directory, inputStem="tracks", outputTrackParameters="tracks",
-        beamspot=[0.0, 0.0, 0.0]))
+        beamspot=args.beamspot))
     sequencer.addAlgorithm(acts.examples.AdaptiveMultiVertexFinderAlgorithm(
         level=level, inputTrackParameters="tracks", outputProtoVertices="protovertices",
         outputVertices="vertices", seedFinder=acts.examples.VertexSeedFinder.GaussianSeeder, bField=field))

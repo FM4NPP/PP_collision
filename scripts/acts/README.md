@@ -25,7 +25,7 @@ scripts/run/vertexing.sh setup --geometry <tgeo.root> --geometry_config <config.
     [--set acts.energy_loss=true] [--set vertex_head.track_error_scale=2.5]
 ```
 
-The input files must exist (see sPHENIX inputs); `--set section.key=value` sets any other key, keeping its comment.
+The input files must exist (see sPHENIX inputs); `--set [section.]key=value` sets any other key, keeping its comment.
 Options after `eval` or `compare` go to the Python script, e.g. `eval --max_eval_events 5000` or
 `compare --tracks finder --max_events 1000`. Rerun `setup` after changing the C++.
 

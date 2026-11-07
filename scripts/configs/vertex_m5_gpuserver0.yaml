@@ -19,8 +19,6 @@ seed: 42
 # what to evaluate and where to write it
 max_eval_events: 1000         # events evaluated and written to the per-point CSV
 eval_batch_size: 8            # events per backbone call: same results as 1 (padding is ignored), slightly faster
-precision: fp32               # full precision: bf16 is 7x faster in the backbone but loses vertex accuracy
-                              # (within 0.5 cm 0.9072 against 0.9109, rmse 0.398 against 0.384 cm; 2026-11-07)
 data_root_test: null          # null: the model YAML's data_root_test
 root_dir: ~/vertex_eval        # runs in <backbone>/<track head>/e<events>/: data/ (CSV), logs/, metrics/ (JSON)
 

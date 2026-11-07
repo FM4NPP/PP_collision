@@ -161,7 +161,8 @@ def acts_vertices(head, outs):
             command = [*command[:2], "--bind", tmp, *command[2:]]
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "acts_vertexing.py")
         field = ["--field_map", head.field_map, "--field_map_kind", head.field_map_kind] if head.field_map else []
-        subprocess.run([*command, script, tmp, "--bz_tesla", str(head.Bz), *field], check=True)
+        beamspot = [str(v) for v in head.acts_worker_config()["reference"]]       # the perigee reference, mm
+        subprocess.run([*command, script, tmp, "--bz_tesla", str(head.Bz), *field, "--beamspot", *beamspot], check=True)
         found = []
         for e in range(len(outs)):
             with open(os.path.join(tmp, f"event{e:09d}-vertices.csv"), newline="") as f:
