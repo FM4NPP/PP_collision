@@ -135,7 +135,7 @@ EOF
         python eval_vertex_reconstruction.py --run_config "$RUN_CONFIG" "$@"
         ;;
     compare)
-        # the newest eval output under root_dir (<backbone>/<track head>/e<events>/); --csv <file> overrides it
+        # the newest eval output under root_dir (<backbone>/<track head>/data/); --csv <file> overrides it
         [[ -d $ROOT_DIR ]] || { echo "root_dir $ROOT_DIR does not exist: run 'eval' first" >&2; exit 1; }
         csv=$(find "$ROOT_DIR" -name '*_per_point_data.csv' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2- || true)
         [[ -n "$csv" ]] || { echo "no per-point CSV under $ROOT_DIR: run 'eval' first" >&2; exit 1; }

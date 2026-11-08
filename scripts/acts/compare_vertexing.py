@@ -13,8 +13,9 @@ side against the truth PV:
   same tracks with the same errors (x track_error_scale); needs the detector file's ACTS image.
 - VertexHead, AMVF events: VertexHead on the events where AMVF found a vertex.
 
-Writes to --out (default: compare/ beside the CSV's folder) reco_vertices.csv (one row per event and track set: the
-truth PV and each reconstruction's PV, cm) and residuals.png (PV residual reco - true in x, y, z and 3D, one row per
+Writes to --out (default: compare/ beside the CSV's folder), named after the CSV (<name>_per_point_data.csv),
+<name>_reco_vertices.csv (one row per event and track set: the truth PV and each reconstruction's PV, cm) and
+<name>_residuals.png (PV residual reco - true in x, y, z and 3D, one row per
 track set; values beyond --range go in the end bins), and prints the PV error table.
 """
 import argparse
@@ -190,6 +191,8 @@ def main():
     args = parser.parse_args()
     out_dir = args.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.csv))), "compare")
     os.makedirs(out_dir, exist_ok=True)
+    name = os.path.basename(args.csv).replace("_per_point_data.csv", "").replace(".csv", "")
+    reco_path, plot_path = (os.path.join(out_dir, f"{name}_{k}") for k in ("reco_vertices.csv", "residuals.png"))
 
     head = vh.VertexHead.from_detector(args.detector).eval()
     head.tracks.start_acts()       # boots while the CSV loads
@@ -228,18 +231,18 @@ def main():
                          *o["vertex_estimate"][0].double().tolist(), int(o["vertex_fallback_step"]),
                          int(o["vertex_n_tracks"]), *a, int(n)])
 
-    with open(os.path.join(out_dir, "reco_vertices.csv"), "w", newline="") as f:
+    with open(reco_path, "w", newline="") as f:
         writer = csv.writer(f, lineterminator="\n")
         writer.writerow(["batch_idx", "tracks", "n_tracks", *(f"true_{a}" for a in "xyz"), *(f"eval_{a}" for a in "xyz"),
                          *(f"vh_{a}" for a in "xyz"), "vh_fallback_step", "vh_n_tracks", *(f"acts_{a}" for a in "xyz"),
                          "acts_n_vertices"])
         writer.writerows(rows)
-    plot(os.path.join(out_dir, "residuals.png"), panels, args.range)
+    plot(plot_path, panels, args.range)
 
     print(f"\n{'tracks':7s} {'vertexing':24s} {'events':>6s} {'median':>7s} {'68%':>7s} {'90%':>7s} {'<1cm':>6s} "
           f"{'bias x':>7s} {'bias y':>7s} {'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (PV residual "
           "reco - true, cm: 3D error quantiles; bias = median, sig = 1.4826 MAD)", *table, sep="\n")
-    print(f"\nwrote {os.path.join(out_dir, 'reco_vertices.csv')} and {os.path.join(out_dir, 'residuals.png')}")
+    print(f"\nwrote {reco_path} and {plot_path}")
     print("time: " + ", ".join(f"{name} {seconds:.1f} s" for name, seconds in timing.items()))
     return 0
 

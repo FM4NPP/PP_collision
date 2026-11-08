@@ -8,8 +8,9 @@ Evaluate VertexHead after a trained track-finding head. Run from train/downstrea
 Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
 --checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events. Speed:
 --eval_batch_size.
-Outputs in <root_dir>/<backbone checkpoint>/<track-head checkpoint>/e<events>/: data/vertex_eval_<N>_per_point_data.csv,
-logs/vertex_eval_<N>.log (parameters, metrics) and metrics/vertex_eval_<N>.json (inputs, track settings, metrics).
+Outputs in <root_dir>/<backbone checkpoint>/<track-head checkpoint>/ (name: vertex_eval_e<events>_<N>):
+data/<name>_per_point_data.csv, logs/<name>.log (parameters, metrics) and metrics/<name>.json (inputs, track
+settings, metrics).
 --no_output writes nothing.
 """
 import os
@@ -150,7 +151,7 @@ def main():
         "--max_eval_events",
         type=int,
         default=20000,
-        help="Evaluate at most this many events (0: all); also names the run folder e<events>",
+        help="Evaluate at most this many events (0: all); also names the outputs vertex_eval_e<events>_<N>",
     )
     parser.add_argument(
         "--combine_weights",
@@ -245,10 +246,11 @@ def main():
         params["data_root_test"] = args.data_root_test
     checkpoint_path = (args.checkpoint if args.checkpoint
                        else os.path.join(args.checkpoint_dir or params.checkpoint_dir, checkpoint_name))
-    # the run folder: <backbone checkpoint>/<track-head checkpoint>/e<events> (outputs vertex_eval_<N>.*)
+    # the run folder: <backbone checkpoint>/<track-head checkpoint> (outputs vertex_eval_e<events>_<N>.*)
     stem = lambda path: os.path.splitext(os.path.basename(path))[0]  # noqa: E731
     head = stem(checkpoint_path).replace("_checkpoint", "").replace("_nerf_tracking_head", "")
-    params.run_folder = os.path.join(stem(params.pretrained_ckpt), head, f"e{args.max_eval_events}")
+    params.run_folder = os.path.join(stem(params.pretrained_ckpt), head)
+    params.run_name = f"vertex_eval_{f'e{args.max_eval_events}' if args.max_eval_events else 'all'}"
     if not os.path.isfile(checkpoint_path):
         sys.exit(f"track-head checkpoint not found: {checkpoint_path}\n"
                  f"(pass --checkpoint, or check --track_config/--run_num/--seed/--eventnumber "

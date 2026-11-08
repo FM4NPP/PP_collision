@@ -169,23 +169,25 @@ class DownstreamTrainer():
         
     def init_exp_dir(self, exp_dir):
         """
-        Run folder exp_dir with a new logs/vertex_eval_<N>.log (parameters, then metrics); its per-point CSV goes
-        to data/ (csv_path), its metrics JSON to metrics/ (metrics_path). No files with no_output.
+        Run folder exp_dir with a new logs/<name>_<N>.log (parameters, then metrics; name: params.run_name, default
+        vertex_eval); its per-point CSV goes to data/ (csv_path), its metrics JSON to metrics/ (metrics_path). No
+        files with no_output.
         """
         self.params['experiment_dir'] = os.path.abspath(exp_dir)
         if getattr(self.params, "no_output", False):
             self.logfile = self.csv_path = self.metrics_path = os.devnull
             return
         logs, idx = os.path.join(exp_dir, "logs"), 0
+        name = getattr(self.params, "run_name", None) or "vertex_eval"
         if self.world_rank == 0:
             os.makedirs(logs, exist_ok=True)
             os.makedirs(os.path.join(exp_dir, "data"), exist_ok=True)
             os.makedirs(os.path.join(exp_dir, "metrics"), exist_ok=True)
-            while os.path.exists(os.path.join(logs, f'vertex_eval_{idx}.log')):
+            while os.path.exists(os.path.join(logs, f'{name}_{idx}.log')):
                 idx += 1
-        self.logfile = os.path.join(logs, f'vertex_eval_{idx}.log')
-        self.csv_path = os.path.join(exp_dir, "data", f'vertex_eval_{idx}_per_point_data.csv')
-        self.metrics_path = os.path.join(exp_dir, "metrics", f'vertex_eval_{idx}.json')
+        self.logfile = os.path.join(logs, f'{name}_{idx}.log')
+        self.csv_path = os.path.join(exp_dir, "data", f'{name}_{idx}_per_point_data.csv')
+        self.metrics_path = os.path.join(exp_dir, "metrics", f'{name}_{idx}.json')
         if self.world_rank == 0:
             with open(self.logfile, 'w') as f:
                 f.write('Initialized at: {}\n'.format(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))))
@@ -203,7 +205,7 @@ class DownstreamTrainer():
     def launch(self, train=True):
         """Run folder, backbone (pretrained checkpoint), optimizer and loaders; train=False (the eval): the test
         loader only."""
-        # the run folder: params.run_folder (the eval: <backbone>/<track head>/e<events>), else <config>/<run_num>
+        # the run folder: params.run_folder (the eval: <backbone>/<track head>), else <config>/<run_num>
         exp_dir = os.path.join(self.root_dir, getattr(self.params, "run_folder", None) or os.path.join(self.config, self.run_num))
         self.init_exp_dir(exp_dir)
 

@@ -19,7 +19,7 @@ seed: 42
 # what to evaluate and where to write it
 max_eval_events: 1000         # events evaluated and written to the per-point CSV
 eval_batch_size: 8            # events per backbone call: same results as 1 (padding is ignored), slightly faster
-root_dir: ~/vertex_eval        # runs in <backbone>/<track head>/e<events>/: data/ (CSV), logs/, metrics/ (JSON)
+root_dir: ~/vertex_eval        # runs in <backbone>/<track head>/: data/ (CSV), logs/, metrics/ (JSON), files vertex_eval_e<events>_<N>
 
 # VertexHead: field, ACTS inputs and fit settings
 detector: sphenix_gpuserver0.yaml   # site detector file (scripts/run/vertexing.sh setup makes it)

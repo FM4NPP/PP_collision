@@ -13,7 +13,7 @@ returns perigee parameters with their covariance.
 scripts/run/vertexing.sh setup      # image (once, an hour or more) + module (a minute); site detector file
 scripts/run/vertexing.sh eval       # backbone, track finder, VertexHead -> per-point CSV
 scripts/run/vertexing.sh compare    # VertexHead and ACTS's own vertex finder against truth on that CSV:
-                                    # compare/reco_vertices.csv, compare/residuals.png beside the CSV's folder
+                                    # compare/<name>_reco_vertices.csv, <name>_residuals.png
 ```
 
 The run is `scripts/configs/vertex_m5_gpuserver0.yaml` (`RUN_CONFIG=<file>` for another). Its `detector:` file,
