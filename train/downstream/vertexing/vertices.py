@@ -13,6 +13,7 @@ Written from the published maths (R. Fruehwirth et al., adaptive vertex fitting,
 G. Piacquadio, CERN-THESIS-2010-027, the helix linearisation) and checked against ACTS v48.2.0 (MPL-2.0); all
 lengths in cm (ACTS: mm).
 """
+import functools
 import math
 
 import torch
@@ -31,9 +32,11 @@ def _wrap(angle):
 
 
 def _soft_below(value, cut, width):
-    """1 where value < cut: a step (width 0) or sigmoid((cut - value) / width); NaN -> 0."""
+    """1 where value < cut: a step (width 0) or sigmoid((cut - value) / width); NaN -> 0 (with a zero gradient)."""
+    finite = ~torch.isnan(value)
+    value = torch.where(finite, value, torch.as_tensor(cut, dtype=value.dtype, device=value.device))
     soft = (value < cut).to(value.dtype) if width == 0 else torch.sigmoid((cut - value) / width)
-    return soft.nan_to_num(0.0)
+    return torch.where(finite, soft, 0.0)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -61,24 +64,40 @@ def _perigee_at(p, bz, beam, point):
     return new, torch.cat([pca, z.unsqueeze(0)])
 
 
-def _impact_3d(p, bz, beam, point, iterations=20):
-    """The helix's 3D point of closest approach to point (Newton in the turning angle), as local coordinates
-    (loc0, loc1) on the curvilinear plane there (axes U = z x T / |.|, V = T x U, T the direction), and U, V."""
+def _impact_3d(p, bz, beam, point, iterations=20, guarded=False):
+    """The helix's 3D point of closest approach to point (Newton in the turning angle from the perigee, as ACTS), as
+    local coordinates (loc0, loc1) on the curvilinear plane there (axes U = z x T / |.|, V = T x U, T the direction),
+    and U, V. guarded: also Newton from the transverse closest approach on the three turns nearest the point in z;
+    the closest distance minimum wins (far points, low pT)."""
     d0, z0, phi0, theta = p[0], p[1], p[2], p[3]
     rho, cot = _helix_radius(p, bz), 1.0 / torch.tan(p[3])
     centre = torch.stack([beam[0] - (d0 - rho) * torch.sin(phi0), beam[1] + (d0 - rho) * torch.cos(phi0),
                           z0 + rho * phi0 * cot])
     dx, dy, dz = point - centre
-    phi = phi0
 
     def step(phi):
         first = rho * (dx * torch.cos(phi) + dy * torch.sin(phi) + (dz + rho * phi * cot) * cot)
         second = rho * (-dx * torch.sin(phi) + dy * torch.cos(phi) + rho * cot * cot)
         return phi - first / second
+
+    def root(phi):
+        for _ in range(iterations - 1):
+            phi = step(phi.detach())
+        return phi.detach()
+    phi = root(phi0)
+    if guarded:
+        distance = lambda a: (centre + rho * torch.stack([-torch.sin(a), torch.cos(a), -cot * a]) - point).norm()  # noqa: E731
+        minimum = lambda a: rho * (-dx * torch.sin(a) + dy * torch.cos(a) + rho * cot * cot) > 0  # noqa: E731
+        sign = torch.sign(rho)
+        transverse = torch.atan2(-sign * dx, sign * dy)
+        steep = cot.abs() > 1e-6
+        along_z = torch.where(steep, -dz / torch.where(steep, rho * cot, 1.0), phi0)
+        turn = torch.round((along_z - transverse) / (2 * math.pi))
+        for k in (-1, 0, 1):
+            other = root(transverse + 2 * math.pi * (turn + k))
+            phi = torch.where(minimum(other) & (distance(other) < distance(phi) * (1 - 1e-9)), other, phi)
     # the root without derivatives, then one step with them: at a Newton root that step's derivative is the root's
-    for _ in range(iterations - 1):
-        phi = step(phi.detach())
-    phi = step(phi.detach())
+    phi = step(phi)
     position = centre + rho * torch.stack([-torch.sin(phi), torch.cos(phi), -cot * phi])
     direction = torch.stack([torch.cos(phi) * torch.sin(theta), torch.sin(phi) * torch.sin(theta), torch.cos(theta)])
     axis = torch.where(direction[2].abs() < _CURVILINEAR_TOLERANCE, direction.new_tensor([0.0, 0.0, 1.0]),
@@ -107,6 +126,7 @@ def _with_jacobian(function):
 
 _perigee_with_jacobian = _with_jacobian(_perigee_at)
 _impact_with_jacobian = _with_jacobian(_impact_3d)
+_guarded_impact_with_jacobian = _with_jacobian(functools.partial(_impact_3d, guarded=True))
 
 
 def _transport(perigee, covariance, bz, beam, point):
@@ -311,17 +331,18 @@ class VertexFinder(nn.Module):
     # Vertex states: (B, K) vertices, their tracks (B, K, T); the tracks' perigee etc. in self._tracks
     # --------------------------------------------------------------------------------------------
 
-    def _new_vertices(self, seeds, links, tracks, prior=None):
+    def _new_vertices(self, seeds, links, tracks, prior=None, guarded=False):
         """
         Vertex states for seeds (B, K, 3) with link factors (B, K, T) (a track's membership, 0..1): the 3D impact
         parameters at the seed (for the compatibility), the tracks linearised at the seed, position = seed, the
-        prior (default: the seed) with initial_variance.
+        prior (default: the seed) with initial_variance; guarded: the guarded 3D impact point (_impact_3d).
         """
         perigee, cov, bz = tracks["perigee"], tracks["covariance"], tracks["bz"]
         beam = perigee.new_tensor(self.beam_position)
         point = seeds.nan_to_num().unsqueeze(2)
         expand = lambda v: v.unsqueeze(1).expand(-1, seeds.shape[1], *v.shape[1:])  # noqa: E731
-        loc, axes, J = _impact_with_jacobian(expand(perigee), expand(bz), beam, point)
+        impact = _guarded_impact_with_jacobian if guarded else _impact_with_jacobian
+        loc, axes, J = impact(expand(perigee), expand(bz), beam, point)
         loc_cov = J @ expand(cov) @ J.transpose(-1, -2)
         finite = seeds.nan_to_num()          # unused slots (NaN seeds) get finite stand-ins (weight 0)
         state = {"seed": seeds, "prior": finite if prior is None else prior.nan_to_num(), "position": finite.clone(),
@@ -492,7 +513,7 @@ class VertexFinder(nn.Module):
                 fit = fit | (shares & kept)
             self._fit(state, fit, track_weight, tracks)
             # the new vertex: >= 2 of its tracks still unused and compatible; those leave the pool (if none, the
-            # least compatible of its unused tracks, or the unused track nearest in z)
+            # least compatible of its unused tracks, or the unused track nearest the fitted vertex in z)
             new_links = (linked & new.unsqueeze(-1)).any(dim=1)
             compatibility = torch.where(new.unsqueeze(-1), state["compatibility"], 0.0).sum(dim=1)
             compatible = new_links & pool & (compatibility < self.max_vertex_chi2)
@@ -501,7 +522,8 @@ class VertexFinder(nn.Module):
             none = alive & ~compatible.any(dim=-1)
             worst = torch.where(new_links & pool & (compatibility > 0), compatibility, -torch.inf).argmax(dim=-1)
             has_worst = (new_links & pool & (compatibility > 0)).any(dim=-1)
-            nearest = torch.where(pool, (perigee[..., 1] - seed[:, 2:]).abs(), torch.inf).argmin(dim=-1)
+            fitted_z = (state["position"][..., 2] * new).sum(1, keepdim=True)
+            nearest = torch.where(pool, (perigee[..., 1] - fitted_z).abs(), torch.inf).argmin(dim=-1)
             drop = torch.where(has_worst, worst, nearest)
             remove = remove | (torch.nn.functional.one_hot(drop, n_tracks).bool() & none.unsqueeze(-1))
             pool = pool & ~remove
@@ -630,7 +652,8 @@ class VertexFinder(nn.Module):
         seed_pair_dca = pair_dca.gather(1, best).masked_fill(~seed_ok, torch.nan)
         pair = pairs.gather(1, best.unsqueeze(-1).expand(-1, -1, 2))
         # each seed's tracks: its pair, and candidates compatible with the seed (chi2 <= sv_max_track_chi2, soft)
-        state = self._new_vertices(seed, torch.zeros(n_events, K, n_tracks, dtype=dtype, device=device), tracks)
+        state = self._new_vertices(seed, torch.zeros(n_events, K, n_tracks, dtype=dtype, device=device), tracks,
+                                   guarded=True)
         compatible = _soft_below(self._compatibility(state, seed), self.sv_max_track_chi2,
                                  self._width("sigma") * 2 * math.sqrt(self.sv_max_track_chi2))
         in_pair = torch.zeros_like(compatible, dtype=torch.bool).scatter_(2, pair, True)
@@ -650,25 +673,33 @@ class VertexFinder(nn.Module):
         beats = (quality.unsqueeze(1) < quality.unsqueeze(2)) | ((quality.unsqueeze(1) == quality.unsqueeze(2))
                                                                   & torch.ones(K, K, dtype=torch.bool, device=device).tril(-1))
         ok = ok & ~(ok.unsqueeze(1) & (distance < self.sv_merge_distance) & beats).any(dim=2)
-        # momentum at the SV (the tracks refitted to it) and the KFParticle-style topology
+        result = self._sv_outputs(state, ok, pv, pv_state["covariance"][torch.arange(n_events), pv_slot])
+        result.update({"sv_pair_dca": seed_pair_dca.masked_fill(~ok, torch.nan), "displaced_mask": candidate,
+                       "displaced_weight": track_weight * candidate_weight})
+        return result, state, ok
+
+    def _sv_outputs(self, state, ok, pv, pv_covariance):
+        """The SV outputs of SV states (B, K) kept where ok, measured from the PV pv (B, 3) with covariance (B, 3, 3):
+        the fit, the momentum at the SV (its tracks refitted to it) and the KFParticle-style topology (decay length
+        significance with the two vertices' covariances added)."""
+        linked = state["links"] > 0.5
         momentum = self._vertex_momentum(state, ok)
-        covariance = state["covariance"] + torch.nan_to_num(pv_state["covariance"][torch.arange(n_events), pv_slot]
-                                                            ).unsqueeze(1)
+        path = state["position"] - pv.unsqueeze(1)
+        length = path.norm(dim=-1)
+        covariance = state["covariance"] + torch.nan_to_num(pv_covariance).unsqueeze(1)
         unit = path / length.unsqueeze(-1).clamp(min=1e-12)
         sigma = (unit.unsqueeze(-2) @ covariance @ unit.unsqueeze(-1)).squeeze(-1).squeeze(-1).sqrt()
         nan = lambda v: v.masked_fill(~ok.view(*ok.shape, *[1] * (v.dim() - 2)), torch.nan)  # noqa: E731
-        result = {
+        return {
             "sv_estimate": nan(state["position"]), "sv_is_valid": ok, "sv_covariance": nan(state["covariance"]),
-            "sv_chi2": nan(state["chi2"]), "sv_chi2_per_dof": nan(chi2_per_dof), "sv_displacement": nan(length),
-            "sv_decay_length_significance": nan(length / sigma), "sv_momentum": nan(momentum),
+            "sv_chi2": nan(state["chi2"]), "sv_chi2_per_dof": nan(state["chi2"] / state["ndf"].clamp(min=1e-12)),
+            "sv_displacement": nan(length), "sv_decay_length_significance": nan(length / sigma),
+            "sv_momentum": nan(momentum),
             "sv_dira": nan((unit * momentum).sum(-1) / momentum.norm(dim=-1).clamp(min=1e-12)),
-            "sv_pair_dca": nan(seed_pair_dca),
             "sv_n_tracks": ((state["weight"] >= 0.5) & linked).sum(-1).masked_fill(~ok, 0),
             "sv_track_mask": linked & (state["weight"] >= 0.5) & ok.unsqueeze(-1),
             "sv_track_weight": state["weight"] * ok.unsqueeze(-1),
-            "displaced_mask": candidate, "displaced_weight": track_weight * candidate_weight,
         }
-        return result, state, ok
 
     def _vertex_momentum(self, state, ok):
         """Sum (B, K, 3) of the momenta (GeV) of each vertex's tracks (weight >= 0.5) refitted to it."""
@@ -743,6 +774,10 @@ class VertexFinder(nn.Module):
                         mask = refit.view(-1, *[1] * (slot_state[key].dim() - 1))
                         slot_state[key] = torch.where(mask, joint[key][:, 0], slot_state[key])
                 pv = slot_state["position"].masked_fill(~valid.unsqueeze(-1), torch.nan)
+                # the SV outputs from the same refit, measured from the refitted PV (the SV selection is unchanged)
+                joint_sv = self._sv_outputs({k: v[:, 1:] for k, v in joint.items()}, sv_ok, pv, slot_state["covariance"])
+                for key, value in joint_sv.items():
+                    result[key] = torch.where(refit.view(-1, *[1] * (value.dim() - 1)), value, result[key])
 
         # the PV's outputs; per-track ones NaN for tracks without a fit
         weight = slot_state["weight"] * (slot_state["links"] > 0.5)

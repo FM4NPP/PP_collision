@@ -201,8 +201,9 @@ $\mathbf{c} = \mathbf{b} + d_0(-\sin\phi, \cos\phi) + \rho(\sin\phi, -\cos\phi)$
   $z_0' = z - x_z$; $C' = JCJ^T$ with $J = \partial\mathbf{q}'/\partial\mathbf{q}$ (automatic differentiation of
   this map).
 * **3D impact** at $\mathbf{x}$: Newton in the turning angle on the helix
-  $\mathbf{h}(\varphi) = \mathbf{O} + \rho(-\sin\varphi, \cos\varphi, -\varphi\cot\theta)$ (20 steps) gives the 3D
-  closest point $\mathbf{P}$ and direction $\hat{\mathbf{T}}$; on the curvilinear axes
+  $\mathbf{h}(\varphi) = \mathbf{O} + \rho(-\sin\varphi, \cos\varphi, -\varphi\cot\theta)$ (20 steps from the perigee
+  $\varphi_0$, as ACTS; for SV seeds also from the transverse closest approach on the three turns nearest the point in
+  $z$, the closest minimum, $h'' > 0$, kept) gives the 3D closest point $\mathbf{P}$ and direction $\hat{\mathbf{T}}$; on the curvilinear axes
   $\hat{\mathbf{U}} = \hat{\mathbf{z}}\times\hat{\mathbf{T}}/|\cdot|$, $\hat{\mathbf{V}} = \hat{\mathbf{T}}\times\hat{\mathbf{U}}$:
   $\mathbf{l} = ((\mathbf{P}-\mathbf{x})\cdot\hat{\mathbf{U}}, (\mathbf{P}-\mathbf{x})\cdot\hat{\mathbf{V}})$, covariance
   $J_lCJ_l^T$.

@@ -95,7 +95,7 @@ class VertexHead(nn.Module):
 
         Returns:
             dict (the PV: AMVF's first vertex; with find_secondary and refit_pv, refitted together with the SVs where
-            the event has one):
+            the event has one, the SV outputs then from that refit and measured from the refitted PV):
                 vertex_estimate (B, 3), chi_square, fit_is_valid (B,), vertex_covariance (B, 3, 3),
                 vertex_from_fallback (B,) found with a looser track preselection (ACTS's kept none),
                 vertex_fallback_step (B,) which (0: as ACTS, -1: none); its quality: vertex_n_tracks (B,)
