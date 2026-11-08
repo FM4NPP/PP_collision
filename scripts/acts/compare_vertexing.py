@@ -16,8 +16,8 @@ Writes to --out (default: compare/ beside the CSV's folder), named after the CSV
 <name>_reco_vertices.csv (one row per event and track set: the truth PV, the eval's own PV and each reconstruction's
 PV, cm), <name>_residuals.png (PV residual reco - true in x, y, z and 3D, one row per track set; values beyond --range
 go in the end bins) and <name>_secondary.png (SVs per event: the true ones, the findable true ones, VertexHead's and
-those of them matched to a true SV; the SV residual of all VertexHead's SVs and of the matched ones, within
---sv_range), and prints the PV error table and an SV summary.
+those of them matched to a true SV, the rest being fakes; the SV residual of all VertexHead's SVs and of the matched
+ones, within --sv_range), and prints the PV error table and an SV summary.
 
 SV definitions (truth from the CSV; the same for both track sets):
 - a track's truth origin: the production vertex (vtx_x/y/z) of its majority truth particle (seg_target);
@@ -221,6 +221,9 @@ STYLE = {"ACTS AMVF": dict(histtype="stepfilled", alpha=0.35, color="tab:gray"),
          "VertexHead": dict(histtype="step", lw=1.6, color="tab:blue"),
          "VertexHead, AMVF events": dict(histtype="step", lw=1.2, ls="--", color="tab:orange"),
          "VertexHead, matched": dict(histtype="step", lw=1.6, color="tab:green")}
+# the SV figure's legend labels (their styles)
+SV_ALL, SV_MATCHED = "VertexHead SVs, all (matched + fakes)", "VertexHead SVs, matched to a true SV"
+STYLE.update({SV_ALL: STYLE["VertexHead"], SV_MATCHED: STYLE["VertexHead, matched"]})
 
 
 def residual_panels(row, tracks, runs, limit, what, unit):
@@ -246,11 +249,11 @@ def sv_counts(ax, tracks, n_found, n_true, n_findable, n_matched):
     """Histogram of SVs per event: the true ones, the findable true ones (>= 2 candidate tracks), VertexHead's and
     those matched to a true SV."""
     edges = np.arange(max(n_found.max(initial=0), n_true.max(initial=0)) + 2) - 0.5
-    ax.hist(n_true, bins=edges, label=f"truth, all ({n_true.sum()})", **STYLE["truth"])
-    ax.hist(n_findable, bins=edges, label=f"truth, >= 2 candidate tracks ({n_findable.sum()})",
+    ax.hist(n_true, bins=edges, label=f"true SVs, all ({n_true.sum()})", **STYLE["truth"])
+    ax.hist(n_findable, bins=edges, label=f"true SVs, findable: >= 2 candidate tracks ({n_findable.sum()})",
             **STYLE["VertexHead, AMVF events"])
-    ax.hist(n_found, bins=edges, label=f"VertexHead ({n_found.sum()})", **STYLE["VertexHead"])
-    ax.hist(n_matched, bins=edges, label=f"VertexHead, matched ({n_matched.sum()})", **STYLE["VertexHead, matched"])
+    ax.hist(n_found, bins=edges, label=f"{SV_ALL} ({n_found.sum()})", **STYLE[SV_ALL])
+    ax.hist(n_matched, bins=edges, label=f"{SV_MATCHED} ({n_matched.sum()})", **STYLE[SV_MATCHED])
     ax.set_xlabel("SVs per event")
     ax.set_ylabel("events")
     ax.set_yscale("log")
@@ -337,7 +340,7 @@ def main():
                                                                             "PV", "events"))
     figure(sv_path, list(sv), 5, lambda axes, tracks: (
         sv_counts(axes[0], tracks, *sv[tracks][:4]),
-        residual_panels(axes[1:], tracks, {"VertexHead": sv[tracks][4], "VertexHead, matched": sv[tracks][5]},
+        residual_panels(axes[1:], tracks, {SV_ALL: sv[tracks][4], SV_MATCHED: sv[tracks][5]},
                         args.sv_range, "SV", "SVs")))
 
     print(f"\n{'tracks':7s} {'vertexing':24s} {'events':>6s} {'median':>7s} {'68%':>7s} {'90%':>7s} {'<1cm':>6s} "
