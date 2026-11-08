@@ -3,9 +3,11 @@
 // build. Without a geometry: field only (VoidNavigator); with one: navigated, with material (MaterialInteractor).
 // With the Kalman refit: each track's hits are first fitted by ACTS's Kalman fitter (each hit a measurement on
 // its own plane, through the hit and normal to the hit fit's direction there, so the track crosses it once;
-// DirectNavigator, field only: no TPC gas material) outward from the track's state just before its innermost hit,
-// its covariance x kalmanStartScale; the smoothed state at the innermost hit is then propagated to the perigee
-// (where the refit fails: the given state, counted as a failure of the refit).
+// DirectNavigator; with kalmanMaterial each gas hit's plane carries the gas from halfway to the previous gas hit to
+// halfway to the next, for multiple scattering and, with energyLoss, energy loss; silicon hits carry none; each hit
+// has its own errors) outward from the track's state just before its innermost hit, its covariance x
+// kalmanStartScale; the smoothed state at the innermost hit is then propagated to the perigee (where the refit fails:
+// the given state, counted as a failure of the refit).
 // States are split across threads (the propagator is const and keeps its state per call). Tracks are singly charged
 // particles of one hypothesis (PDG id, mass), which sets the energy loss and multiple scattering in material.
 // Units mm, GeV, e.
@@ -14,6 +16,7 @@
 #include <Acts/Definitions/ParticleData.hpp>
 #include <Acts/Definitions/PdgParticle.hpp>
 #include <Acts/Definitions/TrackParametrization.hpp>
+#include <Acts/Definitions/Units.hpp>
 #include <Acts/EventData/BoundTrackParameters.hpp>
 #include <Acts/EventData/ParticleHypothesis.hpp>
 #include <Acts/EventData/SourceLink.hpp>
@@ -24,6 +27,9 @@
 #include <Acts/Geometry/TrackingGeometry.hpp>
 #include <Acts/MagneticField/MagneticFieldContext.hpp>
 #include <Acts/MagneticField/MagneticFieldProvider.hpp>
+#include <Acts/Material/HomogeneousSurfaceMaterial.hpp>
+#include <Acts/Material/Material.hpp>
+#include <Acts/Material/MaterialSlab.hpp>
 #include <Acts/Propagator/ActorList.hpp>
 #include <Acts/Propagator/DirectNavigator.hpp>
 #include <Acts/Propagator/EigenStepper.hpp>
@@ -95,7 +101,7 @@ class PerigeePropagator {
   PerigeePropagator(std::shared_ptr<Acts::MagneticFieldProvider> field, std::array<double, 3> reference,
                     std::shared_ptr<Acts::TrackingGeometry> geometry, bool energyLoss, std::size_t maxSteps,
                     std::size_t threads, int particlePdg, std::optional<float> particleMass, bool kalmanRefit,
-                    double kalmanStartScale, std::array<double, 2> hitSigma)
+                    double kalmanStartScale, std::optional<std::array<double, 5>> kalmanMaterial)
       : m_particle(particleHypothesis(particlePdg, particleMass)),
         m_surface(Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3(reference[0], reference[1], reference[2]))),
         m_energyLoss(energyLoss),
@@ -123,13 +129,19 @@ class PerigeePropagator {
                                         logger("KalmanPropagator")),
                        logger("KalmanFitter"));
       m_kalmanStartScale = kalmanStartScale;
-      m_hitSigma = hitSigma;
+      // (X0 mm, L0 mm, A, Z, density g/cm^3)
+      if (kalmanMaterial) {
+        const auto& g = *kalmanMaterial;
+        m_kalmanMaterial = Acts::Material::fromMassDensity(
+            static_cast<float>(g[0]), static_cast<float>(g[1]), static_cast<float>(g[2]), static_cast<float>(g[3]),
+            static_cast<float>(g[4] * Acts::UnitConstants::g / Acts::UnitConstants::cm3));
+      }
     }
   }
 
   // position, direction (n, 3), q/p (n,) and covariance (n, 6, 6) (curvilinear, in the track's direction of
-  // travel; at the innermost hit) and the hits (m, 6: position, the hit fit's direction there) with their state's
-  // index hit_track (m,)
+  // travel; at the innermost hit) and the hits (m, 9: position, the hit fit's direction there, r phi and z errors,
+  // 1 in the gas / 0 silicon) with their state's index hit_track (m,)
   // (sorted by it, each track's hits in order along it; none without the refit) -> perigee parameters (d0, z0, phi,
   // theta, q/p, t) (n, 6), their covariance (n, 6, 6) (both NaN where ACTS failed or an input is not finite),
   // ok (n,), refitted (n,) (the Kalman refit succeeded) and {error message: count}
@@ -140,9 +152,9 @@ class PerigeePropagator {
       return a.ndim() == static_cast<py::ssize_t>(shape.size()) && std::equal(shape.begin(), shape.end(), a.shape());
     };
     if (qop.ndim() != 1 || !shaped(position, {n, 3}) || !shaped(direction, {n, 3}) || !shaped(covariance, {n, 6, 6}) ||
-        hitTrack.ndim() != 1 || !shaped(hits, {m, 6})) {
+        hitTrack.ndim() != 1 || !shaped(hits, {m, 9})) {
       throw std::invalid_argument(
-          "position, direction (n, 3), qop (n,), covariance (n, 6, 6), hit_track (m,), hits (m, 6) expected");
+          "position, direction (n, 3), qop (n,), covariance (n, 6, 6), hit_track (m,), hits (m, 9) expected");
     }
     // each state's hits: [hitBegin[i], hitBegin[i + 1])
     const double* T = hitTrack.data();
@@ -200,7 +212,7 @@ class PerigeePropagator {
               auto refitted = refit(Acts::BoundTrackParameters::createCurvilinear(
                                         Acts::Vector4(before.x(), before.y(), before.z(), 0.0), dir.normalized(), Q[i],
                                         m_kalmanStartScale * startCov, m_particle),
-                                    H + 6 * hitBegin[i], hitBegin[i + 1] - hitBegin[i], error);
+                                    H + 9 * hitBegin[i], hitBegin[i + 1] - hitBegin[i], error);
               if (refitted) {
                 start = std::move(refitted);
                 fitted[i] = true;
@@ -272,7 +284,7 @@ class PerigeePropagator {
     std::vector<const Acts::Surface*> sequence;
     std::vector<Acts::SourceLink> links;
     for (py::ssize_t j = 0; j < count; ++j) {
-      const double* h = hits + 6 * j;
+      const double* h = hits + 9 * j;
       const Acts::Vector3 hit(h[0], h[1], h[2]);
       const Acts::Vector3 normal = Acts::Vector3(h[3], h[4], h[5]).normalized();
       // plane axes: u horizontal (z x normal), v = normal x u
@@ -283,13 +295,29 @@ class PerigeePropagator {
       transform.linear().col(2) = normal;
       transform.translation() = hit;
       surfaces.push_back(Acts::Surface::makeShared<Acts::PlaneSurface>(transform));
+      if (m_kalmanMaterial) {
+        // the gas from halfway to the previous gas hit to halfway to the next
+        auto gap = [&](py::ssize_t k) {
+          if (k < 0 || k + 1 >= count) {
+            return 0.0;
+          }
+          const double* a = hits + 9 * k;
+          const double* b = a + 9;
+          return (a[8] == 0.0 || b[8] == 0.0) ? 0.0
+                                              : (Acts::Vector3(b[0], b[1], b[2]) - Acts::Vector3(a[0], a[1], a[2])).norm();
+        };
+        const double thickness = 0.5 * (gap(j - 1) + gap(j));
+        if (h[8] != 0.0 && thickness > 0.0) {
+          surfaces.back()->assignSurfaceMaterial(std::make_shared<Acts::HomogeneousSurfaceMaterial>(
+              Acts::MaterialSlab(*m_kalmanMaterial, static_cast<float>(thickness))));
+        }
+      }
       // the hit's errors along phi and z, projected onto the plane (along the track: first order)
       const Acts::Vector3 ePhi = Acts::Vector3(-hit.y(), hit.x(), 0.0).normalized();
       Eigen::Matrix<double, 3, 2> axes;
       axes << transform.linear().col(0), transform.linear().col(1);
-      const Acts::SquareMatrix<3> spread = m_hitSigma[0] * m_hitSigma[0] * ePhi * ePhi.transpose() +
-                                           m_hitSigma[1] * m_hitSigma[1] * Acts::Vector3::UnitZ() *
-                                               Acts::Vector3::UnitZ().transpose();
+      const Acts::SquareMatrix<3> spread =
+          h[6] * h[6] * ePhi * ePhi.transpose() + h[7] * h[7] * Acts::Vector3::UnitZ() * Acts::Vector3::UnitZ().transpose();
       sequence.push_back(surfaces.back().get());
       links.emplace_back(HitLink{surfaces.back().get(), Acts::Vector2::Zero(), axes.transpose() * spread * axes});
     }
@@ -303,7 +331,8 @@ class PerigeePropagator {
       plain.maxSteps = m_maxSteps;
     }
     const Acts::KalmanFitterOptions<Acts::VectorMultiTrajectory> options(
-        m_geometryContext, m_fieldContext, m_calibrationContext, extensions, plain, nullptr, false, false);
+        m_geometryContext, m_fieldContext, m_calibrationContext, extensions, plain, nullptr,
+        m_kalmanMaterial.has_value(), m_kalmanMaterial.has_value() && m_energyLoss);
     Acts::TrackContainer tracks{Acts::VectorTrackContainer{}, Acts::VectorMultiTrajectory{}};
     auto result = m_kalman->fit(links.begin(), links.end(), start, options, sequence, tracks);
     if (!result.ok()) {
@@ -362,7 +391,7 @@ class PerigeePropagator {
   Acts::GainMatrixUpdater m_updater;
   Acts::GainMatrixSmoother m_smoother;
   double m_kalmanStartScale = 1.0;
-  std::array<double, 2> m_hitSigma{};
+  std::optional<Acts::Material> m_kalmanMaterial;
   Acts::ParticleHypothesis m_particle;
   std::shared_ptr<Acts::PerigeeSurface> m_surface;
   bool m_energyLoss;
@@ -376,10 +405,10 @@ PYBIND11_MODULE(acts_perigee_propagator, m) {
   py::class_<PerigeePropagator>(m, "PerigeePropagator")
       .def(py::init<std::shared_ptr<Acts::MagneticFieldProvider>, std::array<double, 3>,
                     std::shared_ptr<Acts::TrackingGeometry>, bool, std::size_t, std::size_t, int, std::optional<float>,
-                    bool, double, std::array<double, 2>>(),
+                    bool, double, std::optional<std::array<double, 5>>>(),
            py::arg("field"), py::arg("reference"), py::arg("geometry"), py::arg("energy_loss"), py::arg("max_steps"),
            py::arg("threads"), py::arg("particle_pdg"), py::arg("particle_mass"), py::arg("kalman_refit"),
-           py::arg("kalman_start_covariance_scale"), py::arg("hit_sigma"))
+           py::arg("kalman_start_covariance_scale"), py::arg("kalman_material"))
       .def("propagate", &PerigeePropagator::propagate, py::arg("position"), py::arg("direction"), py::arg("qop"),
            py::arg("covariance"), py::arg("hit_track"), py::arg("hits"));
 }

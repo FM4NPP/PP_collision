@@ -11,10 +11,12 @@ Gaussian seeder; its first vertex as the PV) runs on the same tracks with the sa
 it needs the detector file's ACTS image. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
 Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); VertexHead's SVs against
 truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*); with the Kalman refit,
-its failure rate per bin of track purity, hits, pT and |eta|. VH AMVF evts / VH no AMVF: VertexHead on the events
-where AMVF found a vertex / found none.
+its failure rate per bin of track purity, hits, pT and |eta|; the hard-cut check: VertexHead's finder with ACTS's
+hard cuts (hard_cuts, no fallback) against ACTS AMVF event by event (they should agree to rounding). VH AMVF evts /
+VH no AMVF: VertexHead on the events where AMVF found a vertex / found none. Every track has class probability 1.
 """
 import argparse
+import copy
 import csv
 import os
 import subprocess
@@ -108,7 +110,7 @@ def load_events(path, max_events, tracks="finder"):
             mask = torch.zeros(1, len(hits), n_slots)
             mask[0, torch.tensor(np.flatnonzero(keep)), torch.tensor(slot)] = 0.9
             class_probs = torch.zeros(1, n_slots, 2)
-            class_probs[..., 1] = 0.8
+            class_probs[..., 1] = 1.0       # every track counts fully, as for ACTS
             return (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
                     torch.ones(1, len(hits), dtype=torch.bool))
         n_pv = int(np.nanmax(pv_index[hits], initial=-1)) + 1
@@ -140,7 +142,7 @@ def run_chunk(head, inputs):
             value = value[b:b + 1]
             if key in TRACK_KEYS:
                 value = value[:, :tracks]
-            elif key in ("sv_track_mask", "sv_track_dca"):
+            elif key in ("sv_track_mask", "sv_track_weight"):
                 value = value[..., :tracks]
             one[key] = value
         split.append(one)
@@ -149,7 +151,8 @@ def run_chunk(head, inputs):
 
 def acts_vertices(head, outs):
     """ACTS's own vertex finder (acts_vertexing.py) on each event's VertexHead input tracks (weight > 0), errors
-    scaled by track_error_scale: the first vertex found per event (E, 3) cm (NaN without one), vertices per event."""
+    scaled by track_error_scale: the first vertex found per event (E, 3) cm (NaN without one), vertices per event,
+    and each event's vertices (V, 3) cm in the order found."""
     with tempfile.TemporaryDirectory() as tmp:
         for e, o in enumerate(outs):
             params = o["track_parameters"][0].double().numpy().copy()
@@ -173,7 +176,7 @@ def acts_vertices(head, outs):
             with open(os.path.join(tmp, f"event{e:09d}-vertices.csv"), newline="") as f:
                 found.append([[float(r[k]) for k in "xyz"] for r in csv.DictReader(f)])
     first = np.array([v[0] if v else [np.nan] * 3 for v in found]) / vh.MM_PER_CM
-    return first, [len(v) for v in found]
+    return first, [len(v) for v in found], [np.array(v).reshape(-1, 3) / vh.MM_PER_CM for v in found]
 
 
 def pv_stats(vertices, events):
@@ -207,6 +210,25 @@ def sv_stats(outs, events, origin_tolerance):
     return (f"{n_cand:6d} {f'{n_cand_sec}/{n_sec}':>11s} {n_cand_sec / max(n_sec, 1):5.0%} {n_cand_sec / max(n_cand, 1):5.0%} "
             f"{n_sv:5d} {f'{sv_tracks_sec}/{sv_tracks}':>12s} {sv_all_sec:7d} "
             f"{str(sv_true) if residual else '':>8s} {f'{np.median(residual):.3f}' if residual else '':>8s}")
+
+
+def hard_check(tracks, outs, acts_all):
+    """The hard-cut check's row: events where both VertexHead (hard_cuts, no fallback) and ACTS AMVF find vertices,
+    the share whose first vertices agree within 1e-4 / 1e-3 cm, the distance median and max, events whose vertex
+    counts differ and events only one of them finds a vertex in."""
+    distance, differs, vh_only, acts_only = [], 0, 0, 0
+    for o, acts in zip(outs, acts_all):
+        ours = o["hard_primary_vertices"][0][o["hard_primary_vertex_valid"][0]].double().numpy()
+        differs += len(ours) != len(acts)
+        vh_only += len(ours) > 0 and len(acts) == 0
+        acts_only += len(acts) > 0 and len(ours) == 0
+        if len(ours) and len(acts):
+            distance.append(np.linalg.norm(ours[0] - acts[0]))
+    d = np.array(distance)
+    if not len(d):
+        return f"{tracks:7s} {0:5d}"
+    return (f"{tracks:7s} {len(d):5d} {(d < 1e-4).mean():6.1%} {(d < 1e-3).mean():6.1%} {np.median(d):9.2e} {d.max():9.2e} "
+            f"{differs:9d} {vh_only:7d} {acts_only:9d}")
 
 
 REFIT_BINS = {"purity": (0.7, 0.9, 1.0), "hits": (15, 30, 45), "pT GeV": (0.3, 0.5, 1.0), "|eta|": (0.5, 1.0)}
@@ -244,6 +266,13 @@ def main():
 
     head = vh.VertexHead.from_detector(args.detector, find_secondary=True).eval()
     head.tracks.start_acts()       # boots while the CSV loads
+    # the hard-cut check: VertexHead's finder with ACTS's hard cuts and no fallback, on the same tracks
+    hard = copy.copy(head.vertices)
+    hard.hard_cuts, hard.pv_fallback, hard.find_secondary = True, False, False
+    soft_forward = head.vertices.forward
+    head.vertices.forward = lambda tracks: {**soft_forward(tracks), **{
+        f"hard_{k}": v for k, v in hard(tracks).items() if k in ("primary_vertices", "primary_vertex_valid")}}
+    checks = []
     pv_rows, axis_rows, sv_rows, refit, notes = [], [], [], [], []
     timing = dict.fromkeys(("reading the CSV", "VertexHead", "ACTS AMVF"), 0.0)
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
@@ -268,7 +297,8 @@ def main():
                  sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)]
         if head.tracks.use_acts:
             t0 = time.perf_counter()
-            acts_pv, n_found = acts_vertices(head, outs)
+            acts_pv, n_found, acts_all = acts_vertices(head, outs)
+            checks.append(hard_check(tracks, outs, acts_all))
             timing["ACTS AMVF"] += time.perf_counter() - t0
             runs.append(("ACTS AMVF", acts_pv, "", runs[0][3], None))
             # VertexHead on the events where AMVF found a vertex (same events as its row) and on the rest
@@ -318,6 +348,10 @@ def main():
     print(f"\n{'tracks':7s} {'cands':>6s} {'sec. found':>11s} {'eff':>5s} {'pure':>5s} {'SVs':>5s} {'sec. tracks':>12s} "
           f"{'all-sec':>7s} {'true SVs':>8s} {'residual':>8s}   (VertexHead's SVs against truth; residual cm)",
           *sv_rows, sep="\n")
+    if checks:
+        print(f"\n{'tracks':7s} {'both':>5s} {'<1e-4':>6s} {'<1e-3':>6s} {'median':>9s} {'max':>9s} {'n differs':>9s} "
+              f"{'VH only':>7s} {'ACTS only':>9s}   (hard-cut check: VertexHead with hard_cuts, no fallback, against "
+              "ACTS AMVF event by event; first vertex distance, cm)", *checks, sep="\n")
     if refit:
         print(f"\n{'tracks':7s} {'bin':8s} refit failed % / tracks, per bin (lower edge)   (the hit fit's usable "
               "tracks; purity: the majority truth particle's share of a track's hits)", *refit, sep="\n")

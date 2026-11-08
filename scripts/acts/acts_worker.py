@@ -7,11 +7,12 @@ streams batches:
 
 Config (TrackBuilder.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
 geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (null: the CPUs this process may use),
-particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit, kalman_start_covariance_scale and hit_sigma (r phi, z).
+particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit, kalman_start_covariance_scale and
+kalman_material (the gas between the refit's hits: X0, L0 mm, A, Z, density g/cm^3; null: none).
 
 Protocol, after the line ACTS_WORKER_READY: n, m (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
-covariance (n, 6, 6), hit_track (m,) each hit's state index (sorted) and hits (m, 6) (position, the hit fit's
-direction there): the Kalman refit's hits (m = 0 without kalman_refit). Reply: float64 params (n, 6), covariance
+covariance (n, 6, 6), hit_track (m,) each hit's state index (sorted) and hits (m, 9) (position, the hit fit's
+direction there, the hit's r phi and z errors, 1 in the gas / 0 silicon): the Kalman refit's hits (m = 0 without kalman_refit). Reply: float64 params (n, 6), covariance
 (n, 6, 6), then ok (n,) and refitted (n,) uint8. States are propagated backward to the perigee. EOF ends it and prints a failure summary; everything else goes to stderr.
 """
 import collections
@@ -75,7 +76,7 @@ def build_propagator(config):
         particle_pdg=int(config["particle_pdg"]), particle_mass=config["particle_mass"],
         kalman_refit=bool(config["kalman_refit"]),
         kalman_start_covariance_scale=float(config["kalman_start_covariance_scale"]),
-        hit_sigma=[float(v) for v in config["hit_sigma"]])
+        kalman_material=None if config["kalman_material"] is None else [float(v) for v in config["kalman_material"]])
     return propagator, (field, detector, geometry)
 
 
@@ -105,13 +106,13 @@ def serve(config):
             sys.stdout.flush()
             return 0
         n, m = struct.unpack("<QQ", header)
-        body = read_exact(stdin, n * 8 * 43 + m * 8 * 7)
+        body = read_exact(stdin, n * 8 * 43 + m * 8 * 10)
         if body is None:
             return 1
         values = np.frombuffer(body, dtype="<f8")
         position, direction = values[: 3 * n].reshape(n, 3), values[3 * n: 6 * n].reshape(n, 3)
         qop, covariance = values[6 * n: 7 * n], values[7 * n: 43 * n].reshape(n, 6, 6)
-        hit_track, hits = values[43 * n: 43 * n + m], values[43 * n + m:].reshape(m, 6)
+        hit_track, hits = values[43 * n: 43 * n + m], values[43 * n + m:].reshape(m, 9)
         params, cov, ok, refitted, failures = propagator.propagate(position, direction, qop, covariance, hit_track, hits)
         errors.update(failures)
         attempted += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())

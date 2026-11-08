@@ -24,13 +24,17 @@ hit_errors_cm:                 # per-hit errors: the hit fit's covariance and th
   rphi: 0.034
   z: 0.1
 
+silicon_hit_errors_cm:         # silicon hits (MVTX, INTT: r below max_radius; the current data are TPC-only)
+  max_radius: 25.0
+  rphi: 0.001                  # MVTX-like; INTT r phi ~0.0016, z ~0.46 (1.6 cm strips)
+  z: 0.001
 acts:                          # use_acts is on when image (or command) is set
   image: null                  # acts-base-48.2.0.sif (scripts/acts/build_images.sh, which also builds the module)
   command: null                # instead of image: the command that runs Python with ACTS, a list
   geometry: null               # TGeo file from export_sphenix_geometry.C, e.g. sphenix_ana559_tgeo.root
   geometry_config: null        # ACTS TGeo JSON configuration, CDB key ACTSGEOMETRYCONFIG
   material_map: null           # ACTS JSON material map, CDB key ACTSMATERIALMAP
-  energy_loss: false           # energy loss in the material map's material
+  energy_loss: true            # energy loss in the material (map, and the Kalman refit's gas), as sPHENIX fits
   max_steps: null              # ACTS's propagation step limit (null: ACTS's default)
   threads: null                # propagation threads (null: the CPUs the process may use)
   particle_pdg: 211            # tracks' particle (PDG id; its mass sets energy loss and multiple scattering in material)
@@ -38,6 +42,12 @@ acts:                          # use_acts is on when image (or command) is set
   kalman_refit: true           # ACTS Kalman fit of each track's hits (hit_errors_cm) before the perigee propagation
   kalman_start_covariance_scale: 100.0   # the fit's start: the hit fit's covariance at the innermost hit x this
   kalman_fallback_covariance_scale: 100.0   # where the refit fails: the hit fit's track, its covariance x this
+  kalman_material:             # the TPC gas between the refit's hits (null: field only); Ar/CF4/iC4H10 75/20/5 by volume
+    x0_cm: 11310.0             #   radiation length (PDG values, mass-weighted: 23.9 g/cm^2)
+    l0_cm: 50450.0             #   nuclear interaction length (106.7 g/cm^2)
+    a: 35.0                    #   effective A and Z (Z/A 0.468, mass-weighted)
+    z: 16.4
+    density_g_cm3: 0.002115    #   at 20 C, 1 atm
 
 # any other VertexHead argument (VertexHead's defaults otherwise)
 vertex_head: {}

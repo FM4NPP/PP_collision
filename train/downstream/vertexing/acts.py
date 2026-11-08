@@ -61,8 +61,9 @@ class _ActsWorker:
     def propagate(self, position, direction, qop, covariance, hit_track, hits):
         """
         States in mm (position, direction (n, 3), qop (n,), covariance (n, 6, 6)) propagated backward to the
-        perigee; with the Kalman refit, their hits first (hits (m, 6): position mm and the hit fit's direction there;
-        hit_track (m,): their state's index, sorted; m = 0 without the refit). Returns parameters (n, 6), ok (n,),
+        perigee; with the Kalman refit, their hits first (hits (m, 9): position mm, the hit fit's direction there,
+        the hit's r phi and z errors (mm) and 1 for a hit in the gas (0: silicon); hit_track (m,): their state's index,
+        sorted; m = 0 without the refit). Returns parameters (n, 6), ok (n,),
         covariance (n, 6, 6), refitted (n,).
         """
         import numpy as np
