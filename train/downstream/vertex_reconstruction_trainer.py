@@ -675,7 +675,7 @@ class DownstreamTrainer():
         counts = torch.cat(track_counts).double()
         usable, acts_failed, refit_failed, _ = counts.mean(dim=0).tolist()
         metrics.update(usable_tracks_per_event=usable)
-        # the PVs fitted on all tracks (the finder kept no vertex): their share of the valid fits and both groups' rmse
+        # the fallback PVs (found with a looser preselection): their share of the valid fits and both groups' rmse
         fallback, error = counts[:, 3].bool(), (est - tgt).double().norm(dim=-1)
         rmse = lambda sel: error[sel].pow(2).mean().sqrt().item() if sel.any() else float("nan")  # noqa: E731
         metrics.update(pv_fallback_rate=fallback[ok].double().mean().item() if ok.any() else float("nan"),

@@ -707,17 +707,17 @@ class VertexFinder(nn.Module):
                                                 (self.tracks_max_z_interval, self.tracks_max_significance))
         step = torch.where(kept.any(dim=1), 0, -1)
         for k, preselection in enumerate(self.fallback_preselection if self.pv_fallback and not self.hard_cuts else ()):
-            # events without a vertex: searched again with a looser preselection
-            missing = step < 0
-            if not missing.any():
+            # events without a vertex (only those): searched again with a looser preselection
+            missing = (step < 0).nonzero().squeeze(1)
+            if not len(missing):
                 break
-            again, again_kept, again_order = self._find_primary(inputs, track_weight * missing.unsqueeze(-1), preselection)
-            use = missing & again_kept.any(dim=1)
-            for key, value in again.items():
-                state[key] = torch.where(use.view(-1, *[1] * (value.dim() - 1)), value, state[key])
-            kept = torch.where(use.unsqueeze(-1), again_kept, kept)
-            order = torch.where(use.unsqueeze(-1), again_order, order)
-            step = torch.where(use, k + 1, step)
+            again, again_kept, again_order = self._find_primary({key: v[missing] for key, v in inputs.items()},
+                                                                track_weight[missing], preselection)
+            use = again_kept.any(dim=1)
+            found = (missing[use],)
+            state = {key: value.index_put(found, again[key][use]) for key, value in state.items()}
+            kept, order = kept.index_put(found, again_kept[use]), order.index_put(found, again_order[use])
+            step = step.index_put(found, step.new_tensor(k + 1))
         pv_slot = order.argmin(dim=1)
         slot_state = {k: v[events, pv_slot] for k, v in state.items()}
         valid, from_fallback = step >= 0, step > 0
