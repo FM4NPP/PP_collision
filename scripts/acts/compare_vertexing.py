@@ -15,9 +15,9 @@ side against the truth PV:
 Writes to --out (default: compare/ beside the CSV's folder), named after the CSV (<name>_per_point_data.csv),
 <name>_reco_vertices.csv (one row per event and track set: the truth PV, the eval's own PV and each reconstruction's
 PV, cm), <name>_residuals.png (PV residual reco - true in x, y, z and 3D, one row per track set; values beyond --range
-go in the end bins) and <name>_secondary.png (SVs per event: VertexHead's, the true ones and the true ones it could
-find, those with >= 2 candidate tracks; and the SV residual against the truth, within --sv_range), and prints the PV
-error table and an SV summary.
+go in the end bins) and <name>_secondary.png (SVs per event: the true ones, the findable true ones, VertexHead's and
+those of them matched to a true SV; the SV residual of all VertexHead's SVs and of the matched ones, within
+--sv_range), and prints the PV error table and an SV summary.
 
 SV definitions (truth from the CSV; the same for both track sets):
 - a track's truth origin: the production vertex (vtx_x/y/z) of its majority truth particle (seg_target);
@@ -26,7 +26,9 @@ SV definitions (truth from the CSV; the same for both track sets):
 - candidate track: VertexHead's displaced_mask (its SV candidate cuts);
 - findable: a true SV with >= 2 candidate tracks (the like-for-like truth for VertexHead's SVs);
 - found: a VertexHead SV whose tracks (weight >= 0.5) include >= 2 of the true SV's tracks; a VertexHead SV is
-  matched when its tracks include >= 2 tracks of one true SV; its residual: against its tracks' median truth origin.
+  matched when its tracks include >= 2 tracks of one true SV (the one with most of them);
+- SV residual: matched SVs against their true SV's position; all SVs against their tracks' median truth origin (for
+  an unmatched SV that is mostly the PV, so its residual says little).
 """
 import argparse
 import csv
@@ -139,10 +141,11 @@ def run_chunk(head, inputs):
 
 
 def secondary_vertices(outs, events):
-    """VertexHead's SVs against the true ones: per event the number found, true and findable (>= 2 candidate tracks)
-    (E,); each SV's residual against its tracks' median truth origin (N, 3) cm; the true SVs found, the findable ones
-    found and the matched SVs."""
-    n_found, n_true, n_findable, residual, found, found_findable, matched = [], [], [], [], 0, 0, 0
+    """VertexHead's SVs against the true ones: per event the number found, true, findable (>= 2 candidate tracks) and
+    matched (E,); the residuals (N, 3) cm of all SVs (against their tracks' median truth origin) and of the matched
+    ones (against their true SV); the true SVs found and the findable ones found."""
+    n_found, n_true, n_findable, n_matched, residual, matched_residual, found, found_findable = \
+        [], [], [], [], [], [], 0, 0
     for o, e in zip(outs, events):
         valid = o["sv_is_valid"][0].numpy()
         masks = o["sv_track_mask"][0].numpy().astype(bool)
@@ -152,19 +155,24 @@ def secondary_vertices(outs, events):
         n_true.append(int(true_sv.max(initial=-1)) + 1)
         findable = [(candidate & (true_sv == t)).sum() >= 2 for t in range(n_true[-1])]
         n_findable.append(sum(findable))
+        n_matched.append(0)
         for k in np.flatnonzero(valid):
+            estimate = o["sv_estimate"][0, k].double().numpy()
             tracks = origin[masks[k]]
             tracks = tracks[np.isfinite(tracks).all(axis=1)]
             if len(tracks):
-                residual.append(o["sv_estimate"][0, k].double().numpy() - np.median(tracks, axis=0))
+                residual.append(estimate - np.median(tracks, axis=0))
             ids = true_sv[masks[k]]
-            matched += int(bool((ids >= 0).any()) and np.bincount(ids[ids >= 0]).max() >= 2)
+            ids = ids[ids >= 0]
+            if len(ids) and np.bincount(ids).max() >= 2:
+                n_matched[-1] += 1
+                matched_residual.append(estimate - origin[true_sv == np.bincount(ids).argmax()][0])
         for t in range(n_true[-1]):
             hit = any((masks[k] & (true_sv == t)).sum() >= 2 for k in np.flatnonzero(valid))
             found += hit
             found_findable += hit and findable[t]
-    return (np.array(n_found), np.array(n_true), np.array(n_findable), np.array(residual).reshape(-1, 3), found,
-            found_findable, matched)
+    return (np.array(n_found), np.array(n_true), np.array(n_findable), np.array(n_matched),
+            np.array(residual).reshape(-1, 3), np.array(matched_residual).reshape(-1, 3), found, found_findable)
 
 
 def acts_vertices(head, outs):
@@ -211,7 +219,8 @@ def table_row(label, residual):
 STYLE = {"ACTS AMVF": dict(histtype="stepfilled", alpha=0.35, color="tab:gray"),
          "truth": dict(histtype="stepfilled", alpha=0.35, color="tab:gray"),
          "VertexHead": dict(histtype="step", lw=1.6, color="tab:blue"),
-         "VertexHead, AMVF events": dict(histtype="step", lw=1.2, ls="--", color="tab:orange")}
+         "VertexHead, AMVF events": dict(histtype="step", lw=1.2, ls="--", color="tab:orange"),
+         "VertexHead, matched": dict(histtype="step", lw=1.6, color="tab:green")}
 
 
 def residual_panels(row, tracks, runs, limit, what, unit):
@@ -233,13 +242,15 @@ def residual_panels(row, tracks, runs, limit, what, unit):
         ax.legend(fontsize=7, loc="upper right")
 
 
-def sv_counts(ax, tracks, n_found, n_true, n_findable):
-    """Histogram of SVs per event: VertexHead's, the true ones and the findable true ones (>= 2 candidate tracks)."""
+def sv_counts(ax, tracks, n_found, n_true, n_findable, n_matched):
+    """Histogram of SVs per event: the true ones, the findable true ones (>= 2 candidate tracks), VertexHead's and
+    those matched to a true SV."""
     edges = np.arange(max(n_found.max(initial=0), n_true.max(initial=0)) + 2) - 0.5
     ax.hist(n_true, bins=edges, label=f"truth, all ({n_true.sum()})", **STYLE["truth"])
     ax.hist(n_findable, bins=edges, label=f"truth, >= 2 candidate tracks ({n_findable.sum()})",
             **STYLE["VertexHead, AMVF events"])
     ax.hist(n_found, bins=edges, label=f"VertexHead ({n_found.sum()})", **STYLE["VertexHead"])
+    ax.hist(n_matched, bins=edges, label=f"VertexHead, matched ({n_matched.sum()})", **STYLE["VertexHead, matched"])
     ax.set_xlabel("SVs per event")
     ax.set_ylabel("events")
     ax.set_yscale("log")
@@ -325,19 +336,20 @@ def main():
     figure(plot_path, list(panels), 4, lambda axes, tracks: residual_panels(axes, tracks, panels[tracks], args.range,
                                                                             "PV", "events"))
     figure(sv_path, list(sv), 5, lambda axes, tracks: (
-        sv_counts(axes[0], tracks, *sv[tracks][:3]),
-        residual_panels(axes[1:], tracks, {"VertexHead": sv[tracks][3]}, args.sv_range, "SV", "SVs")))
+        sv_counts(axes[0], tracks, *sv[tracks][:4]),
+        residual_panels(axes[1:], tracks, {"VertexHead": sv[tracks][4], "VertexHead, matched": sv[tracks][5]},
+                        args.sv_range, "SV", "SVs")))
 
     print(f"\n{'tracks':7s} {'vertexing':24s} {'events':>6s} {'median':>7s} {'68%':>7s} {'90%':>7s} {'<1cm':>6s} "
           f"{'bias x':>7s} {'bias y':>7s} {'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (PV residual "
           "reco - true, cm: 3D error quantiles; bias = median, sig = 1.4826 MAD)", *table, sep="\n")
     print()
-    for tracks, (n, t, f, r, found, found_findable, matched) in sv.items():
-        error = np.linalg.norm(r, axis=1)
-        print(f"{tracks:7s} SVs: VertexHead {n.sum()} ({matched} matched to a true SV); true {t.sum()}, with >= 2 "
+    for tracks, (n, t, f, m, r, mr, found, found_findable) in sv.items():
+        median = lambda v: np.median(np.linalg.norm(v, axis=1)) if len(v) else float("nan")  # noqa: E731
+        print(f"{tracks:7s} SVs: VertexHead {n.sum()}, {m.sum()} matched to a true SV; true {t.sum()}, with >= 2 "
               f"candidate tracks {f.sum()}; found {found} of all ({found / max(t.sum(), 1):.1%}), {found_findable} of "
-              f"those with >= 2 candidate tracks ({found_findable / max(f.sum(), 1):.1%}); residual to their tracks' "
-              f"truth origin: median {np.median(error) if len(error) else float('nan'):.3f} cm")
+              f"those with >= 2 candidate tracks ({found_findable / max(f.sum(), 1):.1%}); residual median: matched "
+              f"SVs to their true SV {median(mr):.3f} cm, all SVs to their tracks' truth origin {median(r):.3f} cm")
     print(f"\nwrote {reco_path}, {plot_path} and {sv_path}")
     print("time: " + ", ".join(f"{name} {seconds:.1f} s" for name, seconds in timing.items()))
     return 0
