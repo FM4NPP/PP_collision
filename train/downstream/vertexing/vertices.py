@@ -208,8 +208,10 @@ class VertexFinder(nn.Module):
         max_vertex_chi2, maximum_vertex_contamination, max_merge_vertex_significance: keeping a vertex (>= 2 of
             its tracks still unused with compatibility below max_vertex_chi2; contamination; z separation).
         max_vertices: vertices kept per event at most (ACTS: no limit).
-        pv_fallback: events where the finder keeps no vertex get one fitted on all their tracks (ACTS: none);
-            vertex_from_fallback marks them.
+        pv_fallback, fallback_preselection: events where the finder keeps no vertex (ACTS: none) are searched again
+            with the tracks' preselection relaxed, step by step, to each (tracks_max_z_interval cm,
+            tracks_max_significance) of fallback_preselection (keeping a vertex as ACTS does); vertex_from_fallback
+            marks them, vertex_fallback_step gives the step (0: as ACTS). Off with hard_cuts.
         cut_softness_cm, cut_softness_sigma, cut_softness_hits: sigmoid widths of the soft cuts in cm, in
             significance and in hits; hard_cuts: ACTS's / sPHENIX's hard cuts instead.
         find_secondary, refit_pv: SVs, and the PV refitted together with them (tracks shared).
@@ -240,6 +242,7 @@ class VertexFinder(nn.Module):
         max_merge_vertex_significance: float = 3.0,
         max_vertices: int = 10,
         pv_fallback: bool = True,
+        fallback_preselection: tuple = ((0.3, 7.0), (1.0, 10.0)),
         cut_softness_cm: float = 0.005,
         cut_softness_sigma: float = 0.25,
         cut_softness_hits: float = 1.0,
@@ -279,6 +282,7 @@ class VertexFinder(nn.Module):
         self.max_merge_vertex_significance = max_merge_vertex_significance
         self.max_vertices = max_vertices
         self.pv_fallback = pv_fallback
+        self.fallback_preselection = tuple(tuple(float(v) for v in step) for step in fallback_preselection)
         self.cut_softness_cm = cut_softness_cm
         self.cut_softness_sigma = cut_softness_sigma
         self.cut_softness_hits = cut_softness_hits
@@ -426,19 +430,20 @@ class VertexFinder(nn.Module):
     # Primary vertices: ACTS's adaptive multi-vertex finder
     # --------------------------------------------------------------------------------------------
 
-    def _links(self, seed, tracks):
-        """Each track's membership (B, T) of a vertex seeded at seed (B, 3): |z0 - z_seed| within
-        tracks_max_z_interval and impact significance at the seed below tracks_max_significance (soft)."""
+    def _links(self, seed, tracks, preselection):
+        """Each track's membership (B, T) of a vertex seeded at seed (B, 3): |z0 - z_seed| and the impact significance
+        at the seed below preselection (z interval cm, significance) (soft)."""
         q, cov, _ = _transport(tracks["perigee"], tracks["covariance"], tracks["bz"],
                                tracks["perigee"].new_tensor(self.beam_position), seed.nan_to_num().unsqueeze(1))
         significance = (q[..., 0] ** 2 / cov[..., 0, 0] + q[..., 1] ** 2 / cov[..., 1, 1]).clamp(min=1e-30).sqrt()
         dz = (tracks["perigee"][..., 1] - seed[:, 2:]).abs()
-        return (_soft_below(dz, self.tracks_max_z_interval, self._width("cm"))
-                * _soft_below(significance, self.tracks_max_significance, self._width("sigma"))
+        return (_soft_below(dz, preselection[0], self._width("cm"))
+                * _soft_below(significance, preselection[1], self._width("sigma"))
                 * tracks["input"].to(dz.dtype))
 
-    def _find_primary(self, tracks, track_weight):
-        """ACTS's AMVF over each event's input tracks: the vertex states (B, K) and kept (B, K) in creation order."""
+    def _find_primary(self, tracks, track_weight, preselection):
+        """ACTS's AMVF over each event's input tracks (weight 0: not used) with the tracks' preselection (z interval
+        cm, significance): the vertex states (B, K) and kept (B, K) in creation order."""
         n_events, n_tracks = track_weight.shape
         dtype, device = track_weight.dtype, track_weight.device
         K = self.max_vertices + 1                                   # the kept ones and the one being tried
@@ -460,7 +465,7 @@ class VertexFinder(nn.Module):
             seed = torch.stack([torch.full_like(z, self.beam_position[0]), torch.full_like(z, self.beam_position[1]),
                                 z.nan_to_num()], -1)
             prior = seed
-            links = self._links(seed, tracks)
+            links = self._links(seed, tracks, preselection)
             # no track: move the seed to the nearest unused track's z0 and try again
             empty = alive & ~(links > 0.5).any(dim=1)
             if empty.any():
@@ -468,7 +473,7 @@ class VertexFinder(nn.Module):
                 nearest = dz.argmin(dim=1)
                 seed = torch.where(empty.unsqueeze(-1), torch.stack(
                     [seed[:, 0], seed[:, 1], perigee[events, nearest, 1]], -1), seed)
-                links = torch.where(empty.unsqueeze(-1), self._links(seed, tracks), links)
+                links = torch.where(empty.unsqueeze(-1), self._links(seed, tracks, preselection), links)
                 alive = alive & (links > 0.5).any(dim=1)
             if not alive.any():
                 break
@@ -698,29 +703,24 @@ class VertexFinder(nn.Module):
         n_events = track_weight.shape[0]
         events = torch.arange(n_events, device=track_weight.device)
 
-        state, kept, order = self._find_primary(inputs, track_weight)
+        state, kept, order = self._find_primary(inputs, track_weight,
+                                                (self.tracks_max_z_interval, self.tracks_max_significance))
+        step = torch.where(kept.any(dim=1), 0, -1)
+        for k, preselection in enumerate(self.fallback_preselection if self.pv_fallback and not self.hard_cuts else ()):
+            # events without a vertex: searched again with a looser preselection
+            missing = step < 0
+            if not missing.any():
+                break
+            again, again_kept, again_order = self._find_primary(inputs, track_weight * missing.unsqueeze(-1), preselection)
+            use = missing & again_kept.any(dim=1)
+            for key, value in again.items():
+                state[key] = torch.where(use.view(-1, *[1] * (value.dim() - 1)), value, state[key])
+            kept = torch.where(use.unsqueeze(-1), again_kept, kept)
+            order = torch.where(use.unsqueeze(-1), again_order, order)
+            step = torch.where(use, k + 1, step)
         pv_slot = order.argmin(dim=1)
-        found = kept.any(dim=1)
-        from_fallback = torch.zeros_like(found)
-        if self.pv_fallback and not found.all():
-            # events without a vertex: one fitted on all their tracks, seeded at their highest density
-            missing = ~found
-            z = _density_seed(inputs["perigee"][..., 0], inputs["perigee"][..., 1], inputs["covariance"][..., :2, :2],
-                              track_weight, self.seed_d0_significance, self.seed_z0_significance)
-            mean_z = (track_weight * inputs["perigee"][..., 1]).sum(-1) / track_weight.sum(-1)
-            z = torch.where(torch.isfinite(z), z, mean_z)
-            seed = torch.stack([torch.full_like(z, self.beam_position[0]), torch.full_like(z, self.beam_position[1]), z],
-                               -1)
-            fallback = self._new_vertices(seed.unsqueeze(1), inputs["input"].to(dtype).unsqueeze(1), inputs)
-            self._fit(fallback, (missing & torch.isfinite(z)).unsqueeze(1), track_weight, inputs)
-            from_fallback = missing & torch.isfinite(z) & ((fallback["weight"][:, 0] >= 0.5).sum(-1) >= 2)
-            slot_state = {k: v[events, pv_slot] for k, v in state.items()}
-            for key, value in slot_state.items():
-                mask = from_fallback.view(-1, *[1] * (value.dim() - 1))
-                slot_state[key] = torch.where(mask, fallback[key][:, 0], value)
-        else:
-            slot_state = {k: v[events, pv_slot] for k, v in state.items()}
-        valid = found | from_fallback
+        slot_state = {k: v[events, pv_slot] for k, v in state.items()}
+        valid, from_fallback = step >= 0, step > 0
         pv = slot_state["position"].masked_fill(~valid.unsqueeze(-1), torch.nan)
 
         result = {}
@@ -755,6 +755,7 @@ class VertexFinder(nn.Module):
                                             torch.nan)
         result.update({
             "vertex_estimate": pv, "fit_is_valid": valid, "vertex_from_fallback": from_fallback,
+            "vertex_fallback_step": step,
             "vertex_covariance": slot_state["covariance"].masked_fill(~valid.view(-1, 1, 1), torch.nan),
             "chi_square": slot_state["chi2"].masked_fill(~valid, torch.nan),
             "vertex_ndf": slot_state["ndf"].masked_fill(~valid, torch.nan),

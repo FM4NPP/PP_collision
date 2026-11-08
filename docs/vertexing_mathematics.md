@@ -264,8 +264,10 @@ the last temperature once $\Delta\mathbf{x}^TC^{-1}\Delta\mathbf{x} \le 0.01$ fo
    was fitted with refitted without it.
 5. Repeat while ≥ 2 tracks are unused (and fewer than `max_vertices` are kept).
 
-The PV is the first vertex kept. Events with none get one fit on all their tracks (`pv_fallback`, ACTS: no vertex),
-flagged `vertex_from_fallback`.
+The PV is the first vertex kept. Events with none (ACTS: no vertex) are searched again with the preselection
+relaxed step by step (`fallback_preselection`: (z interval, significance) = (0.3 cm, 7), then (1 cm, 10)), each
+vertex still kept by ACTS's rules; `vertex_fallback_step` says which step (0: as ACTS). Off with `hard_cuts` (ACTS)
+or `pv_fallback=False`; the steps are a place for learning.
 
 ### 7.6 Soft cuts
 
@@ -302,7 +304,8 @@ Status after the ACTS alignment (2026-11-07); numbers before it: 1000-event eval
   covariances, so retune after the check.
 * **Full covariance:** done (§7.3; the old fit used $\sigma_{d_0}, \sigma_{z_0}$ only).
 * **z window:** done (ACTS's 1 mm window around the seed plus the significance cut, then the fit's own weights).
-* **Few tracks:** AMVF's events now come from the same finder; events it can't vertex take the fallback.
+* **Few tracks:** AMVF's events now come from the same finder; events it can't vertex take the relaxed-preselection
+  fallback (§7.5). The first version (one fit on all tracks, no z window) gave 23% of the PVs with rmse 6.7 cm.
 * **Kalman refit material:** done (§5.2).
 * **SV geometry:** done (helix intersections and tangents, 3D impact; no straight lines at the perigee).
 * **Speed:** ~18 ms/event on a laptop CPU (the Jacobians by automatic differentiation); analytic Jacobians would
