@@ -15,10 +15,19 @@ side against the truth PV:
 Writes to --out (default: compare/ beside the CSV's folder), named after the CSV (<name>_per_point_data.csv),
 <name>_reco_vertices.csv (one row per event and track set: the truth PV, the eval's own PV and each reconstruction's
 PV, cm), <name>_residuals.png (PV residual reco - true in x, y, z and 3D, one row per track set; values beyond --range
-go in the end bins) and <name>_secondary.png (VertexHead's SVs: SVs per event against the true ones, and their
-residual against the truth production vertex their tracks share, within --sv_range), and prints the PV error table.
-A track's truth origin: its majority particle's production vertex; a true SV: a truth origin more than
---origin_tolerance from the true PV shared by >= 2 tracks; a reconstructed SV's truth: its tracks' median origin.
+go in the end bins), <name>_secondary.png (VertexHead's SVs: SVs per event against the true ones, true SVs by radius
+(all, with >= 2 candidate tracks, found) and the SV residual against the truth, within --sv_range) and
+<name>_true_svs.csv (one row per true SV), and prints the PV error table and the SV breakdown.
+
+SV definitions (truth from the CSV; the same for both track sets):
+- a track's truth origin: the production vertex (vtx_x/y/z) of its majority truth particle (seg_target);
+- a true SV: a truth origin more than --origin_tolerance from the true PV shared by >= 2 tracks of the set (so it
+  counts only tracks the set has: with finder tracks, reconstructed ones); its radius: from the beam line;
+- candidate track: VertexHead's displaced_mask (its SV candidate cuts);
+- found: a VertexHead SV whose tracks (weight >= 0.5) include >= 2 of the true SV's tracks; a VertexHead SV is
+  matched when its tracks include >= 2 tracks of one true SV; its residual: against its tracks' median truth origin;
+- the stage table: VertexHead's own counts (sv_funnel), summed over events: candidate tracks, track pairs through
+  each seed cut in turn, then SVs through each fit cut in turn.
 """
 import argparse
 import csv
@@ -40,7 +49,8 @@ TRACK_COLUMNS = ["trackId", *PARAMS, *(f"var_{a}" for a in PARAMS),
                  *(f"cov_{a}{b}" for a in PARAMS for b in PARAMS if a != b)]   # CsvTrackParameterReader's columns
 COLUMNS = ("batch_idx", "E_norm", "eta_norm", "phi_norm", "r_norm", "pred_assignment", "seg_target", "reco_vtx_x",
            "reco_vtx_y", "reco_vtx_z", "test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z", "vtx_x", "vtx_y", "vtx_z")
-TRACK_KEYS = ("track_parameters", "track_covariance", "track_weight")
+TRACK_KEYS = ("track_parameters", "track_covariance", "track_weight", "displaced_mask")
+RADIUS_BINS = (0.0, 1.0, 5.0, 20.0, 40.0, np.inf)
 SV_TRACK_KEYS = ("sv_track_mask", "sv_track_weight")
 
 
@@ -74,7 +84,7 @@ def read_columns(path, max_events):
 def load_events(col, tracks, origin_tolerance):
     """Per event with at least one track: its batch_idx, a function giving (class_probs, mask_probs, points,
     padding_mask) as VertexHead takes them (built on demand), the true PV, the eval's PV (cm), per track slot its
-    truth origin (S, 3) cm and the number of true SVs."""
+    truth origin (S, 3) cm and its true SV (S,) (index, -1: none)."""
     label = np.where(np.isnan(col[tracks]), -999999, col[tracks]).astype(np.int64)
     truth_id = np.where(np.isnan(col["seg_target"]), 0, col["seg_target"]).astype(np.int64)
     origin_all = np.stack([col[f"vtx_{a}"] for a in "xyz"], axis=1)
@@ -95,10 +105,15 @@ def load_events(col, tracks, origin_tolerance):
         for t in range(slot.max() + 1):
             ids, counts = np.unique(ids_kept[slot == t], return_counts=True)
             origin[t] = origin_kept[np.flatnonzero((slot == t) & (ids_kept == ids[counts.argmax()]))[0]]
-        # true SVs: displaced origins shared by >= 2 tracks
-        displaced = origin[np.isfinite(origin).all(axis=1) & (np.linalg.norm(origin - true_vertex[hits[0]], axis=1)
-                                                               > origin_tolerance)]
-        _, shared = np.unique(np.round(displaced / 1e-4), axis=0, return_counts=True)
+        # true SVs: displaced origins (equal to 1e-4 cm) shared by >= 2 tracks
+        displaced = np.isfinite(origin).all(axis=1) & (np.linalg.norm(origin - true_vertex[hits[0]], axis=1)
+                                                       > origin_tolerance)
+        true_sv = np.full(len(origin), -1)
+        if displaced.any():
+            _, inverse, counts = np.unique(np.round(origin[displaced] / 1e-4), axis=0, return_inverse=True,
+                                           return_counts=True)
+            inverse = inverse.reshape(-1)
+            true_sv[displaced] = np.where(counts[inverse] >= 2, (np.cumsum(counts >= 2) - 1)[inverse], -1)
 
         def inputs(hits=hits, keep=keep, slot=slot):
             mask = torch.zeros(1, len(hits), slot.max() + 1)
@@ -108,7 +123,7 @@ def load_events(col, tracks, origin_tolerance):
             return (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
                     torch.ones(1, len(hits), dtype=torch.bool))
         events.append((int(col["batch_idx"][hits[0]]), inputs, true_vertex[hits[0]], eval_vertex[hits[0]], origin,
-                       int((shared >= 2).sum())))
+                       true_sv))
     return events
 
 
@@ -125,20 +140,50 @@ def run_chunk(head, inputs):
                  if k in SV_TRACK_KEYS else v[b:b + 1]) for k, v in out.items()} for b, i in enumerate(inputs)]
 
 
-def secondary_vertices(outs, events):
-    """VertexHead's SVs: per event the number found and the true number (E,), and each SV's residual against its
-    tracks' median truth origin (N, 3) cm."""
-    n_found, n_true, residual = [], [], []
+def secondary_vertices(outs, events, beam):
+    """VertexHead's SVs against the true ones: per event the number found and the true number (E,), each SV's
+    residual against its tracks' median truth origin (N, 3) cm, the matched SVs, the summed sv_funnel and per true SV
+    (batch_idx, x, y, z, radius, tracks, candidate tracks, found) (M, 8)."""
+    n_found, n_true, residual, matched, funnel, true_rows = [], [], [], 0, 0, []
     for o, e in zip(outs, events):
         valid = o["sv_is_valid"][0].numpy()
+        masks = o["sv_track_mask"][0].numpy().astype(bool)
+        candidate = o["displaced_mask"][0].numpy().astype(bool)
+        origin, true_sv = e[4], e[5]
         n_found.append(int(valid.sum()))
-        n_true.append(e[5])
+        n_true.append(int(true_sv.max(initial=-1)) + 1)
+        funnel = funnel + o["sv_funnel"][0].numpy()
         for k in np.flatnonzero(valid):
-            origin = e[4][o["sv_track_mask"][0, k].numpy().astype(bool)]
-            origin = origin[np.isfinite(origin).all(axis=1)]
-            if len(origin):
-                residual.append(o["sv_estimate"][0, k].double().numpy() - np.median(origin, axis=0))
-    return np.array(n_found), np.array(n_true), np.array(residual).reshape(-1, 3)
+            tracks = origin[masks[k]]
+            tracks = tracks[np.isfinite(tracks).all(axis=1)]
+            if len(tracks):
+                residual.append(o["sv_estimate"][0, k].double().numpy() - np.median(tracks, axis=0))
+            ids = true_sv[masks[k]]
+            matched += int(bool((ids >= 0).any()) and np.bincount(ids[ids >= 0]).max() >= 2)
+        for t in range(n_true[-1]):
+            members = true_sv == t
+            xyz = origin[members][0]
+            found = any((masks[k] & members).sum() >= 2 for k in np.flatnonzero(valid))
+            true_rows.append([e[0], *xyz, np.hypot(xyz[0] - beam[0], xyz[1] - beam[1]), members.sum(),
+                              (candidate & members).sum(), found])
+    return (np.array(n_found), np.array(n_true), np.array(residual).reshape(-1, 3), matched, funnel,
+            np.array(true_rows, dtype=float).reshape(-1, 8))
+
+
+def sv_tables(tracks, n_found, matched, true_rows, max_radius):
+    """The SV breakdown's rows: true SVs per radius bin (all, >= 2 candidate tracks, found) and VertexHead's SVs."""
+    radius, candidates, found = true_rows[:, 4], true_rows[:, 6] >= 2, true_rows[:, 7] > 0
+    rows = []
+    for lo, hi in zip(RADIUS_BINS[:-1], RADIUS_BINS[1:]):
+        sel = (radius >= lo) & (radius < hi)
+        n, n_cand, n_found_bin = int(sel.sum()), int((sel & candidates).sum()), int((sel & found).sum())
+        rows.append(f"{tracks:7s} {f'{lo:g}-{hi:g}':>9s} {n:8d} {n_cand:9d} {n_found_bin:6d} "
+                    f"{n_found_bin / max(n, 1):6.1%} {n_found_bin / max(n_cand, 1):9.1%}"
+                    + ("   (beyond sv_max_radius)" if lo >= max_radius else ""))
+    n, n_cand, n_f = len(radius), int(candidates.sum()), int(found.sum())
+    rows.append(f"{tracks:7s} {'all':>9s} {n:8d} {n_cand:9d} {n_f:6d} {n_f / max(n, 1):6.1%} "
+                f"{n_f / max(n_cand, 1):9.1%}   (VertexHead SVs {n_found.sum()}, matched to a true SV {matched})")
+    return rows
 
 
 def acts_vertices(head, outs):
@@ -207,6 +252,22 @@ def residual_panels(row, tracks, runs, limit, what, unit):
         ax.legend(fontsize=7, loc="upper right")
 
 
+def sv_radius(ax, tracks, true_rows, max_radius):
+    """True SVs by radius: all, with >= 2 candidate tracks, found (values beyond 2 x sv_max_radius in the last bin)."""
+    edges = np.linspace(0, 2 * max_radius, 41)
+    radius = np.clip(true_rows[:, 4], 0, edges[-1])
+    for label, sel, style in (("true SVs", np.ones(len(radius), bool), STYLE["truth"]),
+                              (">= 2 candidate tracks", true_rows[:, 6] >= 2, STYLE["VertexHead, AMVF events"]),
+                              ("found", true_rows[:, 7] > 0, STYLE["VertexHead"])):
+        ax.hist(radius[sel], bins=edges, label=f"{label} ({int(sel.sum())})", **style)
+    ax.axvline(max_radius, color="tab:red", lw=0.8, ls=":", label="sv_max_radius")
+    ax.set_xlabel("true SV radius (cm)")
+    ax.set_ylabel("true SVs")
+    ax.set_yscale("log")
+    ax.set_title(f"{tracks} tracks: true SVs by radius")
+    ax.legend(fontsize=7, loc="upper right")
+
+
 def sv_counts(ax, tracks, n_found, n_true):
     """Histogram of SVs per event, VertexHead's against the true ones."""
     edges = np.arange(max(n_found.max(initial=0), n_true.max(initial=0)) + 2) - 0.5
@@ -247,8 +308,8 @@ def main():
     out_dir = args.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.csv))), "compare")
     os.makedirs(out_dir, exist_ok=True)
     name = os.path.basename(args.csv).replace("_per_point_data.csv", "").replace(".csv", "")
-    reco_path, plot_path, sv_path = (os.path.join(out_dir, f"{name}_{k}")
-                                     for k in ("reco_vertices.csv", "residuals.png", "secondary.png"))
+    reco_path, plot_path, sv_path, true_sv_path = (os.path.join(out_dir, f"{name}_{k}") for k in (
+        "reco_vertices.csv", "residuals.png", "secondary.png", "true_svs.csv"))
 
     head = vh.VertexHead.from_detector(args.detector).eval()
     head.tracks.start_acts()       # boots while the CSV loads
@@ -278,13 +339,14 @@ def main():
             acts, n_found = acts_vertices(head, outs)
             timing["ACTS AMVF"] += time.perf_counter() - t0
             runs.update({"ACTS AMVF": acts, "VertexHead, AMVF events": np.where(np.isfinite(acts), ours, np.nan)})
-        sv[tracks] = secondary_vertices(outs, events)
+        sv[tracks] = secondary_vertices(outs, events, head.vertices.beam_position)
         panels[tracks] = {k: v - truth for k, v in runs.items()}
         table += [table_row(f"{tracks:7s} {name:24s}", residual) for name, residual in panels[tracks].items()]
         for e, o, a, n in zip(events, outs, acts, n_found):
             rows.append([e[0], tracks, int((o["track_weight"][0] > 0).sum()), *e[2], *e[3],
                          *o["vertex_estimate"][0].double().tolist(), int(o["vertex_fallback_step"]),
-                         int(o["vertex_n_tracks"]), int(o["sv_is_valid"].sum()), e[5], *a, int(n)])
+                         int(o["vertex_n_tracks"]), int(o["sv_is_valid"].sum()), int(e[5].max(initial=-1)) + 1, *a,
+                         int(n)])
 
     with open(reco_path, "w", newline="") as f:
         writer = csv.writer(f, lineterminator="\n")
@@ -295,18 +357,32 @@ def main():
         writer.writerows(rows)
     figure(plot_path, list(panels), 4, lambda axes, tracks: residual_panels(axes, tracks, panels[tracks], args.range,
                                                                             "PV", "events"))
-    figure(sv_path, list(sv), 5, lambda axes, tracks: (sv_counts(axes[0], tracks, *sv[tracks][:2]), residual_panels(
-        axes[1:], tracks, {"VertexHead": sv[tracks][2]}, args.sv_range, "SV", "SVs")))
+    max_radius = head.vertices.sv_max_radius
+    figure(sv_path, list(sv), 6, lambda axes, tracks: (
+        sv_counts(axes[0], tracks, *sv[tracks][:2]), sv_radius(axes[1], tracks, sv[tracks][5], max_radius),
+        residual_panels(axes[2:], tracks, {"VertexHead": sv[tracks][2]}, args.sv_range, "SV", "SVs")))
+    with open(true_sv_path, "w", newline="") as f:
+        writer = csv.writer(f, lineterminator="\n")
+        writer.writerow(["batch_idx", "tracks", "x", "y", "z", "radius", "n_tracks", "n_candidate_tracks", "found"])
+        for tracks, values in sv.items():
+            writer.writerows([int(r[0]), tracks, *r[1:5], int(r[5]), int(r[6]), int(r[7])] for r in values[5])
 
     print(f"\n{'tracks':7s} {'vertexing':24s} {'events':>6s} {'median':>7s} {'68%':>7s} {'90%':>7s} {'<1cm':>6s} "
           f"{'bias x':>7s} {'bias y':>7s} {'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (PV residual "
           "reco - true, cm: 3D error quantiles; bias = median, sig = 1.4826 MAD)", *table, sep="\n")
-    for tracks, (n, t, r) in sv.items():
+    names = vh.vertices.SV_FUNNEL
+    print(f"\n{'SV stage':22s} " + " ".join(f"{t:>8s}" for t in sv) + "   (VertexHead's own counts summed over "
+          "events: tracks, then track pairs through each seed cut in turn, then SVs through each fit cut in turn)")
+    for k, stage in enumerate(names):
+        print(f"{stage:22s} " + " ".join(f"{int(v[4][k]):8d}" for v in sv.values()))
+    print(f"\n{'tracks':7s} {'radius cm':>9s} {'true SVs':>8s} {'2+ cand.':>9s} {'found':>6s} {'eff':>6s} "
+          f"{'eff 2+ c.':>9s}   (true SVs by radius from the beam line; 2+ cand.: >= 2 of its tracks are candidates)",
+          *(row for tracks, v in sv.items() for row in sv_tables(tracks, v[0], v[3], v[5], max_radius)), sep="\n")
+    for tracks, (n, t, r, *_) in sv.items():
         error = np.linalg.norm(r, axis=1)
-        print(f"{tracks:7s} SVs: VertexHead {n.sum()} in {(n > 0).sum()} events, truth {t.sum()} in {(t > 0).sum()} "
-              f"events; residual to their tracks' truth origin: median "
-              f"{np.median(error) if len(error) else float('nan'):.3f} cm")
-    print(f"\nwrote {reco_path}, {plot_path} and {sv_path}")
+        print(f"{tracks:7s} SV residual to their tracks' truth origin: median "
+              f"{np.median(error) if len(error) else float('nan'):.3f} cm over {len(error)} SVs")
+    print(f"\nwrote {reco_path}, {plot_path}, {sv_path} and {true_sv_path}")
     print("time: " + ", ".join(f"{name} {seconds:.1f} s" for name, seconds in timing.items()))
     return 0
 

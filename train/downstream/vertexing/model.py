@@ -115,7 +115,8 @@ class VertexHead(nn.Module):
                 sv_chi2_per_dof, sv_displacement (decay length, cm), sv_decay_length_significance, sv_dira (cosine
                 of the angle between the flight path and the momentum), sv_pair_dca (the seed pair's), sv_n_tracks
                 (B, K), sv_momentum (B, K, 3) GeV, sv_track_mask, sv_track_weight (B, K, T), displaced_mask,
-                displaced_weight (B, T) the candidates.
+                displaced_weight (B, T) the candidates; sv_funnel (B, 12) how many pass each SV stage (SV_FUNNEL in
+                vertices.py: candidate tracks, pairs through each seed cut, SVs through each fit cut).
         """
         tracks = self.tracks(class_probs, mask_probs, points, padding_mask, track_parameters, track_covariance)
         return {**{k: v for k, v in tracks.items() if not k.startswith("_")}, **self.vertices(tracks)}

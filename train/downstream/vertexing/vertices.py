@@ -26,6 +26,12 @@ K_CM = C_LIGHT / CM_PER_M          # pT [GeV] = K_CM x B [T] x R [cm]
 _CURVILINEAR_TOLERANCE = 0.999995  # |direction . z| above which the curvilinear frame uses x instead of z
 
 
+# sv_funnel's columns: candidate tracks; track pairs (either circle intersection) passing each seed cut in turn;
+# then SVs: the seeds kept (the max_sv_per_event smallest pair DCAs), and after each fit cut in turn
+SV_FUNNEL = ("candidate tracks", "candidate pairs", "circles meet", "radius", "projected dz", "pair dca", "path",
+             "seeds kept", "2+ compatible tracks", "chi2/ndf", "decay length", "after merging")
+
+
 def _wrap(angle):
     """Angle in [-pi, pi)."""
     return torch.remainder(angle + math.pi, 2 * math.pi) - math.pi
@@ -558,8 +564,8 @@ class VertexFinder(nn.Module):
         """
         Pair seeds (B, P, 3) and their pair DCA (B, P) of candidate tracks (B, T): the x-y intersections of their
         circles within sv_max_radius, the helix z there within sv_max_projected_dz, the helix tangents there closer
-        than sv_max_pair_dca, the midpoint further than sv_min_path from the PV (soft; score (B, P)); and the pairs'
-        tracks (B, P, 2).
+        than sv_max_pair_dca, the midpoint further than sv_min_path from the PV (soft; score (B, P)); the pairs'
+        tracks (B, P, 2); and the pairs passing these cuts in turn (B, 6), as sv_funnel counts them.
         """
         perigee, bz = tracks["perigee"], tracks["bz"]
         beam = perigee.new_tensor(self.beam_position)
@@ -602,15 +608,22 @@ class VertexFinder(nn.Module):
         p1, p2 = x1 + s1.unsqueeze(-1) * u1, x2 + s2.unsqueeze(-1) * u2
         pair_dca, midpoint = (p1 - p2).norm(dim=-1), (p1 + p2) / 2
         cm = self._width("cm")
-        score = (meets.unsqueeze(-1).to(d.dtype)
-                 * _soft_below(points.norm(dim=-1), self.sv_max_radius, cm)
-                 * _soft_below((x1[..., 2] - x2[..., 2]).abs(), self.sv_max_projected_dz, cm)
-                 * _soft_below(pair_dca, self.sv_max_pair_dca, cm)
-                 * _soft_below(-(midpoint - pv.unsqueeze(1).unsqueeze(1)).norm(dim=-1), -self.sv_min_path, cm))
+        factors = (meets.unsqueeze(-1).expand(-1, -1, 2).to(d.dtype),
+                   _soft_below(points.norm(dim=-1), self.sv_max_radius, cm),
+                   _soft_below((x1[..., 2] - x2[..., 2]).abs(), self.sv_max_projected_dz, cm),
+                   _soft_below(pair_dca, self.sv_max_pair_dca, cm),
+                   _soft_below(-(midpoint - pv.unsqueeze(1).unsqueeze(1)).norm(dim=-1), -self.sv_min_path, cm))
+        score = functools.reduce(torch.mul, factors)
+        # pairs passing the cuts in turn (a pair passes where either intersection does), for sv_funnel
+        passed = (candidate[:, i] & candidate[:, j]).unsqueeze(-1).expand(-1, -1, 2)
+        stages = [passed.any(-1).sum(-1)]
+        for factor in factors:
+            passed = passed & (factor > 0.5)
+            stages.append(passed.any(-1).sum(-1))
         n_events = perigee.shape[0]
         pairs = torch.stack([i, j], -1).unsqueeze(1).expand(-1, 2, -1).reshape(-1, 2)
         return (midpoint.reshape(n_events, -1, 3), pair_dca.reshape(n_events, -1), score.reshape(n_events, -1),
-                pairs.unsqueeze(0).expand(n_events, -1, -1))
+                pairs.unsqueeze(0).expand(n_events, -1, -1), torch.stack(stages, -1))
 
     def _find_secondary(self, tracks, track_weight, pv, pv_state, pv_slot):
         """SV finding after the PV (track_weight: without the other primary vertices' tracks): sv_* outputs,
@@ -635,8 +648,9 @@ class VertexFinder(nn.Module):
                             * torch.isfinite(pv).all(-1, keepdim=True))
         candidate = candidate_weight > 0.5
         if n_tracks >= 2:
-            seeds, pair_dca, score, pairs = self._sv_seeds(tracks, candidate, pv)
+            seeds, pair_dca, score, pairs, pair_stages = self._sv_seeds(tracks, candidate, pv)
         else:   # no pairs: one empty stand-in
+            pair_stages = torch.zeros(n_events, 6, dtype=torch.long, device=device)
             seeds = torch.zeros(n_events, 1, 3, dtype=dtype, device=device)
             pair_dca, score = seeds[..., 0] + torch.inf, seeds[..., 0]
             pairs = torch.zeros(n_events, 1, 2, dtype=torch.long, device=device)
@@ -665,8 +679,10 @@ class VertexFinder(nn.Module):
         chi2_per_dof = state["chi2"] / state["ndf"].clamp(min=1e-12)
         path = state["position"] - pv.unsqueeze(1)
         length = path.norm(dim=-1)
-        ok = (seed_ok & (n_good >= 2) & (state["ndf"] > 0) & (chi2_per_dof <= self.sv_max_chi2_per_dof)
-              & (length > self.sv_min_path))
+        good = seed_ok & (n_good >= 2)
+        fit_ok = good & (state["ndf"] > 0) & (chi2_per_dof <= self.sv_max_chi2_per_dof)
+        ok = fit_ok & (length > self.sv_min_path)
+        funnel = [candidate.sum(-1, keepdim=True), pair_stages, *(v.sum(-1, keepdim=True) for v in (seed_ok, good, fit_ok, ok))]
         # one SV per group within sv_merge_distance: the lowest chi2/ndf (ties: the lower slot)
         distance = (state["position"].unsqueeze(2) - state["position"].unsqueeze(1)).nan_to_num().norm(dim=-1)
         quality = chi2_per_dof.masked_fill(~ok, torch.inf)
@@ -675,7 +691,8 @@ class VertexFinder(nn.Module):
         ok = ok & ~(ok.unsqueeze(1) & (distance < self.sv_merge_distance) & beats).any(dim=2)
         result = self._sv_outputs(state, ok, pv, pv_state["covariance"][torch.arange(n_events), pv_slot])
         result.update({"sv_pair_dca": seed_pair_dca.masked_fill(~ok, torch.nan), "displaced_mask": candidate,
-                       "displaced_weight": track_weight * candidate_weight})
+                       "displaced_weight": track_weight * candidate_weight,
+                       "sv_funnel": torch.cat([*funnel, ok.sum(-1, keepdim=True)], -1)})
         return result, state, ok
 
     def _sv_outputs(self, state, ok, pv, pv_covariance):
