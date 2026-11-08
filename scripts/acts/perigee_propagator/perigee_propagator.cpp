@@ -10,7 +10,7 @@
 // the given state, counted as a failure of the refit).
 // States are split across threads (the propagator is const and keeps its state per call). Tracks are singly charged
 // particles of one hypothesis (PDG id, mass), which sets the energy loss and multiple scattering in material.
-// Units mm, GeV, e.
+// Units mm, GeV, e. build_tgeo_geometry: the TGeo tracking geometry (tgeo_geometry.cpp), without ACTS's examples.
 #include <Acts/Definitions/Algebra.hpp>
 #include <Acts/Definitions/Direction.hpp>
 #include <Acts/Definitions/ParticleData.hpp>
@@ -45,6 +45,8 @@
 #include <Acts/TrackFitting/KalmanFitter.hpp>
 #include <Acts/Utilities/CalibrationContext.hpp>
 #include <Acts/Utilities/Logger.hpp>
+
+#include "tgeo_geometry.hpp"
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -411,4 +413,17 @@ PYBIND11_MODULE(acts_perigee_propagator, m) {
            py::arg("kalman_start_covariance_scale"), py::arg("kalman_material"))
       .def("propagate", &PerigeePropagator::propagate, py::arg("position"), py::arg("direction"), py::arg("qop"),
            py::arg("covariance"), py::arg("hit_track"), py::arg("hits"));
+  // the geometry owns its detector elements: keep this object alive while the tracking geometry is used
+  py::class_<tgeo_geometry::TGeoGeometry>(m, "TGeoGeometry")
+      .def("tracking_geometry", [](const tgeo_geometry::TGeoGeometry& self) {
+        return std::const_pointer_cast<Acts::TrackingGeometry>(self.geometry);
+      });
+  m.def(
+      "build_tgeo_geometry",
+      [](const std::string& geometry, const std::string& config, const std::string& materialMap, bool quiet) {
+        return tgeo_geometry::build(geometry, config, materialMap, quiet ? Acts::Logging::FATAL : Acts::Logging::WARNING);
+      },
+      py::arg("geometry"), py::arg("config"), py::arg("material_map") = "", py::arg("quiet") = false,
+      "The tracking geometry of a TGeo file laid out by a TGeoDetector JSON configuration, with a JSON material map "
+      "(empty: none); quiet: fatal errors only.");
 }

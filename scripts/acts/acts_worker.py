@@ -36,22 +36,14 @@ def build_field(bz_tesla, field_map, field_map_kind):
 
 
 def build_tracking_geometry(geometry, geometry_config, material_map=None, quiet=False):
-    """ACTS tracking geometry from TGeo (TGeoDetector with its JSON configuration), with a JSON material map if
-    given. quiet: ACTS logs fatal errors only while building (README: sPHENIX inputs). Returns (detector, geometry):
-    the detector owns the detector elements and must be kept alive."""
-    import acts.examples.tgeo
-    import acts.json
-    config = acts.examples.tgeo.TGeoDetector.Config()
-    config.readJson(geometry_config)
-    config.fileName = geometry
-    level = acts.logging.FATAL if quiet else acts.logging.WARNING
-    if quiet:
-        config.surfaceLogLevel = config.layerLogLevel = config.volumeLogLevel = level
-    if material_map:
-        config.materialDecorator = acts.json.JsonMaterialDecorator(
-            rConfig=acts.json.MaterialMapJsonConverter.Config(), jFileName=material_map, level=level)
-    detector = acts.examples.tgeo.TGeoDetector(config)
-    return detector, detector.trackingGeometry()
+    """ACTS tracking geometry from TGeo (the perigee module's build_tgeo_geometry: TGeoDetector's layout with its JSON
+    configuration, ACTS Core and plugins only), with a JSON material map if given. quiet: ACTS logs fatal errors only
+    while building (README: sPHENIX inputs). Returns (owner, geometry): the owner holds the detector elements and must
+    be kept alive."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perigee_propagator", "build", "install"))
+    import acts_perigee_propagator
+    owner = acts_perigee_propagator.build_tgeo_geometry(geometry, geometry_config, material_map or "", quiet)
+    return owner, owner.tracking_geometry()
 
 
 def build_propagator(config):

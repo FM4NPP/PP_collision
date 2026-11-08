@@ -1,7 +1,11 @@
 # ACTS for VertexHead
 
 [ACTS](https://github.com/acts-project/acts) v48.2 (MPL-2.0), unmodified, in a Singularity/apptainer image, so it
-never touches `fm4npp-env`; it runs as a separate program, so its licence places no conditions on this repository.
+never touches `fm4npp-env`; it runs as a separate program. The one ACTS-derived source here,
+`perigee_propagator/tgeo_geometry.*`, keeps its MPL-2.0 header (MPL is per file: the rest of the repository is
+unaffected). ACTS's examples are not part of its public API (ACTS `docs/pages/versioning.md`), so the propagation
+path does not use them; only `acts_vertexing.py` (the comparison's reference vertex finder) still does.
+
 With `acts.image` set in the detector file, VertexHead's track builder (`TrackBuilder`, `use_acts`) hands each
 fitted track to ACTS. ACTS's Kalman fitter refits its hits (`kalman_refit`), then ACTS propagates the track from the
 innermost hit back to the beam line, through the field or the detector's tracking geometry with its material, and
@@ -13,7 +17,7 @@ returns perigee parameters with their covariance.
 scripts/run/vertexing.sh setup      # image (once, an hour or more) + module (a minute); site detector file
 scripts/run/vertexing.sh eval       # backbone, track finder, VertexHead -> per-point CSV
 scripts/run/vertexing.sh compare    # VertexHead and ACTS's own vertex finder against truth on that CSV:
-                                    # compare/<name>_reco_vertices.csv, <name>_residuals.png
+                                    # compare/<name>_reco_vertices.csv, _residuals.png, _secondary.png
 ```
 
 The run is `scripts/configs/vertex_m5_gpuserver0.yaml` (`RUN_CONFIG=<file>` for another). Its `detector:` file,
@@ -36,11 +40,11 @@ Options after `eval` or `compare` go to the Python script, e.g. `eval --max_eval
 | file | what |
 |---|---|
 | `build_images.sh`, `acts-base.def` | the image (ROOT, HepMC3, ACTS) and the module compiled inside it into `perigee_propagator/build/install` |
-| `perigee_propagator/` | one C++ file: ACTS Kalman refit of the hits, then backward propagation to the perigee with covariance and material (not in ACTS's Python bindings) |
+| `perigee_propagator/` | the C++ module: ACTS Kalman refit of the hits, then backward propagation to the perigee with covariance and material (not in ACTS's Python bindings); `tgeo_geometry.cpp` builds the TGeo tracking geometry (vendored from ACTS's TGeoDetector example, MPL-2.0, so only ACTS Core and its public Root and Json plugins are used) |
 | `acts_worker.py` | runs in the image; VertexHead starts it once and streams track states to it |
 | `detectors/<name>/` | the detector file template `<name>.yaml` and the tools that make its inputs |
 | `check_geometry.py` | a detector's geometry and material map in ACTS |
-| `compare_vertexing.py` | the PV reconstructions (the eval's, VertexHead's, ACTS's own vertex finder's) against truth: per-event CSV, residual plots in x, y, z and 3D, error table |
+| `compare_vertexing.py` | the PV reconstructions (VertexHead, ACTS AMVF) against truth: per-event CSV, residual plots in x, y, z and 3D, error table; SVs per event and SV residuals (secondary PNG) |
 | `acts_vertexing.py` | ACTS's vertex finder as shipped (AMVF, Gaussian seeder) on given tracks, for the comparison |
 
 Tracks ACTS fails to propagate are dropped; those the hit fit had kept are flagged in `acts_failed`. Where the
