@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-compare_vertexing.py: VertexHead against ACTS's own vertex finder and truth, on the per-point CSV of
-eval_vertex_reconstruction.py:
+compare_vertexing.py: the primary-vertex reconstructions on the per-point CSV of eval_vertex_reconstruction.py, side by
+side against the truth PV:
 
     python scripts/acts/compare_vertexing.py --csv <per-point csv> --detector <detector yaml> \
-        [--tracks finder|truth|both] [--max_events 500]
+        [--tracks finder|truth|both] [--max_events 0] [--out <dir>] [--range 1.0]
 
-VertexHead runs with the detector file's settings (PV and SVs). ACTS's finder as shipped (acts_vertexing.py: AMVF,
-Gaussian seeder; its first vertex as the PV) runs on the same tracks with the same errors (x track_error_scale);
-it needs the detector file's ACTS image. Tracks: the track finder's (pred_assignment) or truth tracks (seg_target).
-Tables: PV error |reco - true| quantiles; PV residual per axis (xy, z, bias, robust sigma); VertexHead's SVs against
-truth (secondary = truth ID < 0; a true SV: its tracks share a displaced truth origin vtx_*); with the Kalman refit,
-its failure rate per bin of track purity, hits, pT and |eta|; the hard-cut check: VertexHead's finder with ACTS's
-hard cuts (hard_cuts, no fallback) against ACTS AMVF event by event (they should agree to rounding). VH AMVF evts /
-VH no AMVF: VertexHead on the events where AMVF found a vertex / found none. Every track has class probability 1.
+- VertexHead (eval): the eval's own PV (track-head probabilities as track weights), read from the CSV.
+- VertexHead: VertexHead with the detector file's settings on the track finder's tracks (pred_assignment) or truth
+  tracks (seg_target), every track with class probability 1.
+- ACTS AMVF: ACTS's own vertex finder as shipped (acts_vertexing.py: AMVF, Gaussian seeder; its first vertex) on the
+  same tracks with the same errors (x track_error_scale); needs the detector file's ACTS image.
+- VertexHead, AMVF events: VertexHead on the events where AMVF found a vertex.
+
+Writes to --out (default: compare/ beside the CSV's folder) reco_vertices.csv (one row per event and track set: the
+truth PV and each reconstruction's PV, cm) and residuals.png (PV residual reco - true in x, y, z and 3D, one row per
+track set; values beyond --range go in the end bins), and prints the PV error table.
 """
 import argparse
-import copy
 import csv
 import os
 import subprocess
@@ -34,18 +35,14 @@ import vertexing as vh  # noqa: E402
 PARAMS = ("d0", "z0", "phi", "theta", "qop")
 TRACK_COLUMNS = ["trackId", *PARAMS, *(f"var_{a}" for a in PARAMS),
                  *(f"cov_{a}{b}" for a in PARAMS for b in PARAMS if a != b)]   # CsvTrackParameterReader's columns
-
-
-COLUMNS = ("batch_idx", "E_norm", "eta_norm", "phi_norm", "r_norm", "pred_assignment", "seg_target", "vtx_x", "vtx_y",
-           "vtx_z", "test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z", "test_truth_pv_index")
-_COLUMN_CACHE = {}
+COLUMNS = ("batch_idx", "E_norm", "eta_norm", "phi_norm", "r_norm", "pred_assignment", "seg_target", "reco_vtx_x",
+           "reco_vtx_y", "reco_vtx_z", "test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z")
+TRACK_KEYS = ("track_parameters", "track_covariance", "track_weight")
 
 
 def read_columns(path, max_events):
-    """The CSV columns compare_vertexing uses (empty fields NaN) for the first max_events events, read once, in
-    ~64 MB blocks with numpy's parser."""
-    if (path, max_events) in _COLUMN_CACHE:
-        return _COLUMN_CACHE[(path, max_events)]
+    """The CSV columns compare_vertexing uses (empty fields NaN) for the first max_events events (0: all), in ~64 MB
+    blocks with numpy's parser."""
     with open(path) as f:
         header = f.readline().strip().split(",")
         missing = [c for c in COLUMNS if c not in header]
@@ -67,62 +64,34 @@ def read_columns(path, max_events):
     data = np.concatenate(blocks)
     first = np.unique(data[:, 0])[:max_events] if max_events else np.unique(data[:, 0])
     data = data[np.isin(data[:, 0], first)]
-    _COLUMN_CACHE[(path, max_events)] = {c: data[:, k] for k, c in enumerate(COLUMNS)}
-    return _COLUMN_CACHE[(path, max_events)]
+    return {c: data[:, k] for k, c in enumerate(COLUMNS)}
 
 
-def load_events(path, max_events, tracks="finder"):
-    """
-    Per event: a function giving (class_probs, mask_probs, points, padding_mask) as VertexHead takes them (built on
-    demand), the true vertex, per track slot whether it is a Geant secondary and its particle's truth production
-    vertex, the number of primary vertices (test_truth_pv_index) and their truth positions (V, 3), ranked as
-    get_vertex_label ranks them, and per track slot its purity (majority truth particle's share of its hits) and hits.
-    """
-    col = read_columns(path, max_events)
-    nan_to = lambda name, value: np.where(np.isnan(col[name]), value, col[name]).astype(np.int64)  # noqa: E731
-    label = nan_to("pred_assignment" if tracks == "finder" else "seg_target", -999999)
-    truth_id = nan_to("seg_target", 0)
+def load_events(col, tracks):
+    """Per event with at least one track: its batch_idx, a function giving (class_probs, mask_probs, points,
+    padding_mask) as VertexHead takes them (built on demand), the true PV and the eval's PV (cm)."""
+    label = np.where(np.isnan(col[tracks]), -999999, col[tracks]).astype(np.int64)
     points = np.stack([col[k] for k in ("E_norm", "eta_norm", "phi_norm", "r_norm")], axis=1)
     true_vertex = np.stack([col[f"test_truth_vtx_{a}"] for a in "xyz"], axis=1)
-    origin_all = np.stack([col[f"vtx_{a}"] for a in "xyz"], axis=1)
-    pv_index = col["test_truth_pv_index"]
-    # each event's rows: one stable sort, then slices
+    eval_vertex = np.stack([col[f"reco_vtx_{a}"] for a in "xyz"], axis=1)
     order = np.argsort(col["batch_idx"], kind="stable")
     _, starts = np.unique(col["batch_idx"][order], return_index=True)
     events = []
     for hits in np.split(order, starts[1:]):
-        keep = (label[hits] != -999999) & ((label[hits] != -1) if tracks == "finder" else True)
+        keep = (label[hits] != -999999) & ((label[hits] != -1) if tracks == "pred_assignment" else True)
         if not keep.any():
             continue
         _, slot = np.unique(label[hits][keep], return_inverse=True)
-        n_slots = slot.max() + 1
-        # per track slot: secondary (majority truth ID < 0) and that particle's production vertex (first such hit)
-        ids_kept, origin_kept = truth_id[hits][keep], origin_all[hits][keep]
-        secondary, origin = np.zeros(n_slots, dtype=bool), np.full((n_slots, 3), np.nan)
-        purity, n_hits = np.zeros(n_slots), np.zeros(n_slots, dtype=np.int64)
-        for t in range(n_slots):
-            ids, counts = np.unique(ids_kept[slot == t], return_counts=True)
-            secondary[t] = ids[counts.argmax()] < 0
-            purity[t], n_hits[t] = counts.max() / counts.sum(), counts.sum()
-            origin[t] = origin_kept[np.flatnonzero((slot == t) & (ids_kept == ids[counts.argmax()]))[0]]
 
-        def inputs(hits=hits, keep=keep, slot=slot, n_slots=n_slots):
-            mask = torch.zeros(1, len(hits), n_slots)
+        def inputs(hits=hits, keep=keep, slot=slot):
+            mask = torch.zeros(1, len(hits), slot.max() + 1)
             mask[0, torch.tensor(np.flatnonzero(keep)), torch.tensor(slot)] = 0.9
-            class_probs = torch.zeros(1, n_slots, 2)
+            class_probs = torch.zeros(1, slot.max() + 1, 2)
             class_probs[..., 1] = 1.0       # every track counts fully, as for ACTS
             return (class_probs, mask, torch.tensor(points[hits], dtype=torch.float32)[None],
                     torch.ones(1, len(hits), dtype=torch.bool))
-        n_pv = int(np.nanmax(pv_index[hits], initial=-1)) + 1
-        truth_pvs = np.array([origin_all[hits][pv_index[hits] == k].mean(axis=0) for k in range(n_pv)]).reshape(-1, 3)
-        events.append((inputs, true_vertex[hits[0]], secondary, origin, n_pv, truth_pvs, purity, n_hits))
+        events.append((int(col["batch_idx"][hits[0]]), inputs, true_vertex[hits[0]], eval_vertex[hits[0]]))
     return events
-
-
-TRACK_KEYS = ("track_parameters", "track_covariance", "track_weight", "track_quality_mask", "track_sigma",
-              "track_position", "track_direction", "track_vertex_weight", "track_chi2", "track_dca",
-              "track_closest_approach_point", "track_primary_vertex", "displaced_mask", "displaced_weight", "acts_failed",
-              "acts_refit_failed")
 
 
 def run_chunk(head, inputs):
@@ -134,25 +103,14 @@ def run_chunk(head, inputs):
                torch.cat([pad(i[1], (0, n_tracks - i[1].shape[2], 0, n_hits - i[1].shape[1])) for i in inputs]),
                torch.cat([pad(i[2], (0, 0, 0, n_hits - i[2].shape[1])) for i in inputs]),
                torch.cat([pad(i[3], (0, n_hits - i[3].shape[1]), value=False) for i in inputs]))
-    split = []
-    for b, i in enumerate(inputs):
-        tracks = i[0].shape[1]
-        one = {}
-        for key, value in out.items():
-            value = value[b:b + 1]
-            if key in TRACK_KEYS:
-                value = value[:, :tracks]
-            elif key in ("sv_track_mask", "sv_track_weight"):
-                value = value[..., :tracks]
-            one[key] = value
-        split.append(one)
-    return split
+    return [{k: (v[b:b + 1, :i[0].shape[1]] if k in TRACK_KEYS else v[b:b + 1]) for k, v in out.items()}
+            for b, i in enumerate(inputs)]
 
 
 def acts_vertices(head, outs):
     """ACTS's own vertex finder (acts_vertexing.py) on each event's VertexHead input tracks (weight > 0), errors
-    scaled by track_error_scale: the first vertex found per event (E, 3) cm (NaN without one), vertices per event,
-    and each event's vertices (V, 3) cm in the order found."""
+    scaled by track_error_scale: the first vertex found per event (E, 3) cm (NaN without one) and the vertices per
+    event."""
     with tempfile.TemporaryDirectory() as tmp:
         for e, o in enumerate(outs):
             params = o["track_parameters"][0].double().numpy().copy()
@@ -175,83 +133,49 @@ def acts_vertices(head, outs):
         for e in range(len(outs)):
             with open(os.path.join(tmp, f"event{e:09d}-vertices.csv"), newline="") as f:
                 found.append([[float(r[k]) for k in "xyz"] for r in csv.DictReader(f)])
-    first = np.array([v[0] if v else [np.nan] * 3 for v in found]) / vh.MM_PER_CM
-    return first, [len(v) for v in found], [np.array(v).reshape(-1, 3) / vh.MM_PER_CM for v in found]
+    first = np.array([v[0] if v else [np.nan] * 3 for v in found]).reshape(-1, 3) / vh.MM_PER_CM
+    return first, np.array([len(v) for v in found])
 
 
-def pv_stats(vertices, events):
-    """The PV table's and the per-axis table's numbers for PVs (E, 3), cm."""
-    residual = vertices - np.array([e[1] for e in events])
-    residual = residual[np.isfinite(residual).all(axis=1)]          # (events, 3): reconstructed - true, cm
+def table_row(label, residual):
+    """The PV table's row for residuals (E, 3) reco - true, cm (NaN: no vertex)."""
+    residual = residual[np.isfinite(residual).all(axis=1)]
     if not len(residual):
-        return (0, *[np.nan] * 4), [np.nan] * 10
-    err, transverse, bias = np.linalg.norm(residual, axis=1), np.linalg.norm(residual[:, :2], axis=1), np.median(residual, axis=0)
-    pv = (len(err), *(np.percentile(err, q) for q in (50, 68, 90)), (err < 1.0).mean())
-    axes = (np.median(transverse), np.percentile(transverse, 68), np.median(np.abs(residual[:, 2])),
-            np.percentile(np.abs(residual[:, 2]), 68), *bias, *(1.4826 * np.median(np.abs(residual - bias), axis=0)))
-    return pv, axes
+        return f"{label} {0:6d}"
+    err, bias = np.linalg.norm(residual, axis=1), np.median(residual, axis=0)
+    sigma = 1.4826 * np.median(np.abs(residual - bias), axis=0)
+    return (f"{label} {len(err):6d} " + " ".join(f"{np.percentile(err, q):7.4f}" for q in (50, 68, 90))
+            + f" {(err < 1.0).mean():6.1%} " + " ".join(f"{v:7.4f}" for v in (*bias, *sigma)))
 
 
-def sv_stats(outs, events, origin_tolerance):
-    """The SV table's numbers for VertexHead's SVs."""
-    n_sec = n_cand = n_cand_sec = n_sv = sv_tracks = sv_tracks_sec = sv_all_sec = sv_true = 0
-    residual = []
-    for o, (_, truth, sec, origin, *_) in zip(outs, events):
-        usable, cand = o["track_quality_mask"][0].numpy(), o["displaced_mask"][0].numpy()
-        n_sec += int((sec & usable).sum()); n_cand += int(cand.sum()); n_cand_sec += int((cand & sec).sum())
-        for k in np.flatnonzero(o["sv_is_valid"][0].numpy()):
-            m = o["sv_track_mask"][0, k].numpy()
-            n_sv += 1; sv_tracks += int(m.sum()); sv_tracks_sec += int((m & sec).sum()); sv_all_sec += int(sec[m].all())
-            if np.isfinite(origin[m]).all():
-                true_sv = np.median(origin[m], axis=0)
-                residual.append(np.linalg.norm(o["sv_estimate"][0, k].double().numpy() - true_sv))
-                shared = np.linalg.norm(origin[m] - true_sv, axis=1).max() <= origin_tolerance
-                sv_true += int(shared and np.linalg.norm(true_sv - truth) > origin_tolerance)
-    return (f"{n_cand:6d} {f'{n_cand_sec}/{n_sec}':>11s} {n_cand_sec / max(n_sec, 1):5.0%} {n_cand_sec / max(n_cand, 1):5.0%} "
-            f"{n_sv:5d} {f'{sv_tracks_sec}/{sv_tracks}':>12s} {sv_all_sec:7d} "
-            f"{str(sv_true) if residual else '':>8s} {f'{np.median(residual):.3f}' if residual else '':>8s}")
-
-
-def hard_check(tracks, outs, acts_all):
-    """The hard-cut check's row: events where both VertexHead (hard_cuts, no fallback) and ACTS AMVF find vertices,
-    the share whose first vertices agree within 1e-4 / 1e-3 cm, the distance median and max, events whose vertex
-    counts differ and events only one of them finds a vertex in."""
-    distance, differs, vh_only, acts_only = [], 0, 0, 0
-    for o, acts in zip(outs, acts_all):
-        ours = o["hard_primary_vertices"][0][o["hard_primary_vertex_valid"][0]].double().numpy()
-        differs += len(ours) != len(acts)
-        vh_only += len(ours) > 0 and len(acts) == 0
-        acts_only += len(acts) > 0 and len(ours) == 0
-        if len(ours) and len(acts):
-            distance.append(np.linalg.norm(ours[0] - acts[0]))
-    d = np.array(distance)
-    if not len(d):
-        return f"{tracks:7s} {0:5d}"
-    return (f"{tracks:7s} {len(d):5d} {(d < 1e-4).mean():6.1%} {(d < 1e-3).mean():6.1%} {np.median(d):9.2e} {d.max():9.2e} "
-            f"{differs:9d} {vh_only:7d} {acts_only:9d}")
-
-
-REFIT_BINS = {"purity": (0.7, 0.9, 1.0), "hits": (15, 30, 45), "pT GeV": (0.3, 0.5, 1.0), "|eta|": (0.5, 1.0)}
-
-
-def refit_rows(tracks, outs, events):
-    """The refit table's rows: the Kalman refit's failure rate among the hit fit's usable tracks, per bin of purity,
-    hits, pT and |eta| (failed % / tracks; a bin's lower edge, inclusive)."""
-    values = {k: [] for k in ("failed", *REFIT_BINS)}
-    for o, e in zip(outs, events):
-        failed = o["acts_refit_failed"][0].numpy()
-        keep = o["track_quality_mask"][0].numpy() | failed
-        theta, qop = o["track_parameters"][0, :, 3].double().numpy(), o["track_parameters"][0, :, 4].double().numpy()
-        for key, v in zip(values, (failed, e[6], e[7], np.sin(theta) / np.abs(qop), np.abs(np.log(np.tan(theta / 2))))):
-            values[key].append(v[keep])
-    values = {k: np.concatenate(v) for k, v in values.items()}
-    rows = [f"{tracks:7s} {'all':8s} {values['failed'].mean():6.1%} / {len(values['failed'])}"]
-    for key, edges in REFIT_BINS.items():
-        b = np.digitize(np.nan_to_num(values[key], nan=0.0), edges)
-        cells = [f"{lo:>5}: {values['failed'][b == k].mean() if (b == k).any() else np.nan:6.1%} / {(b == k).sum():<6d}"
-                 for k, lo in enumerate((0, *edges))]
-        rows.append(f"{tracks:7s} {key:8s} " + "  ".join(cells))
-    return rows
+def plot(path, panels, limit):
+    """residuals.png: per track set (row) the residual histograms in x, y, z and 3D of each reconstruction."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    style = {"ACTS AMVF": dict(histtype="stepfilled", alpha=0.35, color="tab:gray"),
+             "VertexHead": dict(histtype="step", lw=1.6, color="tab:blue"),
+             "VertexHead, AMVF events": dict(histtype="step", lw=1.2, ls="--", color="tab:orange"),
+             "VertexHead (eval)": dict(histtype="step", lw=1.2, ls=":", color="tab:green")}
+    fig, axes = plt.subplots(len(panels), 4, figsize=(18, 4.2 * len(panels)), squeeze=False)
+    for row, (tracks, runs) in zip(axes, panels.items()):
+        for k, (ax, name) in enumerate(zip(row, ("x", "y", "z", "3D"))):
+            edges = np.linspace(0 if k == 3 else -limit, 1.5 * limit if k == 3 else limit, 61)
+            for label, residual in runs.items():
+                residual = residual[np.isfinite(residual).all(axis=1)]
+                value = np.linalg.norm(residual, axis=1) if k == 3 else residual[:, k]
+                if not len(value):
+                    continue
+                sigma = 1.4826 * np.median(np.abs(value - np.median(value))) if k < 3 else np.median(value)
+                ax.hist(np.clip(value, edges[0], edges[-1]), bins=edges, label=f"{label} ({len(value)}, "
+                        f"{'sigma' if k < 3 else 'median'} {sigma:.3f})", **style[label])
+            ax.set_xlabel(f"{'|reco - true|' if k == 3 else f'reco - true, {name}'} (cm)")
+            ax.set_ylabel("events")
+            ax.set_title(f"{tracks} tracks: PV residual {name}")
+            ax.legend(fontsize=7, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
 
 
 def main():
@@ -259,113 +183,64 @@ def main():
     parser.add_argument("--csv", required=True)
     parser.add_argument("--detector", required=True, help="detector file (scripts/acts/detectors/<name>/<name>.yaml)")
     parser.add_argument("--tracks", choices=("finder", "truth", "both"), default="both")
-    parser.add_argument("--origin_tolerance", type=float, default=0.1, help="cm, for true (shared, displaced) origins")
-    parser.add_argument("--max_events", type=int, default=500)
+    parser.add_argument("--max_events", type=int, default=0, help="the CSV's first events (0: all)")
+    parser.add_argument("--out", help="output folder (default: compare/ beside the CSV's folder)")
+    parser.add_argument("--range", type=float, default=1.0, help="plotted residual range, cm (3D: 1.5x)")
     parser.add_argument("--chunk_events", type=int, default=32, help="events per VertexHead call (as the eval)")
     args = parser.parse_args()
+    out_dir = args.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.csv))), "compare")
+    os.makedirs(out_dir, exist_ok=True)
 
-    head = vh.VertexHead.from_detector(args.detector, find_secondary=True).eval()
+    head = vh.VertexHead.from_detector(args.detector).eval()
     head.tracks.start_acts()       # boots while the CSV loads
-    # the hard-cut check: VertexHead's finder with ACTS's hard cuts and no fallback, on the same tracks
-    hard = copy.copy(head.vertices)
-    hard.hard_cuts, hard.pv_fallback, hard.find_secondary = True, False, False
-    soft_forward = head.vertices.forward
-    head.vertices.forward = lambda tracks: {**soft_forward(tracks), **{
-        f"hard_{k}": v for k, v in hard(tracks).items() if k in ("primary_vertices", "primary_vertex_valid")}}
-    checks = []
-    pv_rows, axis_rows, sv_rows, refit, notes = [], [], [], [], []
     timing = dict.fromkeys(("reading the CSV", "VertexHead", "ACTS AMVF"), 0.0)
+    t0 = time.perf_counter()
+    col = read_columns(args.csv, args.max_events)
+    timing["reading the CSV"] += time.perf_counter() - t0
+    rows, table, panels = [], [], {}
     for tracks in (("finder", "truth") if args.tracks == "both" else (args.tracks,)):
         t0 = time.perf_counter()
-        events = load_events(args.csv, args.max_events, tracks)
+        events = load_events(col, "pred_assignment" if tracks == "finder" else "seg_target")
         timing["reading the CSV"] += time.perf_counter() - t0
-        n_truth = sum(bool(np.isfinite(e[1]).all()) for e in events)
-        print(f"{tracks} tracks: {len(events)} events ({n_truth} with a true vertex) from {args.csv}; detector "
-              f"{args.detector}", flush=True)
-        outs, times = [], []    # times: per chunk, per event
+        truth = np.array([e[2] for e in events]).reshape(-1, 3)
+        print(f"{tracks} tracks: {len(events)} events ({int(np.isfinite(truth).all(axis=1).sum())} with a true PV) "
+              f"from {args.csv}; detector {args.detector}", flush=True)
+        outs = []
+        t0 = time.perf_counter()
         with torch.no_grad():
             for k in range(0, len(events), args.chunk_events):
-                chunk = [e[0]() for e in events[k:k + args.chunk_events]]
-                t0 = time.perf_counter()
-                outs += run_chunk(head, chunk)
-                times.append((time.perf_counter() - t0) / len(chunk))
-                timing["VertexHead"] += times[-1] * len(chunk)
-        chi2 = [o["chi_square"].item() / float(o["vertex_ndf"]) for o in outs
-                if float(o["vertex_ndf"]) > 0 and o["fit_is_valid"].all()]
-        vertices = np.array([o["vertex_estimate"][0].double().numpy() for o in outs])
-        runs = [("VertexHead", vertices, f"{np.median(chi2):8.2f}" if chi2 else "",
-                 sum(int(o["acts_failed"].sum()) for o in outs if "acts_failed" in o), np.mean(times[1:] or times) * 1e3)]
+                outs += run_chunk(head, [e[1]() for e in events[k:k + args.chunk_events]])
+        timing["VertexHead"] += time.perf_counter() - t0
+        ours = np.array([o["vertex_estimate"][0].double().numpy() for o in outs]).reshape(-1, 3)
+        runs = {"VertexHead": ours}
+        acts, n_found = np.full_like(ours, np.nan), np.zeros(len(outs), dtype=int)
         if head.tracks.use_acts:
             t0 = time.perf_counter()
-            acts_pv, n_found, acts_all = acts_vertices(head, outs)
-            checks.append(hard_check(tracks, outs, acts_all))
+            acts, n_found = acts_vertices(head, outs)
             timing["ACTS AMVF"] += time.perf_counter() - t0
-            runs.append(("ACTS AMVF", acts_pv, "", runs[0][3], None))
-            # VertexHead on the events where AMVF found a vertex (same events as its row) and on the rest
-            found = np.isfinite(acts_pv).all(axis=1, keepdims=True)
-            runs += [("VH AMVF evts", np.where(found, vertices, np.nan), "", runs[0][3], None),
-                     ("VH no AMVF", np.where(found, np.nan, vertices), "", runs[0][3], None)]
-            distance = np.linalg.norm(acts_pv - vertices, axis=1)
-            notes.append(f"{tracks} tracks: ACTS AMVF found {np.mean(n_found):.2f} vertices per event, none in "
-                         f"{n_found.count(0)}; its first vertex - VertexHead's PV: median {np.nanmedian(distance):.4f} cm, "
-                         f"90% {np.nanpercentile(distance, 90):.4f} cm")
-        n_pv = np.array([e[4] for e in events])
-        error = np.linalg.norm(vertices - np.array([e[1] for e in events]), axis=1)
-        # the worst PVs and where they came from
-        worst = [i for i in np.argsort(-np.nan_to_num(error, nan=-1.0))[:5] if np.isfinite(error[i])]
-        notes.append(f"{tracks} tracks: worst PVs (error cm: fallback, SV refit, tracks >= 0.5 / input, vertices kept"
-                     + (", AMVF vertices" if head.tracks.use_acts else "") + "): " + "; ".join(
-                         f"{error[i]:.2f}: {int(outs[i]['vertex_from_fallback'])}, {int(outs[i]['sv_is_valid'].any())}, "
-                         f"{int(outs[i]['vertex_n_tracks'])}/{int((outs[i]['track_weight'] > 0).sum())}, "
-                         f"{int(outs[i]['primary_vertex_valid'].sum())}"
-                         + (f", {n_found[i]}" if head.tracks.use_acts else "") for i in worst))
-        text = lambda sel: (f"median {np.nanmedian(error[sel]):.4f}, 90% {np.nanpercentile(error[sel], 90):.4f} cm"  # noqa: E731
-                            if np.isfinite(error[sel]).any() else "-")
-        notes.append(f"{tracks} tracks: {(n_pv >= 2).sum()} of {len(n_pv)} events have >= 2 primary vertices "
-                     f"(pileup; most {int(n_pv.max())}); VertexHead's PV error with pileup {text(n_pv >= 2)}, "
-                     f"without {text(n_pv < 2)}")
-        if "primary_vertices" in outs[0]:
-            # pileup vertices (truth rank >= 1) VertexHead found (a non-PV vertex within 2 mm in z), and its extra
-            # vertices matching no truth vertex
-            found = total = fakes = 0
-            for o, e in zip(outs, events):
-                z = o["primary_vertices"][0, :, 2].double().numpy()
-                others = z[o["primary_vertex_valid"][0].numpy() & (np.arange(len(z)) != int(o["pv_index"]))]
-                truth_z = e[5][:, 2]
-                found += sum(bool((np.abs(others - tz) < 0.2).any()) for tz in truth_z[1:])
-                total += len(truth_z[1:])
-                fakes += sum(not (np.abs(truth_z - oz) < 0.2).any() for oz in others)
-            notes.append(f"{tracks} tracks: pileup vertices found {found} of {total} (within 2 mm in z); extra "
-                         f"vertices matching no truth vertex {fakes} in {len(events)} events")
-        for name, run_vertices, run_chi2, dropped, ms in runs:
-            label = f"{tracks:7s} {name:12s}"
-            (n, m, p68, p90, within), axes = pv_stats(run_vertices, events)
-            pv_rows.append(f"{label} {n:6d} {m:8.4f} {p68:8.4f} {p90:8.4f} {within:6.1%} {run_chi2:>8s} {dropped:7d} "
-                           f"{'' if ms is None else f'{ms:7.1f}':>7s}")
-            axis_rows.append(f"{label} " + " ".join(f"{x:7.4f}" for x in axes))
-        sv_rows.append(f"{tracks:7s} {sv_stats(outs, events, args.origin_tolerance)}")
-        if "acts_refit_failed" in outs[0]:
-            refit += refit_rows(tracks, outs, events)
+            runs.update({"ACTS AMVF": acts, "VertexHead, AMVF events": np.where(np.isfinite(acts), ours, np.nan)})
+        if tracks == "finder":
+            runs["VertexHead (eval)"] = np.array([e[3] for e in events]).reshape(-1, 3)
+        panels[tracks] = {k: v - truth for k, v in runs.items()}
+        table += [table_row(f"{tracks:7s} {name:24s}", residual) for name, residual in panels[tracks].items()]
+        for e, o, a, n in zip(events, outs, acts, n_found):
+            rows.append([e[0], tracks, int((o["track_weight"][0] > 0).sum()), *e[2], *e[3],
+                         *o["vertex_estimate"][0].double().tolist(), int(o["vertex_fallback_step"]),
+                         int(o["vertex_n_tracks"]), *a, int(n)])
 
-    head_row = f"{'tracks':7s} {'vertexing':12s}"
-    print(f"\n{head_row} {'events':>6s} {'median':>8s} {'68%':>8s} {'90%':>8s} {'<1cm':>6s} {'chi2/ndf':>8s} {'dropped':>7s} "
-          f"{'ms/evt':>7s}   (PV truth error, cm)", *pv_rows, sep="\n")
-    print(f"\n{head_row} {'xy med':>7s} {'xy 68%':>7s} {'|z| med':>7s} {'|z| 68%':>7s} {'bias x':>7s} {'bias y':>7s} "
-          f"{'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (PV residual reco - true, cm; bias = median, "
-          "sig = 1.4826 MAD)", *axis_rows, sep="\n")
-    print(f"\n{'tracks':7s} {'cands':>6s} {'sec. found':>11s} {'eff':>5s} {'pure':>5s} {'SVs':>5s} {'sec. tracks':>12s} "
-          f"{'all-sec':>7s} {'true SVs':>8s} {'residual':>8s}   (VertexHead's SVs against truth; residual cm)",
-          *sv_rows, sep="\n")
-    if checks:
-        print(f"\n{'tracks':7s} {'both':>5s} {'<1e-4':>6s} {'<1e-3':>6s} {'median':>9s} {'max':>9s} {'n differs':>9s} "
-              f"{'VH only':>7s} {'ACTS only':>9s}   (hard-cut check: VertexHead with hard_cuts, no fallback, against "
-              "ACTS AMVF event by event; first vertex distance, cm)", *checks, sep="\n")
-    if refit:
-        print(f"\n{'tracks':7s} {'bin':8s} refit failed % / tracks, per bin (lower edge)   (the hit fit's usable "
-              "tracks; purity: the majority truth particle's share of a track's hits)", *refit, sep="\n")
-    if notes:
-        print("", *notes, sep="\n")
-    print("\ntime: " + ", ".join(f"{name} {seconds:.1f} s" for name, seconds in timing.items()))
+    with open(os.path.join(out_dir, "reco_vertices.csv"), "w", newline="") as f:
+        writer = csv.writer(f, lineterminator="\n")
+        writer.writerow(["batch_idx", "tracks", "n_tracks", *(f"true_{a}" for a in "xyz"), *(f"eval_{a}" for a in "xyz"),
+                         *(f"vh_{a}" for a in "xyz"), "vh_fallback_step", "vh_n_tracks", *(f"acts_{a}" for a in "xyz"),
+                         "acts_n_vertices"])
+        writer.writerows(rows)
+    plot(os.path.join(out_dir, "residuals.png"), panels, args.range)
+
+    print(f"\n{'tracks':7s} {'vertexing':24s} {'events':>6s} {'median':>7s} {'68%':>7s} {'90%':>7s} {'<1cm':>6s} "
+          f"{'bias x':>7s} {'bias y':>7s} {'bias z':>7s} {'sig x':>7s} {'sig y':>7s} {'sig z':>7s}   (PV residual "
+          "reco - true, cm: 3D error quantiles; bias = median, sig = 1.4826 MAD)", *table, sep="\n")
+    print(f"\nwrote {os.path.join(out_dir, 'reco_vertices.csv')} and {os.path.join(out_dir, 'residuals.png')}")
+    print("time: " + ", ".join(f"{name} {seconds:.1f} s" for name, seconds in timing.items()))
     return 0
 
 

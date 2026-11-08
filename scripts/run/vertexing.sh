@@ -4,7 +4,8 @@
 #                                                 detector file
 #   scripts/run/vertexing.sh eval [options]       eval_vertex_reconstruction.py with the run config
 #   scripts/run/vertexing.sh compare [options]    VertexHead and ACTS's vertex finder against truth on the newest
-#                                                 CSV under root_dir (--csv <file> for another)
+#                                                 CSV under root_dir (--csv <file> for another): per-event CSV and
+#                                                 residual plots in compare/ beside it
 # setup options: --geometry, --geometry_config, --material_map <file> (ACTS inputs, must exist);
 # --field_map <file> (a ROOT map, converted into the detector folder and then used by every site file, or an ACTS
 # text map; with --field_kind xyz|rz, --field_rescale <factor> (ROOT map only)); --set [section.]key=<value> for any

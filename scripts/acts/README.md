@@ -12,7 +12,8 @@ returns perigee parameters with their covariance.
 ```bash
 scripts/run/vertexing.sh setup      # image (once, an hour or more) + module (a minute); site detector file
 scripts/run/vertexing.sh eval       # backbone, track finder, VertexHead -> per-point CSV
-scripts/run/vertexing.sh compare    # VertexHead and ACTS's own vertex finder against truth on that CSV
+scripts/run/vertexing.sh compare    # VertexHead and ACTS's own vertex finder against truth on that CSV:
+                                    # compare/reco_vertices.csv, compare/residuals.png beside the CSV's folder
 ```
 
 The run is `scripts/configs/vertex_m5_gpuserver0.yaml` (`RUN_CONFIG=<file>` for another). Its `detector:` file,
@@ -28,7 +29,7 @@ scripts/run/vertexing.sh setup --geometry <tgeo.root> --geometry_config <config.
 
 The input files must exist (see sPHENIX inputs); `--set [section.]key=value` sets any other key, keeping its comment.
 Options after `eval` or `compare` go to the Python script, e.g. `eval --max_eval_events 5000` or
-`compare --tracks finder --max_events 1000`. Rerun `setup` after changing the C++.
+`compare --tracks finder --max_events 500 --range 0.5`. Rerun `setup` after changing the C++.
 
 ## Pieces
 
@@ -39,7 +40,7 @@ Options after `eval` or `compare` go to the Python script, e.g. `eval --max_eval
 | `acts_worker.py` | runs in the image; VertexHead starts it once and streams track states to it |
 | `detectors/<name>/` | the detector file template `<name>.yaml` and the tools that make its inputs |
 | `check_geometry.py` | a detector's geometry and material map in ACTS |
-| `compare_vertexing.py` | VertexHead against ACTS's own vertex finder and truth: PV, PV per axis, SVs |
+| `compare_vertexing.py` | the PV reconstructions (the eval's, VertexHead's, ACTS's own vertex finder's) against truth: per-event CSV, residual plots in x, y, z and 3D, error table |
 | `acts_vertexing.py` | ACTS's vertex finder as shipped (AMVF, Gaussian seeder) on given tracks, for the comparison |
 
 Tracks ACTS fails to propagate are dropped; those the hit fit had kept are flagged in `acts_failed`. Where the
