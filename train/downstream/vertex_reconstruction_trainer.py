@@ -475,7 +475,8 @@ class DownstreamTrainer():
     def _vertex_head_chunk(self, records):
         """
         VertexHead once over several loader batches, padded to a common size; returns each batch's
-        (vertex_estimate, fit_is_valid, track counts per event: usable, acts_failed, acts_refit_failed (0 without)). Each event keeps only the track slots VertexHead can fit, those at least
+        (vertex_estimate, fit_is_valid, per event: usable, acts_failed, acts_refit_failed (0 without) track counts and
+        vertex_from_fallback). Each event keeps only the track slots VertexHead can fit, those at least
         min_hits real hits are assigned to (VertexHead's argmax), and the hits of the others stay unassigned: the
         same result, without the track head's mostly empty max_gt_classes slots. VertexHead runs on vertex_device;
         the results come back to the CPU.
@@ -502,7 +503,8 @@ class DownstreamTrainer():
         sizes = [r["mask"].shape[0] for r in records]
         zeros = torch.zeros_like(result["track_quality_mask"])
         counts = torch.stack([result.get(k, zeros).sum(dim=-1) for k in ("track_quality_mask", "acts_failed",
-                                                                          "acts_refit_failed")], dim=-1)
+                                                                          "acts_refit_failed")]
+                             + [result["vertex_from_fallback"].to(zeros.dtype)], dim=-1)
         return list(zip(result["vertex_estimate"].cpu().split(sizes), result["fit_is_valid"].cpu().split(sizes),
                         counts.cpu().split(sizes)))
 
@@ -670,8 +672,14 @@ class DownstreamTrainer():
         # fit_valid_rate: valid fits among the events with a truth PV (the accuracies are over those fits)
         metrics.update(n_events=len(ok), truth_valid_rate=truth_valid.float().mean().item(),
                        fit_valid_rate=reco_valid[truth_valid].float().mean().item())
-        usable, acts_failed, refit_failed = torch.cat(track_counts).double().mean(dim=0).tolist()
+        counts = torch.cat(track_counts).double()
+        usable, acts_failed, refit_failed, _ = counts.mean(dim=0).tolist()
         metrics.update(usable_tracks_per_event=usable)
+        # the PVs fitted on all tracks (the finder kept no vertex): their share of the valid fits and both groups' rmse
+        fallback, error = counts[:, 3].bool(), (est - tgt).double().norm(dim=-1)
+        rmse = lambda sel: error[sel].pow(2).mean().sqrt().item() if sel.any() else float("nan")  # noqa: E731
+        metrics.update(pv_fallback_rate=fallback[ok].double().mean().item() if ok.any() else float("nan"),
+                       rmse_3d_finder=rmse(ok & ~fallback), rmse_3d_fallback=rmse(ok & fallback))
         if self.vertex_head.tracks.use_acts:
             metrics.update(acts_failed_per_event=acts_failed, acts_refit_failed_per_event=refit_failed,
                            acts_worker_restarts=vertexing.ACTS_TIMING["restarts"])

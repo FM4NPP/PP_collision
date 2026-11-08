@@ -311,6 +311,14 @@ def main():
                          f"90% {np.nanpercentile(distance, 90):.4f} cm")
         n_pv = np.array([e[4] for e in events])
         error = np.linalg.norm(vertices - np.array([e[1] for e in events]), axis=1)
+        # the worst PVs and where they came from
+        worst = [i for i in np.argsort(-np.nan_to_num(error, nan=-1.0))[:5] if np.isfinite(error[i])]
+        notes.append(f"{tracks} tracks: worst PVs (error cm: fallback, SV refit, tracks >= 0.5 / input, vertices kept"
+                     + (", AMVF vertices" if head.tracks.use_acts else "") + "): " + "; ".join(
+                         f"{error[i]:.2f}: {int(outs[i]['vertex_from_fallback'])}, {int(outs[i]['sv_is_valid'].any())}, "
+                         f"{int(outs[i]['vertex_n_tracks'])}/{int((outs[i]['track_weight'] > 0).sum())}, "
+                         f"{int(outs[i]['primary_vertex_valid'].sum())}"
+                         + (f", {n_found[i]}" if head.tracks.use_acts else "") for i in worst))
         text = lambda sel: (f"median {np.nanmedian(error[sel]):.4f}, 90% {np.nanpercentile(error[sel], 90):.4f} cm"  # noqa: E731
                             if np.isfinite(error[sel]).any() else "-")
         notes.append(f"{tracks} tracks: {(n_pv >= 2).sum()} of {len(n_pv)} events have >= 2 primary vertices "

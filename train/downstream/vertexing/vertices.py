@@ -70,10 +70,15 @@ def _impact_3d(p, bz, beam, point, iterations=20):
                           z0 + rho * phi0 * cot])
     dx, dy, dz = point - centre
     phi = phi0
-    for _ in range(iterations):
+
+    def step(phi):
         first = rho * (dx * torch.cos(phi) + dy * torch.sin(phi) + (dz + rho * phi * cot) * cot)
         second = rho * (-dx * torch.sin(phi) + dy * torch.cos(phi) + rho * cot * cot)
-        phi = phi - first / second
+        return phi - first / second
+    # the root without derivatives, then one step with them: at a Newton root that step's derivative is the root's
+    for _ in range(iterations - 1):
+        phi = step(phi.detach())
+    phi = step(phi.detach())
     position = centre + rho * torch.stack([-torch.sin(phi), torch.cos(phi), -cot * phi])
     direction = torch.stack([torch.cos(phi) * torch.sin(theta), torch.sin(phi) * torch.sin(theta), torch.cos(theta)])
     axis = torch.where(direction[2].abs() < _CURVILINEAR_TOLERANCE, direction.new_tensor([0.0, 0.0, 1.0]),
